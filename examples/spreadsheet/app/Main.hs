@@ -6,11 +6,13 @@ import Control.Monad.Trans.Except
 
 -- unary-scheduling
 import Schedule.Spreadsheet
-  ( scheduleSpreadsheet )
+  ( scheduleSpreadsheet, handleError )
+
+-------------------------------------------------------------------------------
 
 main :: IO ()
 main = do
   res <- runExceptT scheduleSpreadsheet
   case res of
-    Left err -> error ( show err )
+    Left err -> handleError err
     _        -> pure ()

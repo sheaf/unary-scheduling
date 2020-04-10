@@ -121,8 +121,6 @@ import Schedule.Tree
   , DurationExtraInfo(..)
   )
 
-import Debug.Trace
-
 -------------------------------------------------------------------------------
 -- Convenience class synonym for polymorphism over scheduling tree handedness.
 

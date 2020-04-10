@@ -9,7 +9,7 @@
 {-# LANGUAGE TypeApplications           #-}
 
 module Schedule.Spreadsheet
-  ( scheduleSpreadsheet )
+  ( scheduleSpreadsheet, handleError )
   where
 
 -- base
@@ -33,7 +33,19 @@ import Data.Functor
 import Data.Traversable
   ( for )
 import qualified Numeric
-  ( showIntAtBase, readInt )
+  ( readInt )
+import System.Environment
+  ( getArgs, getProgName )
+import System.Exit
+  ( ExitCode(..), exitWith, exitSuccess )
+import System.IO
+  ( hPutStrLn, stderr )
+
+-- ansi-wl-pprint
+import qualified Text.PrettyPrint.ANSI.Leijen as Pretty
+  ( Doc
+  , linebreak, hardline, indent, hang
+  )
 
 -- bytestring
 import qualified Data.ByteString.Lazy as LazyByteString
@@ -50,6 +62,14 @@ import qualified Data.Set as Set
   ( fromList )
 import Data.Sequence
   ( Seq(..) )
+
+-- directory
+import qualified System.Directory as Directory
+  ( doesFileExist )
+
+-- filepath
+import System.FilePath
+  ( (-<.>) )
 
 -- generic-lens
 import Data.Generics.Product.Fields
@@ -69,13 +89,18 @@ import Control.Lens.At
 import Control.Monad.Except
   ( liftEither )
 
--- directory
-import qualified System.Directory as Directory
-  ( doesFileExist )
-
--- filepath
-import System.FilePath
-  ( (-<.>) )
+-- optparse-applicative
+import qualified Options.Applicative as OptParse
+  ( execParserPure, execCompletion, renderFailure
+  , ParserResult(..), CompletionResult(..)
+  , Parser, ParserInfo(..), ParserPrefs(..)
+  , strOption, switch, helper
+  , long, short, metavar, value, help
+  )
+import qualified Options.Applicative.Help.Chunk as OptParse
+  ( Chunk(Chunk) )
+import qualified Options.Applicative.Types as OptParse
+  ( Backtracking(Backtrack), ArgPolicy(Intersperse) )
 
 -- text
 import Data.Text
@@ -87,7 +112,7 @@ import qualified Data.Text as Text
   , strip, split
   )
 import qualified Data.Text.IO as Text
-  ( appendFile )
+  ( appendFile, hPutStrLn )
 
 -- time
 import qualified Data.Time.Clock.POSIX as Time
@@ -132,8 +157,6 @@ import Schedule.Task
 import Schedule.Time
   ( Delta(..), Time(..) )
 
-import Debug.Trace
-
 -------------------------------------------------------------------------------
 
 -- | Read scheduling data from a spreadsheet file,
@@ -159,7 +182,8 @@ scheduleSpreadsheet = do
   inputExists <- lift $ Directory.doesFileExist inputPath
   unless inputExists do
     throwE ( MissingFile inputPath )
-  spreadsheet <- withExceptT XlsxParseError . ExceptT $ Xlsx.toXlsxEither <$> LazyByteString.readFile inputPath
+  spreadsheet <- withExceptT XlsxParseError . ExceptT
+               $ Xlsx.toXlsxEither <$> LazyByteString.readFile inputPath
 
   -- Parse spreadsheet data.
   SchedulingData { schedulingTasks, schedulingRanges } <- liftEither $ parseSpreadsheet spreadsheet
@@ -187,12 +211,36 @@ scheduleSpreadsheet = do
 
 -- | Combined monolithic error type for the application.
 data Error
-  = NoSchedulingPossible Text      -- ^ Constraint solving has established that no solution exists.
-  | XlsxParseError Xlsx.ParseError -- ^ Could not read spreadsheet (parsing error thrown by the @xlsx@ library).
-  | SheetParseError Text           -- ^ Could not parse the necessary scheduling information from the spreadsheet.
-  | MissingFile FilePath           -- ^ Missing input spreadsheet file.
-  | WrongArguments Text            -- ^ Wrong command line arguments.
+  = NoSchedulingPossible Text            -- ^ Constraint solving has established that no solution exists.
+  | XlsxParseError  Xlsx.ParseError      -- ^ Could not read spreadsheet (parsing error thrown by the @xlsx@ library).
+  | SheetParseError Text                 -- ^ Could not parse the necessary scheduling information from the spreadsheet.
+  | MissingFile FilePath                 -- ^ Missing input spreadsheet file.
+  | ArgsError String                     -- ^ Error parsing command line arguments.
+  | Completion OptParse.CompletionResult -- ^ Command line completion.
   deriving stock Show
+
+handleError :: Error -> IO ()
+handleError ( NoSchedulingPossible reason ) = do
+  Text.hPutStrLn stderr ( "No scheduling possible:\n" <> reason )
+  exitSuccess
+handleError ( XlsxParseError err ) = do
+  hPutStrLn stderr ( "Could not parse spreadsheet :\n" <> show err )
+  exitWith ( ExitFailure 2 )
+handleError ( SheetParseError err ) = do
+  hPutStrLn stderr ( "Could not parse scheduling data from spreadsheet." )
+  Text.hPutStrLn stderr err
+  exitWith ( ExitFailure 3 )
+handleError ( MissingFile filePath ) = do
+  hPutStrLn stderr ( "Missing file: " <> filePath )
+  exitWith ( ExitFailure 4 )
+handleError ( ArgsError msg ) = do
+  hPutStrLn stderr msg
+  exitWith ( ExitFailure 5 )
+handleError ( Completion compl ) = do
+  progName <- getProgName
+  msg <- OptParse.execCompletion compl progName
+  putStr msg
+  exitSuccess
 
 -- | Record of expected command line arguments.
 data Args
@@ -238,7 +286,7 @@ newtype Column = Column { getColumn :: Int }
   deriving newtype ( Eq, Ord, Enum, Bounded, Num )
 -- Bijective base 26 system.
 instance Show Column where
-  show ( Column c )
+  show ( Column { getColumn = c } )
     | c <= 0          = "-oo"
     | c >  1000000000 = "+oo"
     | otherwise
@@ -262,12 +310,118 @@ note e _          = throwE e
 -- and whether to perform constraint propagation (if so, provide a filename for logging output).
 parseArgs :: ExceptT Error IO Args
 parseArgs = do
-  -- TODO. 
-  let
-    inputSpreadsheetPath  = "input.xlsx"
-    outputSpreadsheetPath = "output.xlsx"
-    constraintLoggingPath = Just "log.txt"
-  pure ( Args { .. } )
+  args <- lift getArgs
+  case OptParse.execParserPure parserPrefs parserInfo args of
+    OptParse.Success res -> pure res
+    OptParse.CompletionInvoked compl -> throwE ( Completion compl )
+    OptParse.Failure err -> do
+      progName <- lift getProgName
+      let
+        ( msg, _ ) = OptParse.renderFailure err progName
+      throwE ( ArgsError msg )
+
+  where
+    header, desc, usageInfo :: Pretty.Doc
+    header = "schedule-spreadsheet - propagate unary scheduling constraints read from a spreadsheet"
+    desc = "Computes up to date scheduling constraints read from a spreadsheet"
+    usageInfo =
+      "The scheduling information is expected to be provided within the spreadsheet in the following manner:"
+      <> Pretty.linebreak
+      <> Pretty.linebreak <>
+        ( Pretty.indent 2
+          ( "Range information, in the form of a formula pointing to another cell:"
+          <> Pretty.linebreak <>
+            ( Pretty.indent 2
+              (  Pretty.hang 2 "- in cells B1 & C1: point to first and last cells of tasks to be scheduled (range of rows),"
+              <> Pretty.linebreak
+              <> Pretty.hang 2 "- in cells B2 & C2: point to first and last cells of staff to be assigned to the tasks (range of rows),"
+              <> Pretty.linebreak
+              <> Pretty.hang 2 "- in cells B3 & C3: point to first and last cells of available time slots (range of columns)."
+              <> Pretty.linebreak
+              )
+            ) <> Pretty.hardline <>
+            "Information for each task, in the same row as the task:"
+            <> Pretty.linebreak <>
+            ( Pretty.indent 2
+              (  Pretty.hang 2
+                  ( "- column A: staff assigned to the task in the row, in the form of a formula " <> Pretty.linebreak
+                  <> Pretty.indent 4 "TEXTJOIN( delimiter, ignore_empty, staff_cell_1, staff_cell_2, ..., staff_cell_n )"
+                  )
+              <> Pretty.linebreak
+              <> Pretty.hang 2 "- column B: duration of the task, in number of columns,"
+              <> Pretty.linebreak
+              <> Pretty.hang 2 "- for each scheduling column: availability value."
+              <> Pretty.linebreak
+              )
+            ) <> Pretty.hardline <>
+            "Availability values for staff, for the available time columns, in each of the staff member rows."
+            <> Pretty.hardline
+            <> Pretty.hardline <>
+            "Availability for staff and tasks is specified as follows:" <> Pretty.hardline <>
+              ( Pretty.indent 2
+                (  Pretty.hang 2 "- an unavailable time slot corresponds to a cell value of 0,"
+                <> Pretty.linebreak
+                <> Pretty.hang 2 "- an available time slot is a cell with any other value."
+                )
+              )
+           )
+         )
+
+    parserPrefs :: OptParse.ParserPrefs
+    parserPrefs = OptParse.ParserPrefs
+      { OptParse.prefMultiSuffix     = ""
+      , OptParse.prefDisambiguate    = True
+      , OptParse.prefShowHelpOnError = True
+      , OptParse.prefShowHelpOnEmpty = False
+      , OptParse.prefBacktrack       = OptParse.Backtrack
+      , OptParse.prefColumns         = 80
+      , OptParse.prefHelpLongEquals  = False
+      }
+
+    parserInfo :: OptParse.ParserInfo Args
+    parserInfo = OptParse.ParserInfo
+      { OptParse.infoParser      = OptParse.helper <*> ( Args <$> inputArg <*> outputArg <*> logArg )
+      , OptParse.infoFullDesc    = True
+      , OptParse.infoProgDesc    = OptParse.Chunk ( Just desc )
+      , OptParse.infoHeader      = OptParse.Chunk ( Just header )
+      , OptParse.infoFooter      = OptParse.Chunk ( Just usageInfo )
+      , OptParse.infoFailureCode = 255
+      , OptParse.infoPolicy      = OptParse.Intersperse
+      }
+
+    inputArg :: OptParse.Parser FilePath
+    inputArg =
+      OptParse.strOption
+        (  OptParse.long "input"
+        <> OptParse.short 'i'
+        <> OptParse.metavar "INPUTFILE"
+        <> OptParse.value "input.xlsx"
+        <> OptParse.help "Read scheduling data from XLSX spreadsheet INPUTFILE"
+        )
+
+    outputArg :: OptParse.Parser FilePath
+    outputArg =
+      OptParse.strOption
+        (  OptParse.long "output"
+        <> OptParse.short 'o'
+        <> OptParse.metavar "OUTPUTFILE"
+        <> OptParse.value "output.xlsx"
+        <> OptParse.help "Write scheduling data to XLSX spreadsheet OUTPUTFILE"
+        )
+
+    logArg :: OptParse.Parser ( Maybe FilePath )
+    logArg =  ( \ b fp -> if b then Nothing else Just fp )
+          <$> OptParse.switch
+                (  OptParse.long "noprop"
+                <> OptParse.help "Disable constraint propagation"
+                )
+          <*> OptParse.strOption
+                (  OptParse.long "log"
+                <> OptParse.short 'l'
+                <> OptParse.metavar "LOGFILE"
+                <> OptParse.value "log.txt"
+                <> OptParse.help "Log constraint solving information to LOGFILE"
+                )
 
 -- | Parse a spreadsheet into scheduling information.
 --
@@ -316,8 +470,10 @@ parseSpreadsheet spreadsheet = runExcept do
     let
       givenAvailability :: Intervals Column
       givenAvailability = parseAvailability firstScheduleColumn lastScheduleColumn taskRow cells
+      taskCellLocation :: ( Int, Int )
+      taskCellLocation = ( taskRow, 1 )
     taskStaffCell
-      <- note ( SheetParseError $ "Could not parse staff allocated to task in row " <> Text.pack ( show taskRow ) )
+      <- note ( SheetParseError $ "Missing cell data at " <> location taskCellLocation <> ": expected to find staff allocated to the task in that row." )
        $ Map.lookup ( taskRow, 1 ) cells
     taskStaffIDs <- parseTaskStaffIDs taskRow firstStaffRow lastStaffRow taskStaffCell
     let
@@ -345,12 +501,12 @@ parseSpreadsheet spreadsheet = runExcept do
 --  - cells B3 & C3: first and last cells of available time slots (range of columns).
 parseRanges :: Map ( Int, Int ) Xlsx.Cell -> Except Error SchedulingRanges
 parseRanges cells = do
-  firstStaffRow       <- fst <$> parseLocationFromCellFormulaAt (2,2) cells
-  lastStaffRow        <- fst <$> parseLocationFromCellFormulaAt (2,3) cells
-  firstTaskRow        <- fst <$> parseLocationFromCellFormulaAt (1,2) cells
-  lastTaskRow         <- fst <$> parseLocationFromCellFormulaAt (1,3) cells
-  firstScheduleColumn <- snd <$> parseLocationFromCellFormulaAt (3,2) cells
-  lastScheduleColumn  <- snd <$> parseLocationFromCellFormulaAt (3,3) cells
+  firstStaffRow       <- fst <$> parseLocationFromCellFormulaAt "first staff row"           (2,2) cells
+  lastStaffRow        <- fst <$> parseLocationFromCellFormulaAt "last staff row"            (2,3) cells
+  firstTaskRow        <- fst <$> parseLocationFromCellFormulaAt "first task row"            (1,2) cells
+  lastTaskRow         <- fst <$> parseLocationFromCellFormulaAt "last task row"             (1,3) cells
+  firstScheduleColumn <- snd <$> parseLocationFromCellFormulaAt "first availability column" (3,2) cells
+  lastScheduleColumn  <- snd <$> parseLocationFromCellFormulaAt "last availability column"  (3,3) cells
   pure ( SchedulingRanges { .. } )
 
 -- | Pattern synonym for a cell containing a simple textual formula.
@@ -365,14 +521,16 @@ pattern SimpleFormulaCell formula <-
 -- | Obtains the location a cell is pointing at, in the case that the cell is pointing at a single other cell.
 --
 -- This corresponds to a spreadsheet formula of the form @=AB7@ (for instance).
-parseLocationFromCellFormulaAt :: ( Int, Int ) -> Map (Int, Int) Xlsx.Cell -> Except Error ( Int, Int )
-parseLocationFromCellFormulaAt loc cells = do
-  cell <- note ( SheetParseError $ "Could not parse location from cell formula: no cell at " <> location loc )
+parseLocationFromCellFormulaAt :: Text -> ( Int, Int ) -> Map (Int, Int) Xlsx.Cell -> Except Error ( Int, Int )
+parseLocationFromCellFormulaAt desc loc cells = do
+  cell <- note ( SheetParseError $ "Could not parse " <> desc <> " from cell formula: no cell at " <> location loc )
         $ Map.lookup loc cells
   case cell of
     SimpleFormulaCell formula
       -> parseLocation formula
-    _ -> throwE ( SheetParseError $ "Cell " <> location loc <> " does not appear to contain a simple formula referring to a single other cell." )
+    _ -> throwE ( SheetParseError $ "Could not parse " <> desc <> " from cell " <> location loc <> ":\n\
+                                    \cell does not appear to contain a simple formula referring to a single other cell."
+                )
 
 -- | Parse an alphanumeric cell reference into a numeric @(row, column)@ pair.
 --

@@ -104,6 +104,8 @@ executable schedule-spreadsheet
 
   build-depends:
       unary-scheduling
+    , ansi-wl-pprint
+        ^>= 0.6.9
     , bytestring
         ^>= 0.10.10.0
     , directory
@@ -112,6 +114,8 @@ executable schedule-spreadsheet
         ^>= 1.4.2.1
     , lens
         ^>= 4.19.1
+    , optparse-applicative
+        ^>= 0.15.1.0
     , time
         ^>= 1.9.3
     , xlsx
