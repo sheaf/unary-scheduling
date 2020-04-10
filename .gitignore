@@ -1,0 +1,6 @@
+*.txt
+*.xlsx
+*.html
+dist-newstyle/
+refs/
+cabal.project.local
