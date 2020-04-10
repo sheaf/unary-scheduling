@@ -107,6 +107,7 @@ import Data.Text
   ( Text )
 import qualified Data.Text as Text
   ( pack, unpack
+  , replicate
   , span, all, null
   , dropWhile, dropWhileEnd
   , strip, split
@@ -177,8 +178,9 @@ scheduleSpreadsheet = do
 
   -- Read input spreadsheet.
   let
-    inputPath :: FilePath
-    inputPath = inputSpreadsheetPath -<.> "xlsx"
+    inputPath, outputPath :: FilePath
+    inputPath  =  inputSpreadsheetPath -<.> "xlsx"
+    outputPath = outputSpreadsheetPath -<.> "xlsx"
   inputExists <- lift $ Directory.doesFileExist inputPath
   unless inputExists do
     throwE ( MissingFile inputPath )
@@ -197,7 +199,14 @@ scheduleSpreadsheet = do
       let
         ( newTasks, justifications, mbError ) = propagateConstraints ( Left schedulingTasks ) 100 allPropagators
       -- Log constraint propagation information.
-      lift $ Text.appendFile justificationsPath ( "\n" <> Text.pack formattedTime <> "\n" <> justifications )
+      lift $ Text.appendFile justificationsPath
+        ( "\n" <> Text.replicate 25 "-" <> "\n" <>
+        "-- " <> Text.pack formattedTime <> " --\n" <>
+        Text.replicate 25 "-" <> "\n\n-------\n" <>
+        "Input:  " <> Text.pack inputPath <> "\n" <>
+        "Output: " <> Text.pack outputPath <> "\n-------\n\n" <>
+        justifications
+        )
       -- Throw an error if scheduling has been found to be impossible.
       for_ mbError \ err -> throwE ( NoSchedulingPossible err )
       pure ( tasks $ taskInfos newTasks )
@@ -205,7 +214,7 @@ scheduleSpreadsheet = do
   -- Write output spreadsheet with updated availability information.
   let
     outputData = Xlsx.fromXlsx currentPosixTime ( updateSpreadsheet schedulingRanges newTaskData spreadsheet )
-  lift $ LazyByteString.writeFile ( outputSpreadsheetPath -<.> "xlsx" ) outputData
+  lift $ LazyByteString.writeFile outputPath outputData
 
 -------------------------------------------------------------------------------
 

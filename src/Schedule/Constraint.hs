@@ -131,7 +131,7 @@ data Constraints t
 
 instance Ord t => Semigroup ( Constraints t ) where
   ( Constraints cts1 logs1 ) <> ( Constraints cts2 logs2 ) =
-    Constraints ( IntMap.unionWith (<>) cts1 cts2 ) ( logs1 <> "\n\n" <> logs2 )
+    Constraints ( IntMap.unionWith (<>) cts1 cts2 ) ( logs1 <> logs2 )
 instance Ord t => Monoid ( Constraints t ) where
   mempty = Constraints IntMap.empty mempty
 

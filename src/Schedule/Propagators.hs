@@ -183,7 +183,7 @@ normalise = do
           ( Constraints
             { constraints    = IntMap.singleton taskNb ( Inside $ newIntervals )
             , justifications =
-              "Performed normalisation for task " <> taskNames Boxed.Vector.! taskNb <> "\n\n"
+              "Performed normalisation for " <> taskNames Boxed.Vector.! taskNb <> "\n\n"
             }
           )
 
@@ -213,8 +213,8 @@ prune = do
         ( Constraints
           { constraints    = IntMap.singleton taskNb ( Inside kept )
           , justifications =
-            "The following time slots have been removed from task " <> taskNames Boxed.Vector.! taskNb <> "\n\
-            \as they are too short to allow the task to complete\n\n" <>
+            "The following time slots have been removed from " <> taskNames Boxed.Vector.! taskNb <> ",\n\
+            \as they are too short to allow the task to complete:\n" <>
             ( Text.pack ( show removed ) ) <> "\n\n"
           }
         )
@@ -261,11 +261,11 @@ timetable = do
               ( Constraints
                 { constraints    = IntMap.singleton otherTaskNb ( Outside necessaryIntervals )
                 , justifications =
-                  "The task " <> taskNames Boxed.Vector.! taskNb <> " must be in progress during\n\
+                  taskNames Boxed.Vector.! taskNb <> " must be in progress during\n\
                   \  * " <> Text.pack ( show necessaryInterval ) <> "\n\
                   \As a result, the intervals \n\
                   \  * " <> Text.pack ( show removedIntervals ) <> "\n\
-                  \have been removed from task " <> taskNames Boxed.Vector.! otherTaskNb <> "\n\n"
+                  \have been removed from " <> taskNames Boxed.Vector.! otherTaskNb <> "\n\n"
                 }
               )
 
@@ -323,16 +323,15 @@ overloadCheck = do
             currentTaskName = taskNames Boxed.Vector.! taskNb
             currentSubsetTaskNames =
               foldMap
-                ( \ i -> taskNames Boxed.Vector.! i <> "\n" )
+                ( \ i -> "  * " <> taskNames Boxed.Vector.! i <> "\n" )
                 ( taskNb : seenTaskNbs )
           throwError $
             "Could not schedule tasks:\n\
-            \  - task named " <> currentTaskName <> "\n\
-            \    must complete by\n\
+            \  - " <> currentTaskName <> " must complete by\n\
             \      * " <> Text.pack ( show currentLCT ) <> "\n\
             \  - the following set of tasks cannot complete before\n\
-            \      * " <> Text.pack ( show estimatedECT ) <> "\n\n"
-            <> currentSubsetTaskNames <> "\n\n"
+            \      * " <> Text.pack ( show estimatedECT ) <> "\n"
+            <> currentSubsetTaskNames <> "\n"
         
         go (j+1) (taskNb:seenTaskNbs)
 
@@ -431,25 +430,24 @@ detectablePrecedences = do
               currentTaskSubset :: Text
               currentTaskSubset =
                 foldMap
-                  ( \ tk -> if tk == taskNb then "" else taskNames Boxed.Vector.! tk <> "\n" )
+                  ( \ tk -> if tk == taskNb then "" else "  * " <> taskNames Boxed.Vector.! tk <> "\n" )
                   js'
               constraint :: Constraint t
               constraint = handedTimeConstraint excludeCurrentTaskSubsetInnerTime
-              succedeOrPrecede, succedingOrPreceding, earlierOrLater :: Text
-              ( succedeOrPrecede, succedingOrPreceding, earlierOrLater )
+              succedeOrPrecede, earlierOrLater :: Text
+              ( succedeOrPrecede, earlierOrLater )
                 | NotEarlierThan _ _ <- constraint
-                = ( "succede", "succeding", "start after" )
+                = ( "succede", "start after" )
                 | otherwise
-                = ( "precede", "preceding", "end before" )
+                = ( "precede", "end before" )
               reason :: Text
               reason =
-                "Precedence detected:\n\
-                \  task named " <> taskNames Boxed.Vector.! taskNb <> "\n\
-                \  must " <> succedeOrPrecede <> " the following tasks:\n" <>
-                currentTaskSubset <> "\n\
-                \As a consequence, the " <> succedingOrPreceding <> " task is constrained to " <> earlierOrLater <> "\n\
-                \  * " <> Text.pack ( show excludeCurrentTaskSubsetInnerTime )
-            tell 
+                "Precedence detected:\n" <>
+                taskNames Boxed.Vector.! taskNb <> " must " <> succedeOrPrecede <> " all of the following tasks:\n" <>
+                currentTaskSubset <>
+                "As a consequence, this task is constrained to " <> earlierOrLater <> "\n\
+                \  * " <> Text.pack ( show excludeCurrentTaskSubsetInnerTime ) <> "\n\n"
+            tell
               ( Constraints
                 { constraints    = IntMap.singleton taskNb constraint
                 , justifications = reason
@@ -538,7 +536,7 @@ notExtremal = do
           do
             let
               subsetText :: Text
-              subsetText = foldMap ( \ tk -> taskNames Boxed.Vector.! tk <> "\n" ) currentSubset'
+              subsetText = foldMap ( \ tk -> "  * " <> taskNames Boxed.Vector.! tk <> "\n" ) currentSubset'
               constraint :: Constraint t
               constraint = handedTimeConstraint associatedOtherInnerTime
               lastOrFirst, earlierOrLater :: Text
@@ -549,11 +547,10 @@ notExtremal = do
                 = ( "first", "start after" )
               reason :: Text
               reason =
-                "Task named " <> taskNames Boxed.Vector.! currentTaskNb <> "\n\
-                \cannot be scheduled " <> lastOrFirst <> " among the following tasks:\n" <>
-                subsetText <> "\n\
-                \As a consequence, the task is constrained to " <> earlierOrLater <> "\n\
-                \  * " <> Text.pack ( show associatedOtherInnerTime )
+                taskNames Boxed.Vector.! currentTaskNb <> " cannot be scheduled " <> lastOrFirst <> " among the following tasks:\n" <>
+                subsetText <>
+                "As a consequence, the task is constrained to " <> earlierOrLater <> "\n\
+                \  * " <> Text.pack ( show associatedOtherInnerTime ) <> "\n\n"
             tell 
               ( Constraints
                 { constraints    = IntMap.singleton currentTaskNb constraint
@@ -721,7 +718,7 @@ edgeFinding = do
               constraint :: Constraint t
               constraint = handedTimeConstraint currentSubsetInnerTime
               subsetText :: Text
-              subsetText = foldMap ( \ tk -> taskNames Boxed.Vector.! tk <> "\n" ) currentTaskSubset
+              subsetText = foldMap ( \ tk -> "  * " <> taskNames Boxed.Vector.! tk <> "\n" ) currentTaskSubset
               afterOrBefore, laterOrEarlier :: Text
               ( afterOrBefore, laterOrEarlier )
                 | NotEarlierThan _ _ <- constraint
@@ -730,12 +727,11 @@ edgeFinding = do
                 = ( "before", "finish before" )
               reason :: Text
               reason =
-                "Edge detected:\n\
-                \task named " <> taskNames Boxed.Vector.! blamedTaskNb <> "\n\
-                \must be scheduled " <> afterOrBefore <> " all the following tasks:\n" <>
-                subsetText <> "\n\
-                \As a consequence, the task is constrained to " <> laterOrEarlier <> "\n\
-                \  * " <> Text.pack ( show currentSubsetInnerTime )
+                "Edge found:\n" <>
+                taskNames Boxed.Vector.! blamedTaskNb <> " must be scheduled " <> afterOrBefore <> " all the following tasks:\n" <>
+                subsetText <>
+                "As a consequence, the task is constrained to " <> laterOrEarlier <> "\n\
+                \  * " <> Text.pack ( show currentSubsetInnerTime ) <> "\n\n"
             tell 
               ( Constraints
                 { constraints    = IntMap.singleton blamedTaskNb constraint
