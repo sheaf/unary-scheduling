@@ -18,6 +18,7 @@ module Schedule.Propagators
   ( normalise, prune, timetable
   , overloadCheck, detectablePrecedences
   , notExtremal, edgeFinding
+  , makespan
   )
   where
 
@@ -35,7 +36,7 @@ import Data.Foldable
 
 -- acts
 import Data.Act
-  ( Act )
+  ( Act((•)) )
 
 -- containers
 import qualified Data.IntMap.Strict as IntMap
@@ -61,13 +62,21 @@ import Data.Text
 import qualified Data.Text as Text
   ( pack )
 
+-- transformers
+import Control.Monad.State.Strict
+  ( execStateT, put )
+import Control.Monad.Trans.Class
+  ( lift )
+
 -- transformers-base
 import Control.Monad.Base
   ( MonadBase ( liftBase ) )
 
+{-
 -- tree-view
 import qualified Data.Tree.View as TreeView
   ( showTree )
+-}
 
 -- vector
 import Data.Vector as Boxed.Vector
@@ -78,6 +87,7 @@ import Data.Lattice
   ( Lattice
     ( (/\) )
   , BoundedLattice
+    ( top )
   , TotallyOrderedLattice
   )
 import Data.Vector.Generic.Index
@@ -110,11 +120,11 @@ import Schedule.Task
 import Schedule.Time
   ( Delta
   , Handedness(..), OtherHandedness
-  , HandedTime(..), LatestTime
+  , HandedTime(..), EarliestTime, LatestTime
   )
 import Schedule.Tree
   ( newTree, cloneTree, fmapTree
-  , toRoseTree -- for debugging
+--  , toRoseTree
   , Propagatable
     ( overloaded, handedIndex, propagateLeafChange )
   , DurationInfo(..), BaseDurationInfo
@@ -183,7 +193,7 @@ normalise = do
           ( Constraints
             { constraints    = IntMap.singleton taskNb ( Inside $ newIntervals )
             , justifications =
-              "Performed normalisation for " <> taskNames Boxed.Vector.! taskNb <> "\n\n"
+              "Performed normalisation for \"" <> taskNames Boxed.Vector.! taskNb <> "\"\n\n"
             }
           )
 
@@ -213,7 +223,7 @@ prune = do
         ( Constraints
           { constraints    = IntMap.singleton taskNb ( Inside kept )
           , justifications =
-            "The following time slots have been removed from " <> taskNames Boxed.Vector.! taskNb <> ",\n\
+            "The following time slots have been removed from \"" <> taskNames Boxed.Vector.! taskNb <> "\",\n\
             \as they are too short to allow the task to complete:\n" <>
             ( Text.pack ( show removed ) ) <> "\n\n"
           }
@@ -261,11 +271,11 @@ timetable = do
               ( Constraints
                 { constraints    = IntMap.singleton otherTaskNb ( Outside necessaryIntervals )
                 , justifications =
-                  taskNames Boxed.Vector.! taskNb <> " must be in progress during\n\
+                  "\"" <> taskNames Boxed.Vector.! taskNb <> "\" must be in progress during\n\
                   \  * " <> Text.pack ( show necessaryInterval ) <> "\n\
                   \As a result, the intervals \n\
                   \  * " <> Text.pack ( show removedIntervals ) <> "\n\
-                  \have been removed from " <> taskNames Boxed.Vector.! otherTaskNb <> "\n\n"
+                  \have been removed from \"" <> taskNames Boxed.Vector.! otherTaskNb <> "\"\n\n"
                 }
               )
 
@@ -323,11 +333,11 @@ overloadCheck = do
             currentTaskName = taskNames Boxed.Vector.! taskNb
             currentSubsetTaskNames =
               foldMap
-                ( \ i -> "  * " <> taskNames Boxed.Vector.! i <> "\n" )
+                ( \ i -> "  * \"" <> taskNames Boxed.Vector.! i <> "\"\n" )
                 ( taskNb : seenTaskNbs )
           throwError $
             "Could not schedule tasks:\n\
-            \  - " <> currentTaskName <> " must complete by\n\
+            \  - \"" <> currentTaskName <> "\" must complete by\n\
             \      * " <> Text.pack ( show currentLCT ) <> "\n\
             \  - the following set of tasks cannot complete before\n\
             \      * " <> Text.pack ( show estimatedECT ) <> "\n"
@@ -430,7 +440,7 @@ detectablePrecedences = do
               currentTaskSubset :: Text
               currentTaskSubset =
                 foldMap
-                  ( \ tk -> if tk == taskNb then "" else "  * " <> taskNames Boxed.Vector.! tk <> "\n" )
+                  ( \ tk -> if tk == taskNb then "" else "  * \"" <> taskNames Boxed.Vector.! tk <> "\"\n" )
                   js'
               constraint :: Constraint t
               constraint = handedTimeConstraint excludeCurrentTaskSubsetInnerTime
@@ -443,7 +453,7 @@ detectablePrecedences = do
               reason :: Text
               reason =
                 "Precedence detected:\n" <>
-                taskNames Boxed.Vector.! taskNb <> " must " <> succedeOrPrecede <> " all of the following tasks:\n" <>
+                "\"" <> taskNames Boxed.Vector.! taskNb <> "\" must " <> succedeOrPrecede <> " all of the following tasks:\n" <>
                 currentTaskSubset <>
                 "As a consequence, this task is constrained to " <> earlierOrLater <> "\n\
                 \  * " <> Text.pack ( show excludeCurrentTaskSubsetInnerTime ) <> "\n\n"
@@ -536,7 +546,7 @@ notExtremal = do
           do
             let
               subsetText :: Text
-              subsetText = foldMap ( \ tk -> "  * " <> taskNames Boxed.Vector.! tk <> "\n" ) currentSubset'
+              subsetText = foldMap ( \ tk -> "  * \"" <> taskNames Boxed.Vector.! tk <> "\"\n" ) currentSubset'
               constraint :: Constraint t
               constraint = handedTimeConstraint associatedOtherInnerTime
               lastOrFirst, earlierOrLater :: Text
@@ -547,7 +557,7 @@ notExtremal = do
                 = ( "first", "start after" )
               reason :: Text
               reason =
-                taskNames Boxed.Vector.! currentTaskNb <> " cannot be scheduled " <> lastOrFirst <> " among the following tasks:\n" <>
+                "\"" <> taskNames Boxed.Vector.! currentTaskNb <> "\" cannot be scheduled " <> lastOrFirst <> " among the following tasks:\n" <>
                 subsetText <>
                 "As a consequence, the task is constrained to " <> earlierOrLater <> "\n\
                 \  * " <> Text.pack ( show associatedOtherInnerTime ) <> "\n\n"
@@ -718,7 +728,7 @@ edgeFinding = do
               constraint :: Constraint t
               constraint = handedTimeConstraint currentSubsetInnerTime
               subsetText :: Text
-              subsetText = foldMap ( \ tk -> "  * " <> taskNames Boxed.Vector.! tk <> "\n" ) currentTaskSubset
+              subsetText = foldMap ( \ tk -> "  * \"" <> taskNames Boxed.Vector.! tk <> "\"\n" ) currentTaskSubset
               afterOrBefore, laterOrEarlier :: Text
               ( afterOrBefore, laterOrEarlier )
                 | NotEarlierThan _ _ <- constraint
@@ -728,7 +738,7 @@ edgeFinding = do
               reason :: Text
               reason =
                 "Edge found:\n" <>
-                taskNames Boxed.Vector.! blamedTaskNb <> " must be scheduled " <> afterOrBefore <> " all the following tasks:\n" <>
+                "\"" <> taskNames Boxed.Vector.! blamedTaskNb <> "\" must be scheduled " <> afterOrBefore <> " all the following tasks:\n" <>
                 subsetText <>
                 "As a consequence, the task is constrained to " <> laterOrEarlier <> "\n\
                 \  * " <> Text.pack ( show currentSubsetInnerTime ) <> "\n\n"
@@ -744,3 +754,121 @@ edgeFinding = do
       = go j currentTaskSubset
 
   go ( nbTasks - 1 ) ( Set.fromList [ 0 .. ( nbTasks - 1 ) ] )
+
+
+-- | Constrain a set of tasks to have a maximum makespan in given intervals (experimental).
+--
+-- The emitted constraints are logged (using the 'MonadWriter' instance),
+-- but not applied.
+makespan
+  :: forall f1 f2 s task t m tvec ivec
+  .  ( MonadReader ( Tasks tvec ivec task t ) m
+     , MonadWriter ( Constraints t ) m
+     , MonadBase (ST s) m
+     , Num t, Ord t, Bounded t, Show t
+     , ReadableVector m (Task task t) ( tvec (Task task t) )
+     , ReadableVector m Int           ( ivec Int )
+     , Foldable f1
+     , Foldable f2
+     )
+  => Text
+  -> f1 Int
+  -> f2 ( Interval t, Delta t )
+  -> m ()
+makespan label taskNbs mkspans = do
+
+  allTasks@( Tasks { taskNames, taskInfos = TaskInfos { tasks } } ) <- ask
+  let
+    nbTasks :: Int
+    nbTasks = Boxed.Vector.length taskNames
+
+  -- Compute the estimated ECT and LST of the given subset of tasks.
+
+  -- TODO: here we create full size task trees.
+  -- At the cost of recomputing some rankings, we could instead create
+  -- task trees the size of the given subset of tasks.
+  treeECT <- liftBase $ newTree @Earliest @(BaseDurationInfo Earliest t) nbTasks
+  treeLST <- liftBase $ newTree @Latest   @(BaseDurationInfo Latest   t) nbTasks
+  ( subsetECT, subsetLST ) <-
+    ( `execStateT` ( top, top ) ) $ for_ taskNbs \ taskNb -> do
+      task <- lift $ tasks `unsafeIndex` taskNb
+      let
+        infoECT :: BaseDurationInfo Earliest t
+        infoECT =
+          DurationInfo
+            { subsetInnerTime = pickEndPoint @Earliest @Inner task
+            , totalDuration   = taskDuration task
+            }
+        infoLST :: BaseDurationInfo Latest t
+        infoLST =
+          DurationInfo
+            { subsetInnerTime = pickEndPoint @Latest   @Inner task
+            , totalDuration   = taskDuration task
+            }
+      subsetECT <- lift $ subsetInnerTime <$> propagateLeafChange @_ @m treeECT infoECT allTasks taskNb
+      subsetLST <- lift $ subsetInnerTime <$> propagateLeafChange @_ @m treeLST infoLST allTasks taskNb
+      put ( subsetECT, subsetLST )
+
+  -- For each makespan constraint, use the computed estimates of the subset ECT and LST
+  -- to see whether there are any constraints to propagate.
+  for_ mkspans \ ( mkspan, cap ) -> do
+    -- Check whether we need to constrain tasks to not start near the beginning of the makespan range,
+    -- because the subset must be in progress near the end of the makespan range.
+    when ( validInterval $ Interval subsetECT ( end mkspan ) ) do
+      let
+        latestStart :: EndPoint ( LatestTime t )
+        latestStart = cap • ( coerce subsetECT /\ end mkspan )
+        outside :: Interval t
+        outside = Interval ( start mkspan ) latestStart
+        outsides :: Intervals t
+        outsides = Intervals ( Seq.singleton outside )
+      when ( validInterval outside ) do
+        for_ taskNbs \ taskNb -> do
+          avail <- taskAvailability <$> tasks `unsafeIndex` taskNb
+          let
+            removedIntervals :: Intervals t
+            removedIntervals = avail /\ outsides
+          unless ( null $ intervals removedIntervals ) do
+            tell
+              ( Constraints
+                { constraints    = IntMap.singleton taskNb ( Outside outsides )
+                , justifications =
+                  "The makespan constraint " <> Text.pack ( show mkspan ) <> ", " <> Text.pack ( show cap ) <> "\n\
+                  \with label " <> label <> ",\n\
+                  \prevents the task \"" <> taskNames Boxed.Vector.! taskNb <> "\"\n\
+                  \from being scheduled before " <> Text.pack ( show latestStart ) <> " within the makespan interval.\n\
+                  \As a result, the intervals \n\
+                  \  * " <> Text.pack ( show removedIntervals ) <> "\n\
+                  \have been removed from this task.\n\n"
+                }
+              )
+    -- Check whether we need to constrain tasks to not finish near the end of the makespan range,
+    -- because the subset must be in progress near the start of the makespan range.
+    when ( validInterval $ Interval ( start mkspan ) subsetLST ) do
+      let
+        earliestEnd :: EndPoint ( EarliestTime t )
+        earliestEnd = cap • ( coerce subsetLST /\ start mkspan )
+        outside :: Interval t
+        outside = Interval earliestEnd ( end mkspan )
+        outsides :: Intervals t
+        outsides = Intervals ( Seq.singleton outside )
+      when ( validInterval outside ) do
+        for_ taskNbs \ taskNb -> do
+          avail <- taskAvailability <$> tasks `unsafeIndex` taskNb
+          let
+            removedIntervals :: Intervals t
+            removedIntervals = avail /\ outsides
+          unless ( null $ intervals removedIntervals ) do
+            tell
+              ( Constraints
+                { constraints    = IntMap.singleton taskNb ( Outside outsides )
+                , justifications =
+                  "The makespan constraint " <> Text.pack ( show mkspan ) <> ", " <> Text.pack ( show cap ) <> "\n\
+                  \with label " <> label <> ",\n\
+                  \prevents the task \"" <> taskNames Boxed.Vector.! taskNb <> "\"\n\
+                  \from being scheduled after " <> Text.pack ( show earliestEnd ) <> " within the makespan interval.\n\
+                  \As a result, the intervals \n\
+                  \  * " <> Text.pack ( show removedIntervals ) <> "\n\
+                  \have been removed from this task.\n\n"
+                }
+              )

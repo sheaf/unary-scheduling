@@ -21,7 +21,7 @@ import qualified Data.Vector as Boxed.Vector
 
 -- unary-scheduling
 import Schedule
-  ( Propagator(..), allPropagators, propagateConstraints )
+  ( Propagator(..), propagateConstraints )
 import Schedule.Interval
   ( Interval(..), Intervals(..) )
 import Schedule.Propagators

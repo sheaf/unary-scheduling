@@ -6,7 +6,7 @@
 {-# LANGUAGE TypeApplications    #-}
 
 module Schedule
-  ( Propagator(..), allPropagators
+  ( Propagator(..), basicPropagators
   , propagateConstraints, propagationLoop
   )
   where
@@ -44,8 +44,8 @@ import Schedule.Time
 newtype Propagator task t =
   Propagator { runPropagator :: forall s. ScheduleMonad s task t () }
 
-allPropagators :: ( Num t, Ord t, Bounded t, Normalisable t, Show t ) => [ Propagator task t ]
-allPropagators =
+basicPropagators :: ( Num t, Ord t, Bounded t, Normalisable t, Show t ) => [ Propagator task t ]
+basicPropagators =
   [ Propagator $ normalise
   , Propagator $ prune
   , Propagator $ overloadCheck

@@ -106,6 +106,8 @@ executable schedule-spreadsheet
       unary-scheduling
     , ansi-wl-pprint
         ^>= 0.6.9
+    , attoparsec
+        ^>= 0.13.2.4
     , bytestring
         ^>= 0.10.10.0
     , directory
