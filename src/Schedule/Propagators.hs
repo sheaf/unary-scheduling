@@ -9,15 +9,22 @@
 {-# LANGUAGE OverloadedStrings      #-}
 {-# LANGUAGE PolyKinds              #-}
 {-# LANGUAGE QuantifiedConstraints  #-}
+{-# LANGUAGE RankNTypes             #-}
 {-# LANGUAGE ScopedTypeVariables    #-}
 {-# LANGUAGE TypeApplications       #-}
 {-# LANGUAGE TypeFamilies           #-}
 {-# LANGUAGE UndecidableInstances   #-}
 
 module Schedule.Propagators
-  ( normalise, prune, timetable
+  ( -- * Propagator framework.
+    Propagator(..), basicPropagators
+  , propagateConstraints, propagationLoop
+    -- * Local constraint propagators.
+  , prune, timetable
+    -- * Global constraint propagators.
   , overloadCheck, detectablePrecedences
   , notExtremal, edgeFinding
+    -- * Experimental makespan propagator.
   , makespan
   )
   where
@@ -48,13 +55,22 @@ import Data.Set
 import qualified Data.Set as Set
   ( fromList, delete )
 
+-- generic-lens
+import Data.GenericLens.Internal
+  ( set )
+import Data.Generics.Product.Fields
+  ( field' )
+
+
 -- mtl
 import Control.Monad.Except
   ( MonadError ( throwError ) )
 import Control.Monad.Reader
   ( MonadReader ( ask ) )
-import Control.Monad.Writer
-  ( MonadWriter ( tell ) )
+import Control.Monad.State.Strict
+  ( MonadState, modify'
+  , execStateT, get, put
+  )
 
 -- text
 import Data.Text
@@ -63,20 +79,12 @@ import qualified Data.Text as Text
   ( pack )
 
 -- transformers
-import Control.Monad.State.Strict
-  ( execStateT, put )
 import Control.Monad.Trans.Class
   ( lift )
 
 -- transformers-base
 import Control.Monad.Base
   ( MonadBase ( liftBase ) )
-
-{-
--- tree-view
-import qualified Data.Tree.View as TreeView
-  ( showTree )
--}
 
 -- vector
 import Data.Vector as Boxed.Vector
@@ -101,17 +109,21 @@ import Schedule.Constraint
     ( NotEarlierThan, NotLaterThan, Outside, Inside )
   , HandedTimeConstraint
     ( handedTimeConstraint )
-  , Constraints(..)
+  , Constraints(..), applyConstraints
   )
 import Schedule.Interval
   ( EndPoint(..)
-  , Interval(..), validInterval, Intervals(..)
+  , Interval(..), validInterval, duration
+  , Intervals(..)
   , pruneShorterThan
-  , Normalisable
-    ( normaliseIntervals )
+  )
+import Schedule.Monad
+  ( ScheduleMonad, runScheduleMonad
+  , SchedulableData
   )
 import Schedule.Task
   ( Task(..), Tasks(..), TaskInfos(..)
+  , ImmutableTasks
   , ect, lct, lst
   , Limit(Outer, Inner)
   , PickEndPoint
@@ -124,12 +136,84 @@ import Schedule.Time
   )
 import Schedule.Tree
   ( newTree, cloneTree, fmapTree
---  , toRoseTree
   , Propagatable
     ( overloaded, handedIndex, propagateLeafChange )
   , DurationInfo(..), BaseDurationInfo
   , DurationExtraInfo(..)
   )
+
+-------------------------------------------------------------------------------
+-- Propagator framework.
+
+-- | Wrapper for a propagator (to avoid impredicativity).
+newtype Propagator task t =
+  Propagator { runPropagator :: forall s. ScheduleMonad s task t () }
+
+-- | List of all propagators, in a convenient order for running all propagation algorithms.
+basicPropagators :: ( Num t, Ord t, Bounded t, Show t ) => [ Propagator task t ]
+basicPropagators =
+  [ Propagator $ prune
+  , Propagator $ overloadCheck
+  , Propagator $ timetable
+  , Propagator $ detectablePrecedences @Earliest
+  , Propagator $ detectablePrecedences @Latest
+  , Propagator $ notExtremal @Earliest -- not last
+  , Propagator $ notExtremal @Latest   -- not first
+  , Propagator $ edgeFinding @Earliest
+  , Propagator $ edgeFinding @Latest
+  ]
+
+-- | Propagates constraints for the scheduling of a given collection of (named) tasks,
+-- using the provided propagators.
+--
+-- Propagation proceeds in a loop, returning to the beginning of the loop
+-- when any subsequent propagator emits new constraints.
+--
+-- Returns the constrained tasks, an explanation of how the constraints arose,
+-- and, if the tasks proved to be unschedulable, an explanation for that too.
+propagateConstraints
+   :: forall task t taskData
+   .  ( Num t, Ord t, Bounded t, Show t, Show task
+      , SchedulableData taskData task t
+      )
+   => taskData
+   -> Int
+   -> [ Propagator task t ]
+   -> ( ImmutableTasks task t, Text, Maybe Text )
+propagateConstraints taskData maxLoopIterations propagators =
+  case runScheduleMonad taskData ( propagationLoop maxLoopIterations propagators ) of
+    ( updatedTasks, ( mbGaveUpText, Constraints { justifications } ) ) ->
+      ( updatedTasks, justifications, either Just ( const Nothing ) mbGaveUpText )
+
+-- | Run the given propagators in a loop until no new constraints are emitted.
+--
+-- Goes back to the start of the list of propagators each time a new constraint is emitted.
+propagationLoop
+  :: forall s task t
+  .  ( Num t, Ord t, Bounded t
+     -- debugging
+     , Show t, Show task
+     )
+  => Int
+  -> [ Propagator task t ]
+  -> ScheduleMonad s task t ()
+propagationLoop maxLoopIterations propagators = go 0 propagators
+  where
+    go :: Int -> [ Propagator task t ] -> ScheduleMonad s task t ()
+    go _ []
+      = pure ()
+    go i _
+      | i >= maxLoopIterations
+      = pure ()
+    go i ( Propagator { runPropagator = runCurrentPropagator } : followingPropagators ) = do
+      runCurrentPropagator
+      newConstraints <- get
+      if null ( constraints newConstraints )
+      then go i followingPropagators
+      else do
+        applyConstraints newConstraints
+        modify' ( set ( field' @"constraints" ) mempty )
+        go (i+1) propagators
 
 -------------------------------------------------------------------------------
 -- Convenience class synonym for polymorphism over scheduling tree handedness.
@@ -160,51 +244,20 @@ instance
   , forall t. Show t => Show ( HandedTime oh t )
   ) => KnownHandedness h oh where
 
+tell :: ( Monoid s, MonadState s m ) => s -> m ()
+tell s = modify' ( <> s )
+
 -------------------------------------------------------------------------------
 -- Local constraints.
 
-
--- | Normalise task intervals, e.g. by shrinking "exclusive" endpoints for discrete domains.
---
--- The emitted constraints are logged (using the 'MonadWriter' instance),
--- but not applied.
-normalise
-  :: forall s task t m tvec ivec
-  .  ( MonadReader ( Tasks tvec ivec task t ) m
-     , MonadWriter ( Constraints t ) m
-     , MonadBase (ST s) m
-     , Num t, Ord t, Normalisable t, Show t
-     , ReadableVector m (Task task t) ( tvec (Task task t) )
-     )
-  => m ()
-normalise = do
-  Tasks { taskNames, taskInfos = TaskInfos { tasks } } <- ask
-  let
-    nbTasks :: Int
-    nbTasks = Boxed.Vector.length taskNames
-  -- TODO: avoid repeating this computation for tasks that haven't been modified since the last time.
-  -- TODO: avoid doing this computation altogether for types which never need normalisation.
-  for_ [ 0 .. nbTasks - 1 ] \ taskNb -> do
-    task <- tasks `unsafeIndex` taskNb
-    case normaliseIntervals ( taskAvailability task ) of
-      Nothing -> pure ()
-      Just newIntervals ->
-        tell 
-          ( Constraints
-            { constraints    = IntMap.singleton taskNb ( Inside $ newIntervals )
-            , justifications =
-              "Performed normalisation for \"" <> taskNames Boxed.Vector.! taskNb <> "\"\n\n"
-            }
-          )
-
 -- | Prune task intervals that are too short for the task to complete.
 --
--- The emitted constraints are logged (using the 'MonadWriter' instance),
+-- The emitted constraints are logged (using the 'MonadState' instance),
 -- but not applied.
 prune
   :: forall s task t m tvec ivec
   .  ( MonadReader ( Tasks tvec ivec task t ) m
-     , MonadWriter ( Constraints t ) m
+     , MonadState  ( Constraints t ) m
      , MonadBase (ST s) m
      , Num t, Ord t, Show t
      , ReadableVector m (Task task t) ( tvec (Task task t) )
@@ -219,7 +272,7 @@ prune = do
   for_ [ 0 .. nbTasks - 1 ] \ taskNb -> do
     task <- tasks `unsafeIndex` taskNb
     for_ ( pruneShorterThan ( taskDuration task ) ( taskAvailability task ) ) \ ( kept, removed ) -> do
-      tell 
+      tell
         ( Constraints
           { constraints    = IntMap.singleton taskNb ( Inside kept )
           , justifications =
@@ -232,12 +285,12 @@ prune = do
 -- | Check time spans for which a task is necessarily scheduled, and remove them
 -- from all other tasks (as they can't be scheduled concurrently).
 --
--- The emitted constraints are logged (using the 'MonadWriter' instance),
+-- The emitted constraints are logged (using the 'MonadState' instance),
 -- but not applied.
 timetable
   :: forall s task t m tvec ivec
   .  ( MonadReader ( Tasks tvec ivec task t ) m
-     , MonadWriter ( Constraints t ) m
+     , MonadState  ( Constraints t ) m
      , MonadBase (ST s) m
      , Num t, Ord t, Bounded t, Show t
      , ReadableVector m (Task task t) ( tvec (Task task t) )
@@ -256,7 +309,7 @@ timetable = do
       taskECT = ect task
       necessaryInterval :: Interval t
       necessaryInterval = Interval ( coerce taskLST ) ( coerce taskECT )
-    when ( validInterval necessaryInterval ) do
+    when ( duration necessaryInterval > mempty ) do
       let
         necessaryIntervals :: Intervals t
         necessaryIntervals = Intervals ( Seq.singleton necessaryInterval )
@@ -360,12 +413,12 @@ overloadCheck = do
 -- Similarly, with 'Latest' handedness,
 -- this function detects when the task `i` must precede all tasks in the subset.
 --
--- The emitted constraints are logged (using the 'MonadWriter' instance),
+-- The emitted constraints are logged (using the 'MonadState' instance),
 -- but not applied.
 detectablePrecedences
   :: forall h oh s task t m tvec ivec
   .  ( MonadReader ( Tasks tvec ivec task t ) m
-     , MonadWriter ( Constraints t ) m
+     , MonadState  ( Constraints t ) m
      , MonadBase (ST s) m
      , Num t, Ord t, Bounded t, Show t
      , ReadableVector m (Task task t) ( tvec (Task task t) )
@@ -457,6 +510,7 @@ detectablePrecedences = do
                 currentTaskSubset <>
                 "As a consequence, this task is constrained to " <> earlierOrLater <> "\n\
                 \  * " <> Text.pack ( show excludeCurrentTaskSubsetInnerTime ) <> "\n\n"
+            -- TODO: add precedence to precedence graph to avoid unnecessary duplication of effort.
             tell
               ( Constraints
                 { constraints    = IntMap.singleton taskNb constraint
@@ -476,12 +530,12 @@ detectablePrecedences = do
 -- Dually, if the latest start time of a subset is inferior to the earliest completion time of a task,
 -- then that task cannot be scheduled before all tasks in the subset (`not first`).
 --
--- The emitted constraints are logged (using the 'MonadWriter' instance),
+-- The emitted constraints are logged (using the 'MonadState' instance),
 -- but not applied.
 notExtremal
   :: forall h oh s task t m tvec ivec
   .  ( MonadReader ( Tasks tvec ivec task t ) m
-     , MonadWriter ( Constraints t ) m
+     , MonadState  ( Constraints t ) m
      , MonadBase (ST s) m
      , Num t, Ord t, Bounded t, Show t
      , ReadableVector m (Task task t) ( tvec (Task task t) )
@@ -561,7 +615,7 @@ notExtremal = do
                 subsetText <>
                 "As a consequence, the task is constrained to " <> earlierOrLater <> "\n\
                 \  * " <> Text.pack ( show associatedOtherInnerTime ) <> "\n\n"
-            tell 
+            tell
               ( Constraints
                 { constraints    = IntMap.singleton currentTaskNb constraint
                 , justifications = reason
@@ -626,12 +680,12 @@ notExtremal = do
 -- is inferior to the earliest start time of the original subset Θ,
 -- the extra task must be scheduled before all the tasks in Θ.
 --
--- The emitted constraints are logged (using the 'MonadWriter' instance),
+-- The emitted constraints are logged (using the 'MonadState' instance),
 -- but not applied.
 edgeFinding
   :: forall h oh s task t m tvec ivec
   .  ( MonadReader ( Tasks tvec ivec task t ) m
-     , MonadWriter ( Constraints t ) m
+     , MonadState  ( Constraints t ) m
      , MonadBase (ST s) m
      , Num t, Ord t, Bounded t, Show t
      , ReadableVector m (Task task t) ( tvec (Task task t) )
@@ -742,7 +796,8 @@ edgeFinding = do
                 subsetText <>
                 "As a consequence, the task is constrained to " <> laterOrEarlier <> "\n\
                 \  * " <> Text.pack ( show currentSubsetInnerTime ) <> "\n\n"
-            tell 
+            -- TODO: add precedence to precedence graph to avoid unnecessary duplication of effort.
+            tell
               ( Constraints
                 { constraints    = IntMap.singleton blamedTaskNb constraint
                 , justifications = reason
@@ -758,12 +813,12 @@ edgeFinding = do
 
 -- | Constrain a set of tasks to have a maximum makespan in given intervals (experimental).
 --
--- The emitted constraints are logged (using the 'MonadWriter' instance),
+-- The emitted constraints are logged (using the 'MonadState' instance),
 -- but not applied.
 makespan
   :: forall f1 f2 s task t m tvec ivec
   .  ( MonadReader ( Tasks tvec ivec task t ) m
-     , MonadWriter ( Constraints t ) m
+     , MonadState  ( Constraints t ) m
      , MonadBase (ST s) m
      , Num t, Ord t, Bounded t, Show t
      , ReadableVector m (Task task t) ( tvec (Task task t) )

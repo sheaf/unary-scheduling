@@ -1,5 +1,6 @@
 {-# LANGUAGE BlockArguments      #-}
 {-# LANGUAGE DataKinds           #-}
+{-# LANGUAGE DeriveGeneric       #-}
 {-# LANGUAGE DerivingStrategies  #-}
 {-# LANGUAGE FlexibleContexts    #-}
 {-# LANGUAGE NamedFieldPuns      #-}
@@ -16,6 +17,8 @@ module Schedule.Constraint
     ( .. , NotEarlierThan, NotLaterThan, Outside, Inside )
   , HandedTimeConstraint(..)
   , Constraints(..)
+  , constrainToBefore, constrainToAfter
+  , constrainToInside, constrainToOutside
   , applyConstraint, applyConstraints
   )
   where
@@ -27,6 +30,8 @@ import Control.Monad.ST
   ( ST )
 import Data.Foldable
   ( traverse_, foldl' )
+import GHC.Generics
+  ( Generic )
 
 -- containers
 import Data.IntMap.Strict
@@ -83,7 +88,7 @@ data Constraint t
   , outside        :: Maybe ( Intervals t )
   , inside         :: Maybe ( Intervals t )
   }
-  deriving stock Show
+  deriving stock ( Show, Generic )
 
 pattern NotEarlierThan :: Ord t => EarliestTime t -> Clusivity -> Constraint t
 pattern NotEarlierThan t clu <- ( notEarlierThan -> Just ( EndPoint t clu ) )
@@ -127,7 +132,7 @@ data Constraints t
   { constraints    :: IntMap ( Constraint t )
   , justifications :: Text
   }
-  deriving stock Show
+  deriving stock ( Show, Generic )
 
 instance Ord t => Semigroup ( Constraints t ) where
   ( Constraints cts1 logs1 ) <> ( Constraints cts2 logs2 ) =

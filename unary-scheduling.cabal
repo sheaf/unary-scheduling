@@ -21,6 +21,8 @@ common common
         >= 4.11 && < 5.0
     , containers
         ^>= 0.6.2.1
+    , deepseq
+        ^>= 1.4.4.0
     , generic-lens
         >= 1.2.0.1 && < 2.0.0.0
     , mtl
@@ -46,6 +48,14 @@ common common
     -fwarn-missing-deriving-strategies
     -fno-warn-unticked-promoted-constructors
 
+flag viz
+  description:
+    Include visualisation functions (useful for debugging).
+  default:
+    True
+  manual:
+    False
+
 library
 
   import: common
@@ -61,11 +71,12 @@ library
     , Data.Vector.Generic.Index
     , Data.Vector.PhaseTransition
     , Data.Vector.Ranking
-    , Schedule
     , Schedule.Constraint
     , Schedule.Interval
     , Schedule.Monad
+    , Schedule.Ordering
     , Schedule.Propagators
+    , Schedule.Search
     , Schedule.Task
     , Schedule.Time
     , Schedule.Tree
@@ -76,6 +87,8 @@ library
   build-depends:
       acts
         ^>= 0.3.0.0
+    , bitvec
+        ^>= 1.0.3.0
     , groups
         ^>= 0.4.0.0
     , primitive
@@ -83,10 +96,14 @@ library
     , transformers-base
         ^>= 0.4.5.2
 
-    -- for debugging
-    , tree-view
-        ^>= 0.5
-
+  if flag(viz)
+    build-depends:
+        algebraic-graphs
+          ^>= 0.5
+      , tree-view
+          ^>= 0.5
+    cpp-options:
+      -DVIZ
 
 executable schedule-spreadsheet
   
@@ -122,3 +139,6 @@ executable schedule-spreadsheet
         ^>= 1.9.3
     , xlsx
         ^>= 0.8.0
+
+  ghc-options:
+    -threaded

@@ -1,4 +1,6 @@
 {-# LANGUAGE DataKinds                  #-}
+{-# LANGUAGE DeriveAnyClass             #-}
+{-# LANGUAGE DeriveGeneric              #-}
 {-# LANGUAGE DerivingVia                #-}
 {-# LANGUAGE FlexibleInstances          #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
@@ -21,10 +23,16 @@ import Data.Monoid
   ( Sum(..) )
 import Data.Semigroup
   ( Max(..), Min(..) )
+import GHC.Generics
+  ( Generic )
 
 -- acts
 import Data.Act
   ( Act(..), Torsor )
+
+-- deepseq
+import Control.DeepSeq
+  ( NFData )
 
 -- groups
 import Data.Group
@@ -34,18 +42,19 @@ import Data.Group
 
 newtype Time t = Time { getTime :: t }
   deriving stock   Show
-  deriving newtype ( Eq, Ord, Enum, Bounded )
+  deriving newtype ( Eq, Ord, Enum, Bounded, NFData )
   deriving ( Act ( Delta t ), Torsor ( Delta t ) )
     via ( Delta t )
 
 newtype Delta t = Delta { getDelta :: t }
   deriving stock    Show
-  deriving newtype ( Eq, Ord )
+  deriving newtype ( Eq, Ord, NFData )
   deriving ( Semigroup, Monoid, Group )
     via ( Sum t )
 
 data Handedness = Earliest | Latest
-  deriving stock Show
+  deriving stock    ( Show, Generic )
+  deriving anyclass NFData
 
 type family OtherHandedness ( h :: Handedness ) :: Handedness where
   OtherHandedness Earliest = Latest
@@ -53,7 +62,7 @@ type family OtherHandedness ( h :: Handedness ) :: Handedness where
 
 -- | Earliest time or latest time.
 newtype HandedTime ( h :: Handedness ) t = HandedTime { handedTime :: Time t }
-  deriving newtype ( Eq, Ord, Bounded )
+  deriving newtype ( Eq, Ord, Bounded, NFData )
 
 instance Show t => Show ( HandedTime Earliest t ) where
   show ( EarliestTime t ) = "EarliestTime " <> show t

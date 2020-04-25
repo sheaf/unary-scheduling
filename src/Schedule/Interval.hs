@@ -1,3 +1,5 @@
+{-# LANGUAGE DeriveAnyClass             #-}
+{-# LANGUAGE DeriveGeneric              #-}
 {-# LANGUAGE DerivingStrategies         #-}
 {-# LANGUAGE FlexibleInstances          #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
@@ -11,12 +13,11 @@ module Schedule.Interval
   ( Clusivity(..), EndPoint(..)
   , Interval(.., (:<..<), (:<..<=), (:<=..<), (:<=..<=))
   , validInterval
-  , startTime, endTime
+  , startTime, endTime, duration
   , intersection
-  , inside
+  , inside, insideLax
   , Intervals(..)
   , cutBefore, cutAfter, remove, pruneShorterThan
-  , Normalisable(..)
   ) where
 
 -- base
@@ -30,6 +31,8 @@ import Data.Coerce
   ( coerce )
 import Data.Semigroup
   ( Arg(..) )
+import GHC.Generics
+  ( Generic )
 
 -- acts
 import Data.Act
@@ -41,11 +44,11 @@ import Data.Sequence
     ( Empty, (:<|), (:|>) )
   )
 import qualified Data.Sequence as Seq
-  ( singleton )
+  ( singleton, sortOn )
 
--- transformers
-import Control.Monad.Trans.State.Strict
-  ( State, runState, put )
+-- deepseq
+import Control.DeepSeq
+  ( NFData )
 
 -- unary-scheduling
 import Data.Lattice
@@ -61,7 +64,8 @@ import Schedule.Time
 data Clusivity
   = Exclusive
   | Inclusive
-  deriving stock ( Show, Eq, Ord )
+  deriving stock    ( Show, Eq, Ord, Generic )
+  deriving anyclass NFData
 
 instance Lattice Clusivity where
   Exclusive /\ _   = Exclusive
@@ -82,7 +86,8 @@ data EndPoint t
     { endPoint  :: !t
     , clusivity :: !Clusivity
     }
-  deriving stock ( Show, Eq )
+  deriving stock    ( Show, Eq, Generic )
+  deriving anyclass NFData
 
 instance Ord t => Ord ( EndPoint ( EarliestTime t ) ) where
   compare ( EndPoint t1 clu1 ) ( EndPoint t2 clu2 ) =
@@ -175,7 +180,8 @@ data Interval t
   { start :: !(EndPoint (EarliestTime t))
   , end   :: !(EndPoint (  LatestTime t))
   }
-  deriving stock ( Show, Eq )
+  deriving stock    ( Show, Eq, Generic )
+  deriving anyclass NFData
 
 {-# COMPLETE (:<..<), (:<=..<), (:<..<=), (:<=..<=) #-}
 pattern (:<..<), (:<=..<), (:<..<=), (:<=..<=) :: Time t -> Time t -> Interval t
@@ -189,6 +195,9 @@ startTime = start >>> endPoint
 
 endTime :: Interval t -> LatestTime t
 endTime = end >>> endPoint
+
+duration :: Num t => Interval t -> Delta t
+duration ( Interval ( EndPoint ( EarliestTime s ) _ ) ( EndPoint ( LatestTime e ) _ ) ) = s --> e
 
 validInterval :: Ord t => Interval t -> Bool
 validInterval ( Interval ( EndPoint ( EarliestTime s ) s_clu ) ( EndPoint ( LatestTime e ) e_clu ) ) =
@@ -221,19 +230,38 @@ inside = coerce inside'
             EQ -> e_clu == Inclusive
             GT -> t `inside'` ivals
 
+-- | Like 'inside', but assumes endpoints are always included.
+insideLax :: forall t. Ord t => Time t -> Intervals t -> Bool
+insideLax = coerce insideLax'
+  where
+    insideLax' :: Time t -> Seq ( Interval t ) -> Bool
+    insideLax' _ Empty = False
+    insideLax' t ( Interval ( EndPoint ( EarliestTime s ) _ ) ( EndPoint ( LatestTime e ) _ ) :<| ivals )
+      = case compare t s of
+          LT -> False
+          EQ -> True
+          GT -> case compare t e of
+            GT -> t `insideLax'` ivals
+            _ -> True
+
 -------------------------------------------------------------------------------
 -- Intervals.
 
 -- | Ordered collection of non-overlapping intervals.
 newtype Intervals t = Intervals { intervals :: Seq (Interval t) }
   deriving stock   Show
-  deriving newtype Eq
+  deriving newtype ( Eq, NFData )
 
 instance Ord t => Lattice ( Intervals t ) where
-  Intervals ivals1 \/ Intervals ivals2 = Intervals ( go ivals1 ivals2 )
+  Intervals ivals1 \/ Intervals ivals2 = Intervals ( merge ( Seq.sortOn start ( ivals1 <> ivals2 ) ) )
     where
-      go :: Seq (Interval t) -> Seq (Interval t) -> Seq (Interval t)
-      go _ _ = error "union of intervals: TODO"
+      merge :: Seq (Interval t) -> Seq (Interval t)
+      merge ( Interval s1 e1 :<| Interval s2 e2 :<| ivals )
+        | validInterval ( Interval s2 e1 )
+        = merge ( Interval s1 e2 :<| ivals )
+        | otherwise
+        = Interval s1 e1 :<| merge ( Interval s2 e2 :<| ivals )
+      merge ivals = ivals
   Intervals ivals1 /\ Intervals ivals2 = Intervals ( go ivals1 ivals2 )
     where
       go :: Seq (Interval t) -> Seq (Interval t) -> Seq (Interval t)
@@ -332,36 +360,3 @@ pruneShorterThan = coerce pruneShorterThan'
       = Just ( mempty, Seq.singleton ival )     <> pruneShorterThan' delta ivals
       | otherwise
       = fmap ( first ( Seq.singleton ival <> ) ) $ pruneShorterThan' delta ivals
-
--------------------------------------------------------------------------------
--- Normalisation of intervals.
-
-class Normalisable t where
-  normaliseIntervals :: Intervals t -> Maybe (Intervals t)
-
-instance {-# OVERLAPPABLE #-} ( Ord t, Enum t ) => Normalisable t where
-  normaliseIntervals ( Intervals ivs ) = case ( `runState` False ) $ normaliseIntervals' ivs of
-    ( _, False ) -> Nothing
-    ( ivals, _ ) -> Just ( Intervals ivals )
-    where
-      normaliseIntervals' :: Seq ( Interval t ) -> State Bool ( Seq (Interval t) )
-      normaliseIntervals' ( ival@( _ :<=..<= _ ) :<| ivals ) =
-        ( ival :<| ) <$> normaliseIntervals' ivals
-      normaliseIntervals' ( Interval ( EndPoint ( EarliestTime s ) s_clu ) ( EndPoint ( LatestTime e ) e_clu ) :<| ivals ) = do
-        put True
-        let
-          s' 
-            | Exclusive <- s_clu
-            = succ s
-            | otherwise
-            = s
-          e' 
-            | Exclusive <- e_clu
-            = pred e
-            | otherwise
-            = e
-          ival' = s' :<=..<= e'
-        if validInterval ival'
-        then ( ival' :<| ) <$> normaliseIntervals' ivals
-        else normaliseIntervals' ivals
-      normaliseIntervals' _ = pure Empty

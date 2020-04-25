@@ -1,4 +1,5 @@
 {-# LANGUAGE BlockArguments        #-}
+{-# LANGUAGE DeriveAnyClass        #-}
 {-# LANGUAGE DeriveGeneric         #-}
 {-# LANGUAGE DerivingStrategies    #-}
 {-# LANGUAGE FlexibleInstances     #-}
@@ -25,6 +26,10 @@ import Data.List
   ( sort )
 import GHC.Generics
   ( Generic )
+
+-- deepseq
+import Control.DeepSeq
+  ( NFData )
 
 -- generic-lens
 import Data.Generics.Product.Constraints
@@ -55,7 +60,8 @@ data Ranking indices
     { ordered :: !indices
     , ranks   :: !indices
     }
-  deriving stock ( Show, Generic )
+  deriving stock    ( Show, Generic )
+  deriving anyclass NFData
 
 instance Freeze m mvec vec => Freeze m (Ranking mvec) (Ranking vec) where
   freeze       = constraints @( Freeze m ) freeze

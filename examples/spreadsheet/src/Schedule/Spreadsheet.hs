@@ -29,6 +29,8 @@ import Data.Foldable
   ( for_, toList )
 import Data.Functor
   ( ($>) )
+import Data.Semigroup
+  ( Arg(..) )
 import Data.Traversable
   ( for )
 import qualified Numeric
@@ -71,6 +73,10 @@ import qualified Data.Set as Set
 import Data.Sequence
   ( Seq(..) )
 
+-- deepseq
+import Control.DeepSeq
+  ( NFData )
+
 -- directory
 import qualified System.Directory as Directory
   ( doesFileExist )
@@ -102,7 +108,7 @@ import qualified Options.Applicative as OptParse
   ( execParserPure, execCompletion, renderFailure
   , ParserResult(..), CompletionResult(..)
   , Parser, ParserInfo(..), ParserPrefs(..)
-  , strOption, strArgument, switch, helper
+  , strOption, strArgument, switch, flag, helper
   , long, short, metavar, value, help
   )
 import qualified Options.Applicative.Help.Chunk as OptParse
@@ -116,7 +122,7 @@ import Data.Text
 import qualified Data.Text as Text
   ( pack, replicate, intercalate )
 import qualified Data.Text.IO as Text
-  ( appendFile, hPutStrLn )
+  ( appendFile, writeFile, hPutStrLn )
 
 -- time
 import qualified Data.Time.Clock.POSIX as Time
@@ -133,12 +139,14 @@ import Control.Monad.Trans.Except
   ( ExceptT(..)
   , runExceptT, withExceptT
   )
+import Control.Monad.IO.Class
+  ( liftIO )
 
 -- vector
 import qualified Data.Vector as Boxed
   ( Vector )
 import qualified Data.Vector as Boxed.Vector
-  ( length, fromList, (!), zipWith, unzip, unsafeFreeze )
+  ( length, fromList, (!), zipWith, unsafeFreeze )
 import qualified Data.Vector.Mutable as Boxed.MVector
   ( replicate, modify )
 
@@ -154,16 +162,22 @@ import qualified Codec.Xlsx as Xlsx
 -- unary-scheduling
 import Data.Lattice
   ( Meet(..) )
-import Schedule
-  ( propagateConstraints, Propagator(..), basicPropagators )
 import Schedule.Propagators
-  ( makespan )
+  ( propagateConstraints, Propagator(..), basicPropagators
+  , makespan
+  )
 import Schedule.Interval
   ( Interval((:<=..<=)), Intervals(..)
-  , inside
+  , insideLax
   )
+import Schedule.Ordering
+  ( visualiseEdges )
+import Schedule.Search
+  ( SearchState(..), search )
 import Schedule.Task
-  ( Task(..), Tasks(..), TaskInfos(..) )
+  ( Task(..), Tasks(..), TaskInfos(..)
+  , ImmutableTasks
+  )
 import Schedule.Time
   ( Delta(..), Time(..) )
 
@@ -178,9 +192,8 @@ scheduleSpreadsheet :: ExceptT Error IO ()
 scheduleSpreadsheet = do
 
   -- Get command line arguments: input/output spreadsheet file paths,
-  -- and whether to perform constraint propoagation (if so, include filepath for logging).
-  Args { inputSpreadsheetPath, outputSpreadsheetPath, constraintLoggingPath, useMakespanConstraints }
-    <- parseArgs
+  -- whether to perform constraint propagation (if so, include filepath for logging) and search.
+  Args { .. } <- parseArgs
   currentPosixTime <- lift Time.getPOSIXTime
   currentTimeZone  <- lift Time.getCurrentTimeZone
   let
@@ -203,8 +216,8 @@ scheduleSpreadsheet = do
 
   -- Parse spreadsheet data.
   {-allSpreadsheetData@-}
-  SchedulingData { schedulingTasks, schedulingStaff, schedulingRanges } <-
-    liftEither $ parseSpreadsheet useMakespanConstraints spreadsheet
+  SchedulingData { schedulingTasks, schedulingStaff, schedulingRanges, totalSchedulingCost }
+    <- liftEither $ parseSpreadsheet useMakespanConstraints spreadsheet
 
   {-
   -- Log parsed data for debugging.
@@ -212,34 +225,67 @@ scheduleSpreadsheet = do
   -}
 
   -- Perform constraint propagation (if enabled).
-  newTaskData <- case constraintLoggingPath of
-    Nothing ->
-      pure ( Boxed.Vector.unzip $ Boxed.Vector.fromList schedulingTasks )
-    Just justificationsPath -> do
-      -- Propagate constraints using unary scheduling algorithms.
+  let
+    propagators :: [ Propagator ( Set Staff ) Column ]
+    propagators
+      | Nothing <- constraintLoggingPath
+      = [ ]
+      | useMakespanConstraints
+      , let
+          makespanPropagators :: [ Propagator ( Set Staff ) Column ]
+          makespanPropagators
+            = toList
+            $ fmap
+                ( \ StaffMemberData { memberName, memberMakespanRanges, memberAssignedTasks } ->
+                  Propagator $ makespan memberName memberAssignedTasks memberMakespanRanges
+                )
+                schedulingStaff
+      = basicPropagators ++ makespanPropagators
+      | otherwise
+      = basicPropagators
+
+    -- Propagate constraints using unary scheduling algorithms.
+    ( afterPropTasks, justifications, mbError ) =
+      propagateConstraints schedulingTasks 100 propagators
+
+  for_ constraintLoggingPath \ justificationsPath -> do
+    -- Log constraint propagation information.
+    lift $ Text.appendFile justificationsPath
+      ( "\n" <> Text.replicate 25 "-" <> "\n" <>
+      "-- " <> Text.pack formattedTime <> " --\n" <>
+      Text.replicate 25 "-" <> "\n\n-------\n" <>
+      "Input:  " <> Text.pack inputPath <> "\n" <>
+      "Output: " <> Text.pack outputPath <> "\n-------\n\n" <>
+      justifications
+      )
+
+  -- Throw an error if scheduling has been found to be impossible.
+  for_ mbError \ err -> throwError ( NoSchedulingPossible err )
+
+  -- Search the remaining possibilities (if search is enabled).
+  finalTasks <-
+    if useSearch
+    then do
       let
-        makespanPropagators, allPropagators :: [ Propagator ( Set Staff ) Column ]
-        makespanPropagators
-          = toList
-          $ fmap ( \ ( _, name, cts, tasks ) -> Propagator $ makespan name tasks cts ) schedulingStaff
-        allPropagators = if useMakespanConstraints then basicPropagators ++ makespanPropagators else basicPropagators
-        ( Tasks { taskNames, taskInfos }, justifications, mbError ) = propagateConstraints ( Left schedulingTasks ) 100 allPropagators
-      -- Log constraint propagation information.
-      lift $ Text.appendFile justificationsPath
-        ( "\n" <> Text.replicate 25 "-" <> "\n" <>
-        "-- " <> Text.pack formattedTime <> " --\n" <>
-        Text.replicate 25 "-" <> "\n\n-------\n" <>
-        "Input:  " <> Text.pack inputPath <> "\n" <>
-        "Output: " <> Text.pack outputPath <> "\n-------\n\n" <>
-        justifications
+        searchRes :: SearchState (Set Staff) Column
+        searchRes = search totalSchedulingCost 10 propagators afterPropTasks
+      liftIO $ Text.appendFile "search_statistics.txt"
+        ( "Found " <> Text.pack ( show ( totalSolutionsFound searchRes ) ) <> " solutions after "
+        <> Text.pack ( show ( totalDecisionsTaken searchRes ) ) <> " decisions\n\n"
         )
-      -- Throw an error if scheduling has been found to be impossible.
-      for_ mbError \ err -> throwError ( NoSchedulingPossible err )
-      pure ( tasks taskInfos, taskNames )
+      case solutions searchRes of
+        ( Arg cost bestSol : _ ) -> do
+          liftIO $ Text.writeFile "dotfile.txt" ( visualiseEdges . orderings . taskInfos $ bestSol )
+          liftIO $ Text.writeFile "cost.txt" ( Text.pack ( show cost ) )
+          pure bestSol
+        _ -> throwError ( NoSchedulingPossible "Search has found no results" )
+    else pure afterPropTasks
 
   -- Write output spreadsheet with updated availability information.
   let
-    outputData = Xlsx.fromXlsx currentPosixTime ( updateSpreadsheet schedulingRanges newTaskData schedulingStaff spreadsheet )
+    outputData =
+      Xlsx.fromXlsx currentPosixTime
+        ( updateSpreadsheet schedulingRanges finalTasks schedulingStaff spreadsheet )
   lift $ LazyByteString.writeFile outputPath outputData
 
 -------------------------------------------------------------------------------
@@ -259,6 +305,15 @@ data SchedulingRanges
   }
   deriving stock Show
 
+data StaffMemberData
+  = StaffMemberData
+  { memberAvailability   :: !(Intervals Column)
+  , memberName           :: !Text
+  , memberMakespanRanges :: ![ ( Interval Column, Delta Column ) ]
+  , memberSchedulingCost :: ( ImmutableTasks ( Set Staff ) Column -> Double )
+  , memberAssignedTasks  :: !(Set Int)
+  }
+
 -- | All the information needed to run the scheduling algorithms:
 --
 -- - staff availabilities, names, makespan constraints and assigned tasks,
@@ -266,18 +321,18 @@ data SchedulingRanges
 -- - spreadsheet ranges, giving us the info of where to write results to.
 data SchedulingData
   = SchedulingData
-  { schedulingStaff  :: !( Boxed.Vector ( Intervals Column, Text, [ ( Interval Column, Delta Column ) ], Set Int ) )
-  , schedulingTasks  :: ![ ( Task ( Set Staff ) Column, Text ) ]
-  , schedulingRanges :: !SchedulingRanges
+  { schedulingStaff     :: !( Boxed.Vector StaffMemberData )
+  , schedulingTasks     :: ![ ( Task ( Set Staff ) Column, Text ) ]
+  , schedulingRanges    :: !SchedulingRanges
+  , totalSchedulingCost :: ( ImmutableTasks ( Set Staff ) Column -> Double )
   }
-  deriving stock Show
 
 newtype Staff = Staff { staffID :: Int }
   deriving stock   Show
-  deriving newtype ( Eq, Ord )
+  deriving newtype ( Eq, Ord, NFData )
 
 newtype Column = Column { getColumn :: Int }
-  deriving newtype ( Eq, Ord, Enum, Bounded, Num )
+  deriving newtype ( Eq, Ord, Enum, Bounded, Num, NFData )
 -- Bijective base 26 system.
 instance Show Column where
   show ( Column { getColumn = c } )
@@ -332,7 +387,7 @@ parseSpreadsheet enableMakespanConstraints spreadsheet = runST $ runExceptT do
   --   - the columns containing available scheduling slots.
   schedulingRanges@( SchedulingRanges{ .. } ) <- parseRanges cells
 
-  -- Parse the staff names, availabilities and makespan constraints.
+  -- Parse the staff names, availabilities, makespan constraints and cost parameters.
   schedulingStaffInfo <- Boxed.Vector.fromList <$>
     for [ firstStaffRow .. lastStaffRow ] \ staffRow -> do
       let
@@ -348,7 +403,11 @@ parseSpreadsheet enableMakespanConstraints spreadsheet = runST $ runExceptT do
           Nothing   -> pure []
           Just cell -> parseMakespanConstraints makespanConstraintLocation cell
         else pure []
-      pure ( avail, name, makespanCt )
+      -- Parsing individual staff member scheduling cost function (TODO)
+      let
+        schedulingCost :: ImmutableTasks ( Set Staff ) Column -> Double
+        schedulingCost = const 0
+      pure ( avail, name, makespanCt, schedulingCost )
 
   let
     nbStaff :: Int
@@ -376,7 +435,7 @@ parseSpreadsheet enableMakespanConstraints spreadsheet = runST $ runExceptT do
         <> foldMap
             ( \ ( Staff { staffID } ) ->
               let
-                ( avail, _, _ ) = schedulingStaffInfo Boxed.Vector.! staffID
+                ( avail, _, _, _ ) = schedulingStaffInfo Boxed.Vector.! staffID
               in Meet avail
             )
             taskStaffIDs
@@ -398,14 +457,24 @@ parseSpreadsheet enableMakespanConstraints spreadsheet = runST $ runExceptT do
   --  - names,
   --  - availabilities,
   --  - tasks they are assigned to,
+  --  - cost parameters,
   --  - makespan constraints.
   staffTasks <- Boxed.Vector.unsafeFreeze staffTaskNbs
   let
-    schedulingStaff :: Boxed.Vector ( Intervals Column, Text, [ ( Interval Column, Delta Column ) ], Set Int )
-    schedulingStaff = Boxed.Vector.zipWith ( \ ( a, b, c ) d -> ( a, b, c, d ) ) schedulingStaffInfo staffTasks
+    schedulingStaff :: Boxed.Vector StaffMemberData
+    schedulingStaff =
+      Boxed.Vector.zipWith
+        ( \ ( memberAvailability, memberName, memberMakespanRanges, memberSchedulingCost )
+            memberAssignedTasks
+         -> StaffMemberData { .. }
+        )
+        schedulingStaffInfo staffTasks
+    -- Total scheduling cost function (TODO).
+    totalSchedulingCost :: ImmutableTasks ( Set Staff ) Column -> Double
+    totalSchedulingCost = const 0
 
   -- Return the above info.
-  pure ( SchedulingData { schedulingStaff, schedulingTasks, schedulingRanges } )
+  pure ( SchedulingData { schedulingStaff, schedulingTasks, schedulingRanges, totalSchedulingCost } )
 
 -- | Parse ranges for scheduling:
 --
@@ -656,11 +725,11 @@ parseMakespanConstraints loc _ =
 -- unavailable task time slots with the value @0@.
 updateSpreadsheet
   :: SchedulingRanges
-  -> ( Boxed.Vector ( Task taskData Column ), Boxed.Vector Text )
-  -> Boxed.Vector ( Intervals Column, Text, [ ( Interval Column, Delta Column ) ], Set Int )
+  -> ImmutableTasks taskData Column
+  -> Boxed.Vector StaffMemberData
   -> Xlsx.Xlsx
   -> Xlsx.Xlsx
-updateSpreadsheet ( SchedulingRanges { .. } ) ( taskAvails, taskNames ) staff =
+updateSpreadsheet ( SchedulingRanges { .. } ) ( Tasks { taskNames, taskInfos = TaskInfos { tasks = taskAvails } } ) staff =
   over _cells ( Map.unionWith setCellText staffTasks . Map.mapWithKey makeCellUnavailable )
   where
     makeCellUnavailable :: ( Int,Int ) -> Xlsx.Cell -> Xlsx.Cell
@@ -673,7 +742,7 @@ updateSpreadsheet ( SchedulingRanges { .. } ) ( taskAvails, taskNames ) staff =
       | let 
           taskAvail :: Intervals Column
           taskAvail = taskAvailability $ taskAvails Boxed.Vector.! ( r - firstTaskRow )
-      , coerce c `inside` taskAvail && coerce ( c + 1 ) `inside` taskAvail
+      , coerce c `insideLax` taskAvail && coerce ( c + 1 ) `insideLax` taskAvail
       = cell
       | otherwise
       = cell { Xlsx._cellValue = Just ( Xlsx.CellDouble 0 ) }
@@ -683,23 +752,24 @@ updateSpreadsheet ( SchedulingRanges { .. } ) ( taskAvails, taskNames ) staff =
       | i <- [ firstStaffRow .. lastStaffRow ]
       ]
     staffTaskText :: Int -> Text
-    staffTaskText i = case staff Boxed.Vector.! i of
-      ( _, _, _, taskNbs ) -> Text.intercalate " + " names <> " = " <> Text.pack ( show totalDuration )
-        where
-          names :: [ Text ]
-          names = map
-            ( \ taskNb ->
-            let
-              name :: Text
-              name = taskNames Boxed.Vector.! taskNb
-              duration :: Int
-              duration = coerce $ taskDuration ( taskAvails Boxed.Vector.! taskNb )
-            in
-              name <> " (" <> Text.pack ( show duration ) <> ")"
-            )
-            $ toList taskNbs
-          totalDuration :: Int
-          totalDuration = coerce $ foldMap ( \ taskNb -> taskDuration ( taskAvails Boxed.Vector.! taskNb ) ) taskNbs
+    staffTaskText i = Text.intercalate " + " names <> " = " <> Text.pack ( show totalDuration )
+      where
+        taskNbs :: Set Int
+        taskNbs = memberAssignedTasks ( staff Boxed.Vector.! i )
+        names :: [ Text ]
+        names = map
+          ( \ taskNb ->
+          let
+            name :: Text
+            name = taskNames Boxed.Vector.! taskNb
+            duration :: Int
+            duration = coerce $ taskDuration ( taskAvails Boxed.Vector.! taskNb )
+          in
+            name <> " (" <> Text.pack ( show duration ) <> ")"
+          )
+          $ toList taskNbs
+        totalDuration :: Int
+        totalDuration = coerce $ foldMap ( \ taskNb -> taskDuration ( taskAvails Boxed.Vector.! taskNb ) ) taskNbs
     setCellText :: Xlsx.Cell -> Xlsx.Cell -> Xlsx.Cell
     setCellText ( TextCell text ) cell = cell { Xlsx._cellValue = Just ( Xlsx.CellText text ) }
     setCellText _ cell = cell
@@ -753,7 +823,8 @@ data Args
   { inputSpreadsheetPath   :: !FilePath
   , outputSpreadsheetPath  :: !FilePath
   , constraintLoggingPath  :: !(Maybe FilePath)
-  , useMakespanConstraints :: Bool
+  , useSearch              :: !Bool
+  , useMakespanConstraints :: !Bool
   }
   deriving stock Show
 
@@ -836,7 +907,7 @@ parseArgs = do
 
     parserInfo :: OptParse.ParserInfo Args
     parserInfo = OptParse.ParserInfo
-      { OptParse.infoParser      = OptParse.helper <*> ( Args <$> inputArg <*> outputArg <*> logArg <*> makespanArg )
+      { OptParse.infoParser      = OptParse.helper <*> ( Args <$> inputArg <*> outputArg <*> logArg <*> searchArg <*> makespanArg )
       , OptParse.infoFullDesc    = True
       , OptParse.infoProgDesc    = OptParse.Chunk ( Just desc )
       , OptParse.infoHeader      = OptParse.Chunk ( Just header )
@@ -865,7 +936,7 @@ parseArgs = do
     logArg :: OptParse.Parser ( Maybe FilePath )
     logArg =  ( \ b fp -> if b then Nothing else Just fp )
           <$> OptParse.switch
-                (  OptParse.long "noprop"
+                (  OptParse.long "no-prop"
                 <> OptParse.help "Disable constraint propagation"
                 )
           <*> OptParse.strOption
@@ -876,9 +947,17 @@ parseArgs = do
                 <> OptParse.help    "Log constraint solving information to LOGFILE"
                 )
 
+    searchArg :: OptParse.Parser Bool
+    searchArg =
+      OptParse.flag True False
+        (  OptParse.long "no-search"
+        <> OptParse.help "Disable search"
+        )
+
     makespanArg :: OptParse.Parser Bool
-    makespanArg = OptParse.switch
-                    (  OptParse.long  "makespan"
-                    <> OptParse.short 'm'
-                    <> OptParse.help  "Enable makespan constraints (experimental)"
-                    )
+    makespanArg =
+      OptParse.switch
+        (  OptParse.long  "makespan"
+        <> OptParse.short 'm'
+        <> OptParse.help  "Enable makespan constraints (experimental)"
+        )

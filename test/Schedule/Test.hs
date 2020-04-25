@@ -20,12 +20,11 @@ import qualified Data.Vector as Boxed.Vector
   ( fromList )
 
 -- unary-scheduling
-import Schedule
-  ( Propagator(..), propagateConstraints )
 import Schedule.Interval
   ( Interval(..), Intervals(..) )
 import Schedule.Propagators
-  ( prune, timetable, overloadCheck
+  ( Propagator(..), propagateConstraints
+  , prune, timetable, overloadCheck
   , detectablePrecedences, notExtremal
   , edgeFinding
   )
@@ -89,10 +88,10 @@ testPrune = case mbExceptText of
     -> Left err
   _ 
     | tasks ( taskInfos endTasks ) /= Boxed.Vector.fromList expectedTasks 
-    -> Left ( "expected:\n" <> Text.pack ( show expectedTasks ) <> "\nactual:\n" <> Text.pack ( show endTasks ) )
+    -> Left ( "expected:\n" <> Text.pack ( show expectedTasks ) <> "\nactual:\n" <> Text.pack ( show ( tasks $ taskInfos endTasks ) ) )
   _ -> Right ()
   where
-    ( endTasks, _endText, mbExceptText ) = propagateConstraints ( Left pruneTasks ) 10 prunePropagators
+    ( endTasks, _endText, mbExceptText ) = propagateConstraints pruneTasks 10 prunePropagators
     expectedTasks :: [ TimeOfDayTask ]
     expectedTasks =
       [ timeOfDayTask ( Minutes 30 ) []

@@ -1,29 +1,30 @@
 {-# LANGUAGE AllowAmbiguousTypes   #-}
 {-# LANGUAGE DataKinds             #-}
+{-# LANGUAGE DeriveAnyClass        #-}
 {-# LANGUAGE DeriveGeneric         #-}
 {-# LANGUAGE DerivingStrategies    #-}
 {-# LANGUAGE FlexibleContexts      #-}
 {-# LANGUAGE FlexibleInstances     #-}
+{-# LANGUAGE MonoLocalBinds        #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE NamedFieldPuns        #-}
+{-# LANGUAGE OverloadedStrings     #-}
 {-# LANGUAGE PolyKinds             #-}
 {-# LANGUAGE ScopedTypeVariables   #-}
 {-# LANGUAGE StandaloneDeriving    #-}
 {-# LANGUAGE TypeApplications      #-}
+{-# LANGUAGE TypeFamilies          #-}
 
 module Schedule.Task
   ( Task(..), Tasks(..)
+  , summariseTasks
   , Ranking(..), TaskInfos(..)
   , MutableTasks, ImmutableTasks
   , est, lct, lst, ect
-  , freezeTaskInfos, unsafeFreezeTaskInfos
-  , thawTaskInfos, unsafeThawTaskInfos
   , Limit(..), PickEndPoint(..)
   ) where
 
 -- base
-import Control.Monad.ST
-  ( ST )
 import GHC.Generics
   ( Generic )
 
@@ -37,19 +38,33 @@ import Data.Sequence
     ( (:<|), (:|>) )
   )
 
+-- deepseq
+import Control.DeepSeq
+  ( NFData )
+
 -- generic-lens
 import Data.Generics.Product.Constraints
   ( HasConstraints
     ( constraints )
   )
 
+-- primitive
+import Control.Monad.Primitive
+  ( PrimMonad
+    ( PrimState )
+  )
+
 -- text
 import Data.Text
   ( Text )
+import qualified Data.Text as Text
+  ( pack )
 
 -- vector
 import qualified Data.Vector as Boxed
   ( Vector )
+import qualified Data.Vector as Boxed.Vector
+  ( length, (!) )
 import Data.Vector.Generic
   ( Mutable )
 import qualified Data.Vector.Generic as Generic.Vector
@@ -77,6 +92,8 @@ import Schedule.Interval
   , Intervals
     ( Intervals )
   )
+import Schedule.Ordering
+  ( Order, OrderingMatrix )
 import Schedule.Time
   ( Delta
   , Handedness(Earliest, Latest)
@@ -92,76 +109,96 @@ data Task task t
   , taskDuration     :: !(Delta t)
   , taskInfo         :: !task
   }
-  deriving stock ( Show, Eq )
-
-data Tasks tvec ivec task t
-  = Tasks
-    { taskNames :: Boxed.Vector Text
-    , taskInfos :: TaskInfos ( tvec (Task task t) ) ( ivec Int )
-    }
-  deriving stock Generic
-
-deriving stock instance
-    ( Show task, Show t, Show (tvec (Task task t)), Show ( ivec Int ) )
-  => Show ( Tasks tvec ivec task t )
-
-{-
-instance ( Show task, Show t ) => Show ( Tasks Boxed.Vector ivec task t ) where
-  show ( Tasks { taskNames, taskInfos } ) = foldMap showTask [ 0 .. nbTasks - 1 ]
-    where
-      nbTasks :: Int
-      nbTasks = Boxed.Vector.length taskNames
-      showTask :: Int -> String
-      showTask i =
-        "Task named " <> Text.unpack ( taskNames Boxed.Vector.! i ) <> ":\n"
-        <> show ( tasks taskInfos Boxed.Vector.! i ) <> "\n"
--}
-
-data TaskInfos tasks indices = TaskInfos
-  { tasks      :: !tasks             -- tasks
-  , rankingEST :: !(Ranking indices) -- task rankings according to earliest start      time
-  , rankingLCT :: !(Ranking indices) -- task rankings according to latest   completion time
-  , rankingLST :: !(Ranking indices) -- task rankings according to latest   start      time
-  , rankingECT :: !(Ranking indices) -- task rankings according to earliest completion time
-  }
-  deriving stock ( Show, Generic )
-
-type MutableTasks s = Tasks ( Boxed.MVector s ) ( Unboxed.MVector s ) 
-type ImmutableTasks = Tasks   Boxed.Vector        Unboxed.Vector
+  deriving stock    ( Show, Eq, Generic )
+  deriving anyclass NFData
 
 -- | Earliest start time.
-est :: ( Ord t, Bounded t ) => Task task t -> EndPoint (EarliestTime t)
+est :: ( Ord t, Bounded t ) => Task task t -> EndPoint ( EarliestTime t )
 est ( Task { taskAvailability = Intervals ( ival :<| _ ) } ) = start ival
 est _                                                        = bottom
 
 -- | Latest completion time.
-lct :: ( Ord t, Bounded t ) => Task task t -> EndPoint (LatestTime t)
+lct :: ( Ord t, Bounded t ) => Task task t -> EndPoint ( LatestTime t )
 lct ( Task { taskAvailability = Intervals ( _ :|> ival ) } ) = end ival
 lct _                                                        = bottom
 
 -- | Latest start time.
-lst :: ( Num t, Ord t, Bounded t ) => Task task t -> EndPoint (LatestTime t)
+lst :: ( Num t, Ord t, Bounded t ) => Task task t -> EndPoint ( LatestTime t )
 lst ( task@( Task { taskDuration = delta } ) ) = delta • lct task -- recall: action of delta on 'LatestTime' involves an inversion
 
 -- | Earliest completion time.
-ect :: ( Num t, Ord t, Bounded t ) => Task task t -> EndPoint (EarliestTime t)
+ect :: ( Num t, Ord t, Bounded t ) => Task task t -> EndPoint ( EarliestTime t )
 ect ( task@( Task { taskDuration = delta } ) ) = delta • est task
 
-freezeTaskInfos, unsafeFreezeTaskInfos
-  :: forall s task i tvec ivec
-  .  ( Generic.Vector.Vector tvec task, Generic.Vector.Vector ivec i )
-  => TaskInfos ( Mutable tvec s task ) ( Mutable ivec s i )
-  -> ST s ( TaskInfos ( tvec task ) ( ivec i ) )
-freezeTaskInfos       = constraints @( Freeze (ST s) ) freeze
-unsafeFreezeTaskInfos = constraints @( Freeze (ST s) ) unsafeFreeze
+data Tasks tvec ivec task t
+  = Tasks
+    { taskNames :: Boxed.Vector Text
+    , taskInfos :: TaskInfos ( tvec (Task task t) ) ivec
+    }
+  deriving stock Generic
 
-thawTaskInfos, unsafeThawTaskInfos
-  :: forall s task i tvec ivec
-  .  ( Generic.Vector.Vector tvec task, Generic.Vector.Vector ivec i )
-  => TaskInfos ( tvec task ) ( ivec i )
-  -> ST s ( TaskInfos ( Mutable tvec s task ) ( Mutable ivec s i ) )
-thawTaskInfos       = constraints @( Thaw (ST s) ) thaw
-unsafeThawTaskInfos = constraints @( Thaw (ST s) ) unsafeThaw
+deriving stock instance
+    ( Show task, Show t, Show (tvec (Task task t)), Show ( ivec Int ), Show ( OrderingMatrix ivec ) )
+  => Show ( Tasks tvec ivec task t )
+deriving anyclass instance
+    ( NFData ( tvec ( Task task t ) ), NFData ( ivec Int ), NFData ( ivec Order ) )
+  => NFData ( Tasks tvec ivec task t )
+
+-- | Quick summary of all the tasks' start and end times.
+summariseTasks
+  :: forall task t ivec
+  .  ( Show task, Show t, Ord t, Bounded t )
+  => Tasks Boxed.Vector ivec task t
+  -> Text
+summariseTasks ( Tasks { taskNames, taskInfos = TaskInfos { tasks } } ) =
+  foldMap summariseTask [ 0 .. nbTasks - 1 ]
+    where
+      nbTasks :: Int
+      nbTasks = Boxed.Vector.length taskNames
+      summariseTask :: Int -> Text
+      summariseTask i =
+        let
+          task :: Task task t
+          task = tasks Boxed.Vector.! i
+        in
+          "Task named " <> taskNames Boxed.Vector.! i <> ":\n"
+          <> Text.pack ( show $ est task ) <> " --- " <> Text.pack ( show $ lct task ) <> "\n"
+
+
+type MutableTasks s = Tasks ( Boxed.MVector s ) ( Unboxed.MVector s ) 
+type ImmutableTasks = Tasks   Boxed.Vector        Unboxed.Vector
+
+data TaskInfos tasks ivec = TaskInfos
+  { tasks      :: !tasks                 -- tasks
+  , rankingEST :: !(Ranking (ivec Int))  -- task rankings according to earliest start      time
+  , rankingLCT :: !(Ranking (ivec Int))  -- task rankings according to latest   completion time
+  , rankingLST :: !(Ranking (ivec Int))  -- task rankings according to latest   start      time
+  , rankingECT :: !(Ranking (ivec Int))  -- task rankings according to earliest completion time
+  , orderings  :: !(OrderingMatrix ivec) -- precedence graph information
+  }
+  deriving stock    Generic
+deriving stock    instance ( Show tasks, Show ( ivec Int ), Show ( OrderingMatrix ivec ) ) => Show ( TaskInfos tasks ivec )
+deriving anyclass instance ( NFData tasks, NFData ( ivec Int ), NFData ( ivec Order ) ) => NFData ( TaskInfos tasks ivec )
+
+instance ( PrimMonad m, s ~ PrimState m
+         , Generic.Vector.Vector tvec task, Generic.Vector.Vector ivec Int, Generic.Vector.Vector ivec Order
+         , mtvec ~ Mutable tvec
+         , mivec ~ Mutable ivec
+         )
+  => Freeze m ( TaskInfos ( mtvec s task ) ( mivec s ) ) ( TaskInfos ( tvec task ) ivec )
+  where
+  freeze       = constraints @( Freeze m ) freeze
+  unsafeFreeze = constraints @( Freeze m ) unsafeFreeze
+
+instance ( PrimMonad m, s ~ PrimState m
+         , Generic.Vector.Vector tvec task, Generic.Vector.Vector ivec Int, Generic.Vector.Vector ivec Order
+         , mtvec ~ Mutable tvec
+         , mivec ~ Mutable ivec
+         )
+  => Thaw m ( TaskInfos ( tvec task ) ivec ) ( TaskInfos ( mtvec s task ) ( mivec s ) )
+  where
+  thaw       = constraints @( Thaw m ) thaw
+  unsafeThaw = constraints @( Thaw m ) unsafeThaw
 
 -------------------------------------------------------------------------------
 
@@ -170,7 +207,7 @@ data Limit = Outer | Inner
 
 class PickEndPoint ( h :: Handedness ) ( e :: Limit ) where
   pickEndPoint :: ( Num t, Ord t, Bounded t ) => Task task t -> EndPoint (HandedTime h t)
-  pickRanking  :: TaskInfos tasks indices -> Ranking indices
+  pickRanking  :: TaskInfos tasks ivec -> Ranking ( ivec Int )
 
 instance PickEndPoint Earliest Outer where
   pickEndPoint = est

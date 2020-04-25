@@ -1,5 +1,6 @@
 {-# LANGUAGE AllowAmbiguousTypes        #-}
 {-# LANGUAGE BlockArguments             #-}
+{-# LANGUAGE CPP                        #-}
 {-# LANGUAGE DataKinds                  #-}
 {-# LANGUAGE DerivingStrategies         #-}
 {-# LANGUAGE DuplicateRecordFields      #-}
@@ -19,6 +20,9 @@
 module Schedule.Tree
   ( Tree(..), newTree, cloneTree, fmapTree
   , toRoseTree
+#ifdef VIZ
+  , visualiseTree
+#endif
   , Propagatable(..)
   , DurationInfo(..), BaseDurationInfo
   , TTDurationInfo(..), BaseTTDurationInfo
@@ -72,6 +76,13 @@ import qualified Data.Vector.Mutable as Boxed
   ( MVector )
 import qualified Data.Vector.Mutable as Boxed.MVector
   ( length, replicate, unsafeNew, unsafeRead, unsafeWrite, clone )
+
+
+#ifdef VIZ
+-- tree-view
+import qualified Data.Tree.View as TreeView
+  ( showTree )
+#endif
 
 -- unary-scheduling
 import Data.Lattice
@@ -208,7 +219,13 @@ toRoseTree ( Tree { treeVector } ) = do
             mbLeftSubtree  <- go ( childIndex i LeftChild  )
             mbRightSubtree <- go ( childIndex i RightChild )
             pure ( Just $ Rose.Node ( i, a ) ( catMaybes [ mbLeftSubtree, mbRightSubtree ] ) )
-  
+
+#ifdef VIZ
+-- | Visualise a tree using the tree-view package.
+visualiseTree :: ( Eq a, Monoid a, Show a ) => Tree h s a -> ST s String
+visualiseTree tree = TreeView.showTree . fmap show <$> toRoseTree tree
+#endif
+
 ---------------------------------------------------------------------------------------------------
 -- Handedness polymorphism for different kinds of propagatable data.
 

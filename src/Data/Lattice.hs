@@ -13,6 +13,9 @@ import Data.Semigroup
 
 -------------------------------------------------------------------------------
 
+infixr 6 /\
+infixr 5 \/
+
 class Lattice t where
   (/\) :: t -> t -> t
   (\/) :: t -> t -> t
@@ -22,9 +25,13 @@ class Lattice t => BoundedLattice t where
   top    :: t
 
 class BoundedLattice t => Heyting t where
+  {-# MINIMAL (==>) | negation #-}
   (==>) :: t -> t -> t
   negation   :: t -> t
   negation t = t ==> bottom
+
+  -- Default implementation of implication is Boolean.
+  a ==> b = negation a \/ b
 
 instance Lattice Bool where
   (/\) = (&&)
@@ -71,6 +78,9 @@ instance BoundedLattice a => Monoid ( Join a ) where
 meet, join :: forall a. BoundedLattice a => [a] -> a
 meet = coerce ( mconcat @(Meet a) )
 join = coerce ( mconcat @(Join a) )
+
+infixr 6 /.\
+infixr 5 \./
 
 class Lattice t => TotallyOrderedLattice t where
   (/.\) :: Arg t a -> Arg t a -> Arg t a

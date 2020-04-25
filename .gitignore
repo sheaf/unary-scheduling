@@ -1,6 +1,13 @@
 *.txt
 *.xlsx
+*.xlsx#
 *.html
+*.prof
+*.hp
+*.exe
+*.svg
+*.eventlog
+*.json
 dist-newstyle/
 refs/
 cabal.project.local
