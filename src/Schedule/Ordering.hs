@@ -18,6 +18,7 @@ module Schedule.Ordering
   ( Order(Order, LessThan, GreaterThan, Unknown, Equal)
   , OrderingMatrix(..), upperTriangular
   , newOrderingMatrix, addEdgesTransitively
+  , readOrdering
 #ifdef VIZ
   , visualiseEdges
 #endif
@@ -27,8 +28,6 @@ module Schedule.Ordering
 -- base
 import Control.Monad
   ( when, unless )
-import Control.Monad.ST
-  ( ST )
 import Data.Bits
   ( shiftR )
 import Data.Coerce
@@ -60,15 +59,11 @@ import Control.Monad.Except
 
 -- primitive
 import Control.Monad.Primitive
-  ( PrimMonad )
+  ( PrimMonad(PrimState) )
 
 -- text
 import Data.Text
   ( Text )
-
--- transformers-base
-import Control.Monad.Base
-  ( MonadBase ( liftBase ) )
 
 -- vector
 import qualified Data.Vector.Generic as Generic
@@ -77,7 +72,7 @@ import qualified Data.Vector.Generic as Generic.Vector
 import qualified Data.Vector.Generic.Mutable as Generic
   ( MVector )
 import qualified Data.Vector.Generic.Mutable as Generic.MVector
-import Data.Vector.Unboxed
+import qualified Data.Vector.Unboxed as Vector
   ( Unbox )
 import qualified Data.Vector.Unboxed as Unboxed
   ( Vector )
@@ -86,7 +81,7 @@ import qualified Data.Vector.Unboxed as Unboxed.Vector
 import qualified Data.Vector.Unboxed.Mutable as Unboxed
   ( MVector )
 import qualified Data.Vector.Unboxed.Mutable as Unboxed.MVector
-  ( unsafeNew, unsafeRead, unsafeWrite )
+  ( unsafeNew, unsafeWrite )
 
 #ifdef VIZ
 -- algebraic-graphs
@@ -101,6 +96,8 @@ import Data.Lattice
   ( Lattice(..), BoundedLattice(..), Heyting(..) )
 import Data.Vector.PhaseTransition
   ( Freeze(..), Thaw(..) )
+import Data.Vector.Generic.Index
+  ( ReadableVector(unsafeIndex) )
 
 -------------------------------------------------------------------------------
 
@@ -167,11 +164,13 @@ visualiseEdges ( OrderingMatrix { dim, orderingMatrix } )
 -- | Initialise a matrix holding ordering information (similar to an adjacency matrix for a directed graph).
 --
 -- Number of entries corresponds to the number of above-diagonal cells.
-newOrderingMatrix :: MonadBase ( ST s ) m => Int -> ( Int -> Int -> Order ) -> m ( OrderingMatrix ( Unboxed.MVector s ) )
+newOrderingMatrix
+  :: ( PrimMonad m, PrimState m ~ s )
+  => Int -> ( Int -> Int -> Order ) -> m ( OrderingMatrix ( Unboxed.MVector s ) )
 newOrderingMatrix dim f = do
-  orderingMatrix <- liftBase $ Unboxed.MVector.unsafeNew ( ( dim * ( dim - 1 ) ) `shiftR` 1 )
-  for_ [ ( i, j ) | i <- [ 0 .. dim - 1 ], j <- [ i + 1 .. dim - 1 ] ] \ ( i, j ) -> do
-    liftBase $ Unboxed.MVector.unsafeWrite orderingMatrix ( upperTriangular dim i j ) ( f i j )
+  orderingMatrix <- Unboxed.MVector.unsafeNew ( ( dim * ( dim - 1 ) ) `shiftR` 1 )
+  for_ [ ( i, j ) | i <- [ 0 .. dim - 1 ], j <- [ i + 1 .. dim - 1 ] ] \ ( i, j ) ->
+    Unboxed.MVector.unsafeWrite orderingMatrix ( upperTriangular dim i j ) ( f i j )
   pure ( OrderingMatrix { dim, orderingMatrix } )
 
 -- | Index of above-diagonal cell at row @i@, column @j@ ( @i < j@ ),
@@ -191,25 +190,25 @@ upperTriangular :: Int -> Int -> Int -> Int
 upperTriangular d i j = j - 1 + i * d - ( ( ( i + 3 ) * i ) `shiftR` 1 )
 
 -- | Mutate ordering matrix to specify edges from vertex @i@ to vertex @j@.
-writeOrdering :: MonadBase ( ST s ) m => OrderingMatrix ( Unboxed.MVector s ) -> Order -> Int -> Int -> m ()
+writeOrdering :: ( PrimMonad m, s ~ PrimState m ) => OrderingMatrix ( Unboxed.MVector s ) -> Order -> Int -> Int -> m ()
 writeOrdering ( OrderingMatrix { dim, orderingMatrix } ) order i j = case compare i j of
   EQ -> pure ()
-  LT -> liftBase $ Unboxed.MVector.unsafeWrite orderingMatrix ( upperTriangular dim i j ) order
-  GT -> liftBase $ Unboxed.MVector.unsafeWrite orderingMatrix ( upperTriangular dim j i ) ( reverseOrder order )
+  LT -> Unboxed.MVector.unsafeWrite orderingMatrix ( upperTriangular dim i j ) order
+  GT -> Unboxed.MVector.unsafeWrite orderingMatrix ( upperTriangular dim j i ) ( reverseOrder order )
 
 -- | Read stateful ordering matrix for edges from vertex @i@ to vertex @j@.
-readOrdering :: MonadBase ( ST s ) m => OrderingMatrix ( Unboxed.MVector s ) -> Int -> Int -> m Order
+readOrdering :: ( ReadableVector m Order ( vec Order ) ) => OrderingMatrix vec -> Int -> Int -> m Order
 readOrdering ( OrderingMatrix { dim, orderingMatrix } ) i j = case compare i j of
   EQ -> pure Equal
-  LT -> liftBase $ Unboxed.MVector.unsafeRead orderingMatrix ( upperTriangular dim i j )
-  GT -> liftBase $ Unboxed.MVector.unsafeRead orderingMatrix ( upperTriangular dim j i ) <&> reverseOrder
+  LT -> unsafeIndex orderingMatrix ( upperTriangular dim i j )
+  GT -> unsafeIndex orderingMatrix ( upperTriangular dim j i ) <&> reverseOrder
 
 -- | King–Sagert insertion algorithm: add edges incident to a given vertex, and compute the transitive closure.
 addEdgesTransitively
   :: forall m t1 t2 e s
   .  ( Foldable t1, Foldable t2
      , MonadError e m
-     , MonadBase ( ST s ) m
+     , PrimMonad m, s ~ PrimState m
      )
   => ( Int -> Int -> m () ) -- ^ Function to propagate information relative to a new precedence.
   -> ( Either Int ( Int, Int ) -> e ) -- ^ Function to give an error message.
@@ -237,7 +236,7 @@ addEdgesTransitively propagateNewEdge errorMessage mat@( OrderingMatrix { dim } 
         pure res
 
   -- Add the transitive edges away from 'v'.
-  for_ [ ( i, j ) | i <- [ 0 .. dim - 1 ], j <- [ i + 1 .. dim - 1 ], i /= v, j /= v ] \ ( i, j ) -> do
+  for_ [ ( i, j ) | i <- [ 0 .. dim - 1 ], i /= v, j <- [ i + 1 .. dim - 1 ], j /= v ] \ ( i, j ) -> do
     let
       n_i, n_j :: Order
       n_i = new Unboxed.Vector.! i
@@ -278,8 +277,8 @@ addEdgesTransitively propagateNewEdge errorMessage mat@( OrderingMatrix { dim } 
 -------------------------------------------------------------------------------
 -- Writing out 'Unbox' instance for 'Order' by hand to avoid any Template Haskell...
 
-newtype instance Unboxed.MVector s Order = MVOrder ( Unboxed.MVector s ( Bool, Bool ) )
-newtype instance Unboxed.Vector    Order = VOrder  ( Unboxed.Vector    ( Bool, Bool ) )
+newtype instance Unboxed.MVector s Order = MVOrder ( Unboxed.MVector s ( Bit, Bit ) )
+newtype instance Unboxed.Vector    Order = VOrder  ( Unboxed.Vector    ( Bit, Bit ) )
 
 instance Generic.MVector Unboxed.MVector Order where
   basicLength ( MVOrder mv ) = Generic.MVector.basicLength mv
@@ -305,7 +304,7 @@ instance Generic.Vector Unboxed.Vector Order where
   basicUnsafeCopy ( MVOrder mv ) ( VOrder v ) = Generic.Vector.basicUnsafeCopy mv v
   elemseq ( VOrder v ) x y = Generic.Vector.elemseq v ( coerce x ) y
 
-instance Unbox Order
+instance Vector.Unbox Order
 
 -------------------------------------------------------------------------------
 -- Utility function only used in this module.

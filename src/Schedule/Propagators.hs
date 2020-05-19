@@ -1,30 +1,38 @@
-{-# LANGUAGE AllowAmbiguousTypes    #-}
-{-# LANGUAGE BlockArguments         #-}
-{-# LANGUAGE DataKinds              #-}
-{-# LANGUAGE FlexibleContexts       #-}
-{-# LANGUAGE FlexibleInstances      #-}
-{-# LANGUAGE FunctionalDependencies #-}
-{-# LANGUAGE MonoLocalBinds         #-}
-{-# LANGUAGE NamedFieldPuns         #-}
-{-# LANGUAGE OverloadedStrings      #-}
-{-# LANGUAGE PolyKinds              #-}
-{-# LANGUAGE QuantifiedConstraints  #-}
-{-# LANGUAGE RankNTypes             #-}
-{-# LANGUAGE ScopedTypeVariables    #-}
-{-# LANGUAGE TypeApplications       #-}
-{-# LANGUAGE TypeFamilies           #-}
-{-# LANGUAGE UndecidableInstances   #-}
+{-# LANGUAGE AllowAmbiguousTypes        #-}
+{-# LANGUAGE BlockArguments             #-}
+{-# LANGUAGE DataKinds                  #-}
+{-# LANGUAGE FlexibleContexts           #-}
+{-# LANGUAGE FlexibleInstances          #-}
+{-# LANGUAGE FunctionalDependencies     #-}
+{-# LANGUAGE GADTs                      #-}
+{-# LANGUAGE NamedFieldPuns             #-}
+{-# LANGUAGE OverloadedStrings          #-}
+{-# LANGUAGE PolyKinds                  #-}
+{-# LANGUAGE QuantifiedConstraints      #-}
+{-# LANGUAGE RankNTypes                 #-}
+{-# LANGUAGE ScopedTypeVariables        #-}
+{-# LANGUAGE TypeApplications           #-}
+{-# LANGUAGE UndecidableInstances       #-}
 
 module Schedule.Propagators
   ( -- * Propagator framework.
     Propagator(..), basicPropagators
   , propagateConstraints, propagationLoop
     -- * Local constraint propagators.
-  , prune, timetable
+  , prune, prunePropagator
+  , timetable, timetablePropagator
     -- * Global constraint propagators.
-  , overloadCheck, detectablePrecedences
-  , notExtremal, edgeFinding
-    -- * Experimental makespan propagator.
+    -- ** Overload checking
+  , overloadCheck, overloadPropagator
+    -- ** Detectable precedences
+  , detectablePrecedences, detectablePrecedencesPropagator, detectableSuccedencesPropagator
+    -- ** Not first / not last
+  , notExtremal, notLastPropagator, notFirstPropagator
+    -- ** Edge finding
+  , edgeFinding, edgeLastPropagator, edgeFirstPropagator
+    -- ** Precedence matrix
+  , precedenceMatrix, predecessorPropagator, successorPropagator
+    -- ** Experimental makespan propagator.
   , makespan
   )
   where
@@ -32,10 +40,14 @@ module Schedule.Propagators
 -- base
 import Control.Monad
   ( when, unless, void )
-import Control.Monad.ST
-  ( ST )
 import Data.Coerce
   ( coerce )
+import Data.Functor.Identity
+  ( Identity(..) )
+import Data.Kind
+  ( Type )
+import Data.Maybe
+  ( fromJust )
 import Data.Semigroup
   ( Arg(..) )
 import Data.Foldable
@@ -55,12 +67,23 @@ import Data.Set
 import qualified Data.Set as Set
   ( fromList, delete )
 
+-- dependent-map
+import qualified Data.Dependent.Map.Lens as DMap
+  ( dmat )
+
 -- generic-lens
 import Data.GenericLens.Internal
-  ( set )
+  ( view, set, over )
 import Data.Generics.Product.Fields
   ( field' )
 
+-- lens
+import Control.Lens
+  ( assign )
+import Control.Lens.Fold
+  ( forOf_ )
+import qualified Data.IntSet.Lens as IntSet
+  ( members )
 
 -- mtl
 import Control.Monad.Except
@@ -72,6 +95,10 @@ import Control.Monad.State.Strict
   , execStateT, get, put
   )
 
+-- primitive
+import Control.Monad.Primitive
+  ( PrimMonad(PrimState) )
+
 -- text
 import Data.Text
   ( Text )
@@ -81,10 +108,6 @@ import qualified Data.Text as Text
 -- transformers
 import Control.Monad.Trans.Class
   ( lift )
-
--- transformers-base
-import Control.Monad.Base
-  ( MonadBase ( liftBase ) )
 
 -- vector
 import Data.Vector as Boxed.Vector
@@ -112,22 +135,28 @@ import Schedule.Constraint
   , Constraints(..), applyConstraints
   )
 import Schedule.Interval
-  ( EndPoint(..)
+  ( Endpoint(..)
   , Interval(..), validInterval, duration
   , Intervals(..)
   , pruneShorterThan
   )
 import Schedule.Monad
   ( ScheduleMonad, runScheduleMonad
+  , constrain
   , SchedulableData
+  , TaskUpdates(..)
+  , Notifiee(..)
+  , BroadcastTarget(..), broadcastModifications
   )
+import Schedule.Ordering
+  ( Order, readOrdering )
 import Schedule.Task
-  ( Task(..), Tasks(..), TaskInfos(..)
-  , ImmutableTasks
+  ( Task(..), TaskInfos(..)
+  , ImmutableTaskInfos
   , ect, lct, lst
   , Limit(Outer, Inner)
-  , PickEndPoint
-    ( pickEndPoint, pickRanking )
+  , PickEndpoint
+    ( pickEndpoint, _ranking )
   )
 import Schedule.Time
   ( Delta
@@ -137,30 +166,122 @@ import Schedule.Time
 import Schedule.Tree
   ( newTree, cloneTree, fmapTree
   , Propagatable
-    ( overloaded, handedIndex, propagateLeafChange )
+    ( overloaded, handedIndex, inHandedOrder, propagateLeafChange )
   , DurationInfo(..), BaseDurationInfo
   , DurationExtraInfo(..)
   )
 
 -------------------------------------------------------------------------------
--- Propagator framework.
+-- Propagators.
 
--- | Wrapper for a propagator (to avoid impredicativity).
-newtype Propagator task t =
-  Propagator { runPropagator :: forall s. ScheduleMonad s task t () }
+-- | Wrapper for a propagator.
+--
+-- We keep track of the propagator name at the type level,
+-- so that we can notify all *other* (local) propagators of stale tasks
+-- that they need to process.
+data Propagator task t where
+  Propagator
+    :: forall ( n :: Type ) ( task :: Type ) ( t :: Type )
+    .  { mbNotifiee    :: Maybe ( Notifiee n )
+       , notifyTarget  :: BroadcastTarget
+       , runPropagator :: forall s. ScheduleMonad s task t ()
+       }
+    -> Propagator task t
+
+
+prunePropagator, timetablePropagator,
+  overloadPropagator,
+  detectablePrecedencesPropagator, detectableSuccedencesPropagator,
+  notLastPropagator, notFirstPropagator,
+  edgeLastPropagator, edgeFirstPropagator,
+  predecessorPropagator, successorPropagator
+ :: ( Num t, Ord t, Bounded t, Show t )
+ => Propagator task t
+prunePropagator =
+  Propagator
+    { mbNotifiee    = Just ( Coarse "prune" )
+    , notifyTarget  = TellEveryoneBut "prune"
+    , runPropagator = prune
+    }
+timetablePropagator =
+  Propagator
+    { mbNotifiee    = Just ( Coarse "timetable" )
+    , notifyTarget  = TellEveryone
+    , runPropagator = timetable
+    }  
+overloadPropagator =
+  Propagator
+    { mbNotifiee    = Nothing
+    , notifyTarget  = TellEveryone
+    , runPropagator = overloadCheck
+    }
+detectablePrecedencesPropagator =
+  Propagator
+    { mbNotifiee    = Nothing
+    , notifyTarget  = TellEveryone
+    , runPropagator = detectablePrecedences @Earliest
+    }
+detectableSuccedencesPropagator =
+  Propagator
+    { mbNotifiee    = Nothing
+    , notifyTarget  = TellEveryone
+    , runPropagator = detectablePrecedences @Latest
+    }
+notLastPropagator =
+  Propagator
+    { mbNotifiee    = Nothing
+    , notifyTarget  = TellEveryone
+    , runPropagator = notExtremal @Earliest
+    }
+notFirstPropagator =
+  Propagator
+    { mbNotifiee    = Nothing
+    , notifyTarget  = TellEveryone
+    , runPropagator = notExtremal @Latest
+    }
+edgeLastPropagator =
+  Propagator
+    { mbNotifiee    = Nothing
+    , notifyTarget  = TellEveryone
+    , runPropagator = edgeFinding @Earliest
+    }
+edgeFirstPropagator =
+  Propagator
+    { mbNotifiee    = Nothing
+    , notifyTarget  = TellEveryone
+    , runPropagator = edgeFinding @Latest
+    }
+predecessorPropagator =
+  Propagator
+    { mbNotifiee    = Nothing
+    , notifyTarget  = TellEveryone
+    , runPropagator = precedenceMatrix @Earliest
+    }
+successorPropagator =
+  Propagator
+    { mbNotifiee    = Nothing
+    , notifyTarget  = TellEveryone
+    , runPropagator = precedenceMatrix @Latest
+    }
 
 -- | List of all propagators, in a convenient order for running all propagation algorithms.
-basicPropagators :: ( Num t, Ord t, Bounded t, Show t ) => [ Propagator task t ]
+basicPropagators
+  :: ( Num t, Ord t, Bounded t, Show t )
+  => [ Propagator task t ]
 basicPropagators =
-  [ Propagator $ prune
-  , Propagator $ overloadCheck
-  , Propagator $ timetable
-  , Propagator $ detectablePrecedences @Earliest
-  , Propagator $ detectablePrecedences @Latest
-  , Propagator $ notExtremal @Earliest -- not last
-  , Propagator $ notExtremal @Latest   -- not first
-  , Propagator $ edgeFinding @Earliest
-  , Propagator $ edgeFinding @Latest
+  -- Local propagators (need to be notified of tasks which have been modified).
+  [ prunePropagator
+  , timetablePropagator
+  -- Global propagators (run on all tasks at once as soon as any task has been modified).
+  , overloadPropagator
+  , detectablePrecedencesPropagator
+  , detectableSuccedencesPropagator
+  , notLastPropagator
+  , notFirstPropagator
+  , edgeLastPropagator
+  , edgeFirstPropagator
+  , predecessorPropagator
+  , successorPropagator
   ]
 
 -- | Propagates constraints for the scheduling of a given collection of (named) tasks,
@@ -172,14 +293,14 @@ basicPropagators =
 -- Returns the constrained tasks, an explanation of how the constraints arose,
 -- and, if the tasks proved to be unschedulable, an explanation for that too.
 propagateConstraints
-   :: forall task t taskData
-   .  ( Num t, Ord t, Bounded t, Show t, Show task
-      , SchedulableData taskData task t
-      )
-   => taskData
-   -> Int
-   -> [ Propagator task t ]
-   -> ( ImmutableTasks task t, Text, Maybe Text )
+  :: forall task t taskData
+  .  ( Num t, Ord t, Bounded t, Show t, Show task
+     , SchedulableData taskData task t
+     )
+  => taskData
+  -> Int
+  -> [ Propagator task t ]
+  -> ( ImmutableTaskInfos task t, Text, Maybe Text )
 propagateConstraints taskData maxLoopIterations propagators =
   case runScheduleMonad taskData ( propagationLoop maxLoopIterations propagators ) of
     ( updatedTasks, ( mbGaveUpText, Constraints { justifications } ) ) ->
@@ -197,7 +318,20 @@ propagationLoop
   => Int
   -> [ Propagator task t ]
   -> ScheduleMonad s task t ()
-propagationLoop maxLoopIterations propagators = go 0 propagators
+propagationLoop maxLoopIterations propagators = do
+  -- Initialise the dependent map of modifications,
+  -- so that there is a key for each propagator which needs
+  -- to be notified of modifications.
+  for_ propagators \ Propagator { mbNotifiee } -> case mbNotifiee of
+    Nothing              -> pure ()
+    Just ( Coarse name ) -> assign ( field' @"tasksModified" . DMap.dmat ( Coarse name ) ) ( Just mempty )
+    Just ( Fine   name ) -> assign ( field' @"tasksModified" . DMap.dmat ( Fine   name ) ) ( Just mempty )
+  -- Apply the currently existing constraints, notifying
+  -- all propagators that need this information.
+  -- Then start the propagation loop.
+  updateConstraints TellEveryone
+    ( go 0 propagators )
+    ( go 0 propagators )
   where
     go :: Int -> [ Propagator task t ] -> ScheduleMonad s task t ()
     go _ []
@@ -205,74 +339,86 @@ propagationLoop maxLoopIterations propagators = go 0 propagators
     go i _
       | i >= maxLoopIterations
       = pure ()
-    go i ( Propagator { runPropagator = runCurrentPropagator } : followingPropagators ) = do
-      runCurrentPropagator
-      newConstraints <- get
-      if null ( constraints newConstraints )
-      then go i followingPropagators
+    go i ( Propagator { notifyTarget, runPropagator = runCurrentProp } : followingProps ) 
+      = do
+        runCurrentProp
+        updateConstraints notifyTarget
+          ( go   i       followingProps )
+          ( go ( i + 1 ) propagators    )
+    updateConstraints
+      :: BroadcastTarget
+      -> ScheduleMonad s task t () 
+      -> ScheduleMonad s task t ()
+      -> ScheduleMonad s task t ()
+    updateConstraints toNotify noCtsAction newCtsAction = do
+      cts <- view ( field' @"taskConstraints" ) <$> get
+      if null ( constraints cts )
+      then
+        noCtsAction
       else do
-        applyConstraints newConstraints
-        modify' ( set ( field' @"constraints" ) mempty )
-        go (i+1) propagators
+        modifs <- applyConstraints cts
+        modify'
+          -- Reset constraints: they have been applied.
+          $ set  ( field' @"taskConstraints" . field' @"constraints" ) mempty
+          -- Broadcast which tasks have been newly modified to all
+          -- the other propagators which make use of such modification information.
+          . over ( field' @"tasksModified" ) ( broadcastModifications toNotify modifs )
+        newCtsAction
 
 -------------------------------------------------------------------------------
 -- Convenience class synonym for polymorphism over scheduling tree handedness.
 
 class
-  ( PickEndPoint h  Inner, PickEndPoint h  Outer
-  , PickEndPoint oh Inner, PickEndPoint oh Outer
+  ( PickEndpoint h  Inner, PickEndpoint h  Outer
+  , PickEndpoint oh Inner, PickEndpoint oh Outer
   , HandedTimeConstraint h, HandedTimeConstraint oh
   , oh ~ OtherHandedness h, OtherHandedness oh ~ h
   , Propagatable h
-  , forall t. ( Ord t, Bounded t ) => BoundedLattice        ( EndPoint ( HandedTime h t ) )
-  , forall t. ( Ord t, Bounded t ) => TotallyOrderedLattice ( EndPoint ( HandedTime h t ) )
+  , forall t. ( Ord t, Bounded t ) => BoundedLattice        ( Endpoint ( HandedTime h t ) )
+  , forall t. ( Ord t, Bounded t ) => TotallyOrderedLattice ( Endpoint ( HandedTime h t ) )
   , forall t. Num t => Act ( Delta t ) ( HandedTime h t )
   , forall t. Show t => Show ( HandedTime h  t )
   , forall t. Show t => Show ( HandedTime oh t )
   ) => KnownHandedness ( h :: Handedness ) ( oh :: Handedness ) | h -> oh, oh -> h where
 
 instance
-  ( PickEndPoint h  Inner, PickEndPoint h  Outer
-  , PickEndPoint oh Inner, PickEndPoint oh Outer
+  ( PickEndpoint h  Inner, PickEndpoint h  Outer
+  , PickEndpoint oh Inner, PickEndpoint oh Outer
   , HandedTimeConstraint h, HandedTimeConstraint oh
   , oh ~ OtherHandedness h, OtherHandedness oh ~ h
   , Propagatable h
-  , forall t. ( Ord t, Bounded t ) => BoundedLattice        ( EndPoint ( HandedTime h t ) )
-  , forall t. ( Ord t, Bounded t ) => TotallyOrderedLattice ( EndPoint ( HandedTime h t ) )
+  , forall t. ( Ord t, Bounded t ) => BoundedLattice        ( Endpoint ( HandedTime h t ) )
+  , forall t. ( Ord t, Bounded t ) => TotallyOrderedLattice ( Endpoint ( HandedTime h t ) )
   , forall t. Num t => Act ( Delta t ) ( HandedTime h t )
   , forall t. Show t => Show ( HandedTime h  t )
   , forall t. Show t => Show ( HandedTime oh t )
   ) => KnownHandedness h oh where
 
-tell :: ( Monoid s, MonadState s m ) => s -> m ()
-tell s = modify' ( <> s )
-
 -------------------------------------------------------------------------------
--- Local constraints.
+-- Local propagators.
 
 -- | Prune task intervals that are too short for the task to complete.
+--
+-- Runs on tasks that have been modified since last pruning.
 --
 -- The emitted constraints are logged (using the 'MonadState' instance),
 -- but not applied.
 prune
-  :: forall s task t m tvec ivec
-  .  ( MonadReader ( Tasks tvec ivec task t ) m
-     , MonadState  ( Constraints t ) m
-     , MonadBase (ST s) m
+  :: forall s task t m bvec uvec
+  .  ( MonadReader ( TaskInfos bvec uvec task t ) m
+     , MonadState  ( TaskUpdates t ) m
+     , PrimMonad m, s ~ PrimState m
      , Num t, Ord t, Show t
-     , ReadableVector m (Task task t) ( tvec (Task task t) )
+     , ReadableVector m ( Task task t ) ( bvec ( Task task t ) )
      )
   => m ()
 prune = do
-  Tasks { taskNames, taskInfos = TaskInfos { tasks } } <- ask
-  let
-    nbTasks :: Int
-    nbTasks = Boxed.Vector.length taskNames
-  -- TODO: avoid repeating this computation for tasks that haven't been modified since the last time.
-  for_ [ 0 .. nbTasks - 1 ] \ taskNb -> do
-    task <- tasks `unsafeIndex` taskNb
-    for_ ( pruneShorterThan ( taskDuration task ) ( taskAvailability task ) ) \ ( kept, removed ) -> do
-      tell
+  TaskInfos { taskNames, taskAvails } <- ask
+  Identity toUpdate <- fromJust . view ( field' @"tasksModified" . DMap.dmat ( Coarse "prune" ) ) <$> get
+  forOf_ IntSet.members toUpdate \ taskNb -> do
+    task <- taskAvails `unsafeIndex` taskNb
+    for_ ( pruneShorterThan ( taskDuration task ) ( taskAvailability task ) ) \ ( kept, removed ) ->
+      constrain
         ( Constraints
           { constraints    = IntMap.singleton taskNb ( Inside kept )
           , justifications =
@@ -281,29 +427,33 @@ prune = do
             ( Text.pack ( show removed ) ) <> "\n\n"
           }
         )
+  assign ( field' @"tasksModified" . DMap.dmat ( Coarse "prune" ) ) ( Just mempty )
 
 -- | Check time spans for which a task is necessarily scheduled, and remove them
 -- from all other tasks (as they can't be scheduled concurrently).
 --
+-- Runs on tasks that have been modified since last timetabling.
+--
 -- The emitted constraints are logged (using the 'MonadState' instance),
 -- but not applied.
 timetable
-  :: forall s task t m tvec ivec
-  .  ( MonadReader ( Tasks tvec ivec task t ) m
-     , MonadState  ( Constraints t ) m
-     , MonadBase (ST s) m
+  :: forall s task t m bvec uvec
+  .  ( MonadReader ( TaskInfos bvec uvec task t ) m
+     , MonadState  ( TaskUpdates t ) m
+     , PrimMonad m, s ~ PrimState m
      , Num t, Ord t, Bounded t, Show t
-     , ReadableVector m (Task task t) ( tvec (Task task t) )
+     , ReadableVector m ( Task task t ) ( bvec ( Task task t ) )
      )
   => m ()
 timetable = do
-  Tasks { taskNames, taskInfos = TaskInfos { tasks } } <- ask
+  TaskInfos { taskNames, taskAvails } <- ask
   let
     nbTasks :: Int
     nbTasks = Boxed.Vector.length taskNames
-  -- TODO: avoid repeating this computation for tasks that haven't been modified since the last time
-  for_ [ 0 .. nbTasks - 1 ] \ taskNb -> do
-    task <- tasks `unsafeIndex` taskNb
+  Identity toUpdate <- fromJust . view ( field' @"tasksModified" . DMap.dmat ( Coarse "timetable" ) ) <$> get
+  assign ( field' @"tasksModified" . DMap.dmat ( Coarse "timetable" ) ) ( Just mempty )
+  forOf_ IntSet.members toUpdate \ taskNb -> do
+    task <- taskAvails `unsafeIndex` taskNb
     let
       taskLST = lst task
       taskECT = ect task
@@ -313,14 +463,14 @@ timetable = do
       let
         necessaryIntervals :: Intervals t
         necessaryIntervals = Intervals ( Seq.singleton necessaryInterval )
-      for_ [ 0 .. nbTasks - 1 ] \ otherTaskNb -> do
+      for_ [ 0 .. nbTasks - 1 ] \ otherTaskNb ->
         unless ( otherTaskNb == taskNb ) do
-          otherAvailability <- taskAvailability <$> tasks `unsafeIndex` otherTaskNb
+          otherAvailability <- taskAvailability <$> taskAvails `unsafeIndex` otherTaskNb
           let
             removedIntervals :: Intervals t
             removedIntervals = necessaryIntervals /\ otherAvailability
           unless ( null $ intervals removedIntervals ) do
-            tell
+            constrain
               ( Constraints
                 { constraints    = IntMap.singleton otherTaskNb ( Outside necessaryIntervals )
                 , justifications =
@@ -333,7 +483,93 @@ timetable = do
               )
 
 -------------------------------------------------------------------------------
--- Global constraints.
+-- Global propagators.
+
+-- | Propagates the precedence information stored in the precedence matrix.
+--
+-- Runs on tasks that have been modified since last time.
+--
+-- The emitted constraints are logged (using the 'MonadState' instance),
+-- but not applied.
+precedenceMatrix
+  :: forall h oh s task t m bvec uvec
+  .  ( MonadReader ( TaskInfos bvec uvec task t ) m
+     , MonadState  ( TaskUpdates t ) m
+     , PrimMonad m, s ~ PrimState m
+     , Num t, Ord t, Bounded t, Show t
+     , ReadableVector m ( Task task t ) ( bvec ( Task task t ) )
+     , ReadableVector m Order           ( uvec Order )
+     , ReadableVector m Int             ( uvec Int )
+     , KnownHandedness h oh
+     )
+  => m ()
+precedenceMatrix = do
+  
+  allTasks@( TaskInfos { taskNames, taskAvails, orderings } ) :: TaskInfos bvec uvec task t <- ask
+  let
+    nbTasks :: Int
+    nbTasks = Boxed.Vector.length taskNames
+  
+  let
+    go :: Int -> Endpoint ( HandedTime h t ) -> Endpoint ( HandedTime h t ) -> [Int] -> Int -> m ()
+    go taskNb taskOuterTime limitTime subsetTaskNbs j
+      | j >= nbTasks
+      -- Done with the inner loop: report the new earliest start time / latest completion time,
+      -- if it imposes a new constraint.
+      = when ( overloaded limitTime ( coerce taskOuterTime ) ) do
+        let
+          constraint :: Constraint t
+          constraint = handedTimeConstraint limitTime
+          precedesOrSuccedes, afterOrBefore :: Text
+          ( precedesOrSuccedes, afterOrBefore )
+            | NotEarlierThan _ <- constraint
+            = ( "succedes", "after" )
+            | otherwise
+            = ( "precedes", "before" )
+          currentSubsetTaskNames :: Text
+          currentSubsetTaskNames =
+            foldMap
+              ( \ i -> "  * \"" <> taskNames Boxed.Vector.! i <> "\"\n" )
+              subsetTaskNbs
+          reason :: Text
+          reason =
+            "Precedence matrix: \"" <> taskNames Boxed.Vector.! taskNb <> "\" " <> precedesOrSuccedes <> " the following tasks:\n" <>
+            currentSubsetTaskNames <> "\n\
+            \As a result, \"" <> taskNames Boxed.Vector.! taskNb <> "\" must be scheduled " <> afterOrBefore <>
+            "  * " <> Text.pack ( show limitTime ) <> "\n\n"
+        constrain
+          ( Constraints
+            { constraints    = IntMap.singleton taskNb constraint
+            , justifications = reason
+            }
+          )
+      | otherwise
+      -- Loop over predecessors in increasing earliest start time / successors in decreasing latest completion time,
+      -- to propagate information from the precedence matrix.
+      = do
+        otherTaskNb <- ( ordered $ view ( _ranking @h @Outer ) allTasks ) `unsafeIndex` ( handedIndex @h nbTasks j )
+        otherTask   <-                                         taskAvails `unsafeIndex` otherTaskNb
+        let
+          otherTaskOuterTime :: Endpoint ( HandedTime h t )
+          otherTaskOuterTime = pickEndpoint @h @Inner otherTask
+          otherTaskDuration :: Delta t
+          otherTaskDuration = taskDuration otherTask
+        order <- readOrdering orderings otherTaskNb taskNb
+        if inHandedOrder @h order
+        then
+          -- Other task is a predecessor (Earliest) / successor (Latest) of the current task:
+          -- add it to the subset for computation of earliest completion time / latest start time.
+          go taskNb taskOuterTime ( otherTaskDuration • ( limitTime /\ otherTaskOuterTime ) ) ( otherTaskNb : subsetTaskNbs ) ( j + 1 )
+        else
+          go taskNb taskOuterTime limitTime subsetTaskNbs ( j + 1 )
+
+  for_ [ 0 .. nbTasks - 1 ] \ taskNb -> do
+    task <- taskAvails `unsafeIndex` taskNb
+    let
+      taskOuterTime :: Endpoint ( HandedTime h t )
+      taskOuterTime = pickEndpoint @h @Inner task
+    go taskNb taskOuterTime top [] 0
+
 
 -- | Checks whether any collection of tasks overloads the resource,
 -- throwing an exception when overloading is detected.
@@ -344,21 +580,21 @@ timetable = do
 -- Does /not/ take gaps in task availabilities under consideration,
 -- i.e. this check only depends on earliest start times and latest completion times.
 overloadCheck
-  :: forall s task t m tvec ivec
-  .  ( MonadReader ( Tasks tvec ivec task t ) m
+  :: forall s task t m bvec uvec
+  .  ( MonadReader ( TaskInfos bvec uvec task t ) m
      , MonadError Text  m
-     , MonadBase (ST s) m
+     , PrimMonad m, s ~ PrimState m
      , Num t, Ord t, Bounded t, Show t
-     , ReadableVector m (Task task t) ( tvec (Task task t) )
-     , ReadableVector m      Int      ( ivec Int )
+     , ReadableVector m ( Task task t ) ( bvec ( Task task t ) )
+     , ReadableVector m Int             ( uvec Int )
      )
   => m ()
 overloadCheck = do
-  allTasks@( Tasks { taskNames, taskInfos = TaskInfos { tasks, rankingLCT } } ) <- ask
+  allTasks@( TaskInfos { taskNames, taskAvails, rankingLCT } ) <- ask
   let
     nbTasks :: Int
     nbTasks = Boxed.Vector.length taskNames
-  tree <- liftBase $ newTree @Earliest @(BaseDurationInfo Earliest t) nbTasks
+  tree <- newTree @Earliest @(BaseDurationInfo Earliest t) nbTasks
   let
     go :: Int -> [Int] -> m ()
     go j seenTaskNbs
@@ -366,7 +602,7 @@ overloadCheck = do
       | otherwise = do
         -- For the overload check, we add tasks by non-decreasing latest completion time.
         taskNb <- ordered rankingLCT `unsafeIndex` j
-        task   <-              tasks `unsafeIndex` taskNb
+        task   <-         taskAvails `unsafeIndex` taskNb
         let
           nodeInfo :: BaseDurationInfo Earliest t
           nodeInfo =
@@ -377,7 +613,7 @@ overloadCheck = do
         estimatedECT <-
           subsetInnerTime <$> propagateLeafChange tree nodeInfo allTasks taskNb
         let
-          currentLCT :: EndPoint (LatestTime t)
+          currentLCT :: Endpoint (LatestTime t)
           currentLCT = lct task
         -- When the unary resource is overloaded, throw an error to put an end to constraint propagation.
         when ( overloaded estimatedECT currentLCT ) do
@@ -416,22 +652,22 @@ overloadCheck = do
 -- The emitted constraints are logged (using the 'MonadState' instance),
 -- but not applied.
 detectablePrecedences
-  :: forall h oh s task t m tvec ivec
-  .  ( MonadReader ( Tasks tvec ivec task t ) m
-     , MonadState  ( Constraints t ) m
-     , MonadBase (ST s) m
+  :: forall h oh s task t m bvec uvec
+  .  ( MonadReader ( TaskInfos bvec uvec task t ) m
+     , MonadState  ( TaskUpdates t ) m
+     , PrimMonad m, s ~ PrimState m
      , Num t, Ord t, Bounded t, Show t
-     , ReadableVector m (Task task t) ( tvec (Task task t) )
-     , ReadableVector m Int           ( ivec Int )
+     , ReadableVector m ( Task task t ) ( bvec ( Task task t ) )
+     , ReadableVector m Int             ( uvec Int )
      , KnownHandedness h oh
      )
   => m ()
 detectablePrecedences = do
-  allTasks@( Tasks { taskNames, taskInfos = rankings@(TaskInfos { tasks }) } ) <- ask
+  allTasks@( TaskInfos { taskNames, taskAvails } ) <- ask
   let
     nbTasks :: Int
     nbTasks = Boxed.Vector.length taskNames
-  tree <- liftBase $ newTree @h @(BaseDurationInfo h t) nbTasks
+  tree <- newTree @h @(BaseDurationInfo h t) nbTasks
   let
     -- Finding detectable precedences:
     --
@@ -444,19 +680,20 @@ detectablePrecedences = do
       = pure ()
       | otherwise
       = do
-        taskNb   <- ( ordered $ pickRanking @h @Inner rankings ) `unsafeIndex` ( handedIndex @h nbTasks i )
-        currTask <-                                        tasks `unsafeIndex` taskNb
+        let
+        taskNb   <- ( ordered $ view ( _ranking @h @Inner ) allTasks ) `unsafeIndex` ( handedIndex @h nbTasks i )
+        currTask <-                                         taskAvails `unsafeIndex` taskNb
         innerLoop taskNb currTask i j js
 
     innerLoop :: Int -> Task task t -> Int -> Int -> [Int] -> m ()
     innerLoop taskNb currentTask i j js = do
-      otherTaskNb <- ( ordered $ pickRanking @oh @Inner rankings ) `unsafeIndex` ( handedIndex @h nbTasks j )
-      otherTask   <-                                         tasks `unsafeIndex` otherTaskNb
+      otherTaskNb <- ( ordered $ view ( _ranking @oh @Inner ) allTasks ) `unsafeIndex` ( handedIndex @h nbTasks j )
+      otherTask   <-                                          taskAvails `unsafeIndex` otherTaskNb
       let
-        currentInnerTime :: EndPoint ( HandedTime h t )
-        currentInnerTime = pickEndPoint @h @Inner currentTask
-        otherInnerTime :: EndPoint ( HandedTime oh t )
-        otherInnerTime = pickEndPoint @oh @Inner otherTask
+        currentInnerTime :: Endpoint ( HandedTime h t )
+        currentInnerTime = pickEndpoint @h @Inner currentTask
+        otherInnerTime :: Endpoint ( HandedTime oh t )
+        otherInnerTime = pickEndpoint @oh @Inner otherTask
         addNode :: Bool
         addNode = overloaded currentInnerTime otherInnerTime
       when addNode do
@@ -464,7 +701,7 @@ detectablePrecedences = do
           nodeInfo :: BaseDurationInfo h t
           nodeInfo =
             DurationInfo
-              { subsetInnerTime = pickEndPoint @h @Inner otherTask
+              { subsetInnerTime = pickEndpoint @h @Inner otherTask
               , totalDuration   = taskDuration otherTask
               }
         void $ propagateLeafChange tree nodeInfo allTasks otherTaskNb
@@ -474,19 +711,19 @@ detectablePrecedences = do
         ( j', js' ) = if addNode then ( j + 1, j : js ) else ( j, js )
 
       if addNode && j' < nbTasks
-      then do
+      then
         innerLoop taskNb currentTask i j' js'
       else do
         -- End of inner loop: gather results.
         when ( j > 0 ) do
-          clone <- liftBase $ cloneTree tree
+          clone <- cloneTree tree
           -- Compute the estimated earliest completion time / latest start time
           -- from the subset excluding the current task.
           excludeCurrentTaskSubsetInnerTime
             <- subsetInnerTime <$> propagateLeafChange clone mempty allTasks taskNb
           let
-            currentOuterTime :: EndPoint ( HandedTime h t )
-            currentOuterTime = pickEndPoint @h @Outer currentTask
+            currentOuterTime :: Endpoint ( HandedTime h t )
+            currentOuterTime = pickEndpoint @h @Outer currentTask
           -- Check that this succedence/precedence would induce a nontrivial constraint on the current task availability.
           when ( not $ overloaded currentOuterTime ( coerce excludeCurrentTaskSubsetInnerTime ) ) do
             let
@@ -499,7 +736,7 @@ detectablePrecedences = do
               constraint = handedTimeConstraint excludeCurrentTaskSubsetInnerTime
               succedeOrPrecede, earlierOrLater :: Text
               ( succedeOrPrecede, earlierOrLater )
-                | NotEarlierThan _ _ <- constraint
+                | NotEarlierThan _ <- constraint
                 = ( "succede", "start after" )
                 | otherwise
                 = ( "precede", "end before" )
@@ -511,7 +748,7 @@ detectablePrecedences = do
                 "As a consequence, this task is constrained to " <> earlierOrLater <> "\n\
                 \  * " <> Text.pack ( show excludeCurrentTaskSubsetInnerTime ) <> "\n\n"
             -- TODO: add precedence to precedence graph to avoid unnecessary duplication of effort.
-            tell
+            constrain
               ( Constraints
                 { constraints    = IntMap.singleton taskNb constraint
                 , justifications = reason
@@ -533,22 +770,22 @@ detectablePrecedences = do
 -- The emitted constraints are logged (using the 'MonadState' instance),
 -- but not applied.
 notExtremal
-  :: forall h oh s task t m tvec ivec
-  .  ( MonadReader ( Tasks tvec ivec task t ) m
-     , MonadState  ( Constraints t ) m
-     , MonadBase (ST s) m
+  :: forall h oh s task t m bvec uvec
+  .  ( MonadReader ( TaskInfos bvec uvec task t ) m
+     , MonadState  ( TaskUpdates t ) m
+     , PrimMonad m, s ~ PrimState m
      , Num t, Ord t, Bounded t, Show t
-     , ReadableVector m (Task task t) ( tvec (Task task t) )
-     , ReadableVector m Int           ( ivec Int )
+     , ReadableVector m ( Task task t ) ( bvec ( Task task t ) )
+     , ReadableVector m Int             ( uvec Int )
      , KnownHandedness h oh
      )
   => m ()
 notExtremal = do
-  allTasks@( Tasks { taskNames, taskInfos = rankings@(TaskInfos { tasks }) } ) <- ask
+  allTasks@( TaskInfos { taskNames, taskAvails } ) <- ask
   let
     nbTasks :: Int
     nbTasks = Boxed.Vector.length taskNames
-  tree <- liftBase $ newTree @h @(BaseDurationInfo h t) nbTasks
+  tree <- newTree @h @(BaseDurationInfo h t) nbTasks
 
   let
     -- Not last / not first algorithm.
@@ -558,11 +795,11 @@ notExtremal = do
     --
     go :: Int -> Int -> [Int] -> m ()
     go i j currentSubset = unless ( i >= nbTasks ) do
-      currentTaskNb <- ( ordered $ pickRanking @oh @Outer rankings ) `unsafeIndex` ( handedIndex @h nbTasks i )
-      currentTask   <-                                         tasks `unsafeIndex` currentTaskNb
+      currentTaskNb <- ( ordered $ view ( _ranking @oh @Outer ) allTasks ) `unsafeIndex` ( handedIndex @h nbTasks i )
+      currentTask   <-                                          taskAvails `unsafeIndex` currentTaskNb
       let
-        currentOtherOuterTime :: EndPoint ( HandedTime oh t )
-        currentOtherOuterTime = pickEndPoint @oh @Outer currentTask
+        currentOtherOuterTime :: Endpoint ( HandedTime oh t )
+        currentOtherOuterTime = pickEndpoint @oh @Outer currentTask
 
       -- Inner loop: find all tasks in the set `NotLast'(tasks, currentTask)`  / `NotFirst'(tasks, currentTask)`,
       -- adding them to the task tree as we go.
@@ -580,22 +817,22 @@ notExtremal = do
 
       for_ mbRelevantTaskNb \ relevantTaskNb -> do
 
-        clone <- liftBase $ cloneTree tree
+        clone <- cloneTree tree
         -- Compute the estimated earliest completion time / latest start time
         -- from the subset excluding the current task.
         -- TODO: implement the optimisation from the paper that computes
         -- a constraint relative to the secondary task before inserting it in the Theta-tree.
         excludeCurrentTaskSubsetInnerTime
           <- subsetInnerTime <$> propagateLeafChange clone mempty allTasks currentTaskNb
-        relevantTask <- tasks `unsafeIndex` relevantTaskNb
+        relevantTask <- taskAvails `unsafeIndex` relevantTaskNb
         let
-          associatedOtherInnerTime :: EndPoint ( HandedTime oh t )
-          associatedOtherInnerTime = pickEndPoint @oh @Inner relevantTask
+          associatedOtherInnerTime :: Endpoint ( HandedTime oh t )
+          associatedOtherInnerTime = pickEndpoint @oh @Inner relevantTask
         when
           -- check that the current task can't be scheduled after / before all the other tasks in the current subset
-          ( overloaded excludeCurrentTaskSubsetInnerTime ( pickEndPoint @oh @Inner currentTask ) 
+          ( overloaded excludeCurrentTaskSubsetInnerTime ( pickEndpoint @oh @Inner currentTask ) 
           -- check that this observation imposes a nontrivial constraint on the current task
-          && not ( overloaded ( coerce associatedOtherInnerTime :: EndPoint ( HandedTime h t ) ) currentOtherOuterTime )
+          && not ( overloaded ( coerce associatedOtherInnerTime :: Endpoint ( HandedTime h t ) ) currentOtherOuterTime )
           )
           do
             let
@@ -605,7 +842,7 @@ notExtremal = do
               constraint = handedTimeConstraint associatedOtherInnerTime
               lastOrFirst, earlierOrLater :: Text
               ( lastOrFirst, earlierOrLater )
-                | NotLaterThan _ _ <- constraint
+                | NotLaterThan _ <- constraint
                 = ( "last", "finish before" )
                 | otherwise
                 = ( "first", "start after" )
@@ -615,7 +852,7 @@ notExtremal = do
                 subsetText <>
                 "As a consequence, the task is constrained to " <> earlierOrLater <> "\n\
                 \  * " <> Text.pack ( show associatedOtherInnerTime ) <> "\n\n"
-            tell
+            constrain
               ( Constraints
                 { constraints    = IntMap.singleton currentTaskNb constraint
                 , justifications = reason
@@ -626,7 +863,7 @@ notExtremal = do
       go ( i + 1 ) j' currentSubset'
 
     innerLoop
-      :: EndPoint ( HandedTime oh t )
+      :: Endpoint ( HandedTime oh t )
       -> Int
       -> [Int]
       -> m ( Int, [Int] )
@@ -636,31 +873,31 @@ notExtremal = do
         pure ( j, currentSubset )
       else do
       -- Check whether we can add further tasks to the task tree.
-        otherTaskNb' <- ( ordered $ pickRanking @oh @Inner rankings ) `unsafeIndex` ( handedIndex @h nbTasks j' )
-        otherTask'   <-                                         tasks `unsafeIndex` otherTaskNb'
-        if overloaded ( coerce currentOtherOuterTime :: EndPoint ( HandedTime h t ) ) ( pickEndPoint @oh @Inner otherTask' )
+        otherTaskNb' <- ( ordered $ view ( _ranking @oh @Inner ) allTasks ) `unsafeIndex` ( handedIndex @h nbTasks j' )
+        otherTask'   <-                                          taskAvails `unsafeIndex` otherTaskNb'
+        if overloaded ( coerce currentOtherOuterTime :: Endpoint ( HandedTime h t ) ) ( pickEndpoint @oh @Inner otherTask' )
         then do
         -- Can add another `j`.
           let
             nodeInfo :: BaseDurationInfo h t
             nodeInfo =
               DurationInfo
-                { subsetInnerTime = pickEndPoint @h @Inner otherTask'
+                { subsetInnerTime = pickEndpoint @h @Inner otherTask'
                 , totalDuration   = taskDuration otherTask'
                 }
           void $ propagateLeafChange tree nodeInfo allTasks otherTaskNb'
           innerLoop currentOtherOuterTime j' ( otherTaskNb' : currentSubset )
-        else do
+        else
           pure ( j, currentSubset )
 
   -- Start process with first task (ordered by other inner time).
-  firstTaskNb <- ( ordered $ pickRanking @oh @Inner rankings ) `unsafeIndex` ( handedIndex @h nbTasks 0 )
-  firstTask   <-                                         tasks `unsafeIndex` firstTaskNb
+  firstTaskNb <- ( ordered $ view ( _ranking @oh @Inner ) allTasks ) `unsafeIndex` ( handedIndex @h nbTasks 0 )
+  firstTask   <-                                          taskAvails `unsafeIndex` firstTaskNb
   let
     nodeInfo :: BaseDurationInfo h t
     nodeInfo =
       DurationInfo
-        { subsetInnerTime = pickEndPoint @h @Inner firstTask
+        { subsetInnerTime = pickEndpoint @h @Inner firstTask
         , totalDuration   = taskDuration firstTask
         }
   void $ propagateLeafChange tree nodeInfo allTasks firstTaskNb
@@ -683,42 +920,41 @@ notExtremal = do
 -- The emitted constraints are logged (using the 'MonadState' instance),
 -- but not applied.
 edgeFinding
-  :: forall h oh s task t m tvec ivec
-  .  ( MonadReader ( Tasks tvec ivec task t ) m
-     , MonadState  ( Constraints t ) m
-     , MonadBase (ST s) m
+  :: forall h oh s  task t m bvec uvec
+  .  ( MonadReader ( TaskInfos bvec uvec task t ) m
+     , MonadState  ( TaskUpdates t ) m
+     , PrimMonad m, s ~ PrimState m
      , Num t, Ord t, Bounded t, Show t
-     , ReadableVector m (Task task t) ( tvec (Task task t) )
-     , ReadableVector m Int           ( ivec Int )
+     , ReadableVector m ( Task task t ) ( bvec ( Task task t ) )
+     , ReadableVector m Int             ( uvec Int )
      , KnownHandedness h oh
      )
   => m ()
 edgeFinding = do
-  allTasks@( Tasks { taskNames, taskInfos = rankings@(TaskInfos { tasks }) } ) <- ask
+  allTasks@( TaskInfos { taskNames, taskAvails } ) <- ask
   let
     nbTasks :: Int
     nbTasks = Boxed.Vector.length taskNames
-  startingTree <- liftBase $ newTree @h @(BaseDurationInfo h t) nbTasks
+  startingTree <- newTree @h @(BaseDurationInfo h t) nbTasks
 
   -- Start by adding all tasks to the task tree,
   -- in order ( increasing earliest start time / decreasing latest completion time ).
   for_ [ 0 .. ( nbTasks - 1 ) ] \ i -> do
-    taskNb <- ( ordered $ pickRanking @h @Outer rankings ) `unsafeIndex` ( handedIndex @h nbTasks i )
-    task   <-                                        tasks `unsafeIndex` taskNb
+    taskNb <- ( ordered $ view ( _ranking @h @Outer ) allTasks ) `unsafeIndex` ( handedIndex @h nbTasks i )
+    task   <-                                         taskAvails `unsafeIndex` taskNb
     let
       nodeInfo :: BaseDurationInfo h t
       nodeInfo =
         DurationInfo
-          { subsetInnerTime = pickEndPoint @h @Inner task
+          { subsetInnerTime = pickEndpoint @h @Inner task
           , totalDuration   = taskDuration task
           }
     void $ propagateLeafChange startingTree nodeInfo allTasks taskNb
   -- Convert the task tree to a coloured task tree, starting off with no coloured nodes.
   tree <-
-    liftBase $ 
-      fmapTree
-        ( \ durInfo -> mempty { baseDurationInfo = durInfo } )
-        startingTree
+    fmapTree
+      ( \ durInfo -> mempty { baseDurationInfo = durInfo } )
+      startingTree
 
   -- Edge finding algorithm.
   --
@@ -727,8 +963,8 @@ edgeFinding = do
   let
     go :: Int -> Set Int -> m ()
     go j currentTaskSubset = when ( j > 1 ) do
-      taskNb <- ( ordered $ pickRanking @oh @Outer rankings ) `unsafeIndex` ( handedIndex @h nbTasks j )
-      task   <-                                         tasks `unsafeIndex` taskNb
+      taskNb <- ( ordered $ view ( _ranking @oh @Outer ) allTasks ) `unsafeIndex` ( handedIndex @h nbTasks j )
+      task   <-                                          taskAvails `unsafeIndex` taskNb
 
       -- Set the current task to be coloured in the task tree (normal --> coloured).
       let
@@ -738,7 +974,7 @@ edgeFinding = do
             { baseDurationInfo = mempty -- trivial base task information (coloured task)
             , extraDurationInfo =
               DurationInfo
-                { subsetInnerTime = Just $ Arg ( pickEndPoint @h @Inner task ) taskNb
+                { subsetInnerTime = Just $ Arg ( pickEndpoint @h @Inner task ) taskNb
                 , totalDuration   = Just $ Arg ( taskDuration task ) taskNb
                 }
             }
@@ -750,21 +986,21 @@ edgeFinding = do
         , extraDurationInfo = DurationInfo { subsetInnerTime = currentSubsetExtraInnerTime }
         } <- propagateLeafChange tree colouredNodeInfo allTasks taskNb
 
-      nextTaskNb <- ( ordered $ pickRanking @oh @Outer rankings ) `unsafeIndex` ( handedIndex @h nbTasks j' )
-      nextTask   <-                                         tasks `unsafeIndex` nextTaskNb
+      nextTaskNb <- ( ordered $ view ( _ranking @oh @Outer ) allTasks ) `unsafeIndex` ( handedIndex @h nbTasks j' )
+      nextTask   <-                                          taskAvails `unsafeIndex` nextTaskNb
       
       let
-        nextOtherOuterTime :: EndPoint ( HandedTime oh t )
-        nextOtherOuterTime = pickEndPoint @oh @Outer nextTask
+        nextOtherOuterTime :: Endpoint ( HandedTime oh t )
+        nextOtherOuterTime = pickEndpoint @oh @Outer nextTask
 
       innerLoop j' ( Set.delete taskNb currentTaskSubset ) nextOtherOuterTime currentSubsetInnerTime currentSubsetExtraInnerTime
 
     innerLoop
       :: Int
       -> Set Int
-      -> EndPoint ( HandedTime oh t )
-      -> EndPoint ( HandedTime h t )
-      -> Maybe ( Arg ( EndPoint ( HandedTime h t ) ) Int )
+      -> Endpoint ( HandedTime oh t )
+      -> Endpoint ( HandedTime h t )
+      -> Maybe ( Arg ( Endpoint ( HandedTime h t ) ) Int )
       -> m ()
     innerLoop j currentTaskSubset nextOtherOuterTime currentSubsetInnerTime ( Just ( Arg subsetExtraInnerTime blamedTaskNb ) )
       | overloaded subsetExtraInnerTime nextOtherOuterTime
@@ -773,11 +1009,11 @@ edgeFinding = do
           DurationExtraInfo { extraDurationInfo = DurationInfo { subsetInnerTime = subsetExtraInnerTime' } }
             <- propagateLeafChange tree mempty allTasks blamedTaskNb
           -- Emit induced constraint (if necessary).
-          blamedTask <- tasks `unsafeIndex` blamedTaskNb
+          blamedTask <- taskAvails `unsafeIndex` blamedTaskNb
           let
-            blamedOuterTime :: EndPoint ( HandedTime h t )
-            blamedOuterTime = pickEndPoint @h @Outer blamedTask
-          when ( not $ overloaded blamedOuterTime ( coerce currentSubsetInnerTime :: EndPoint ( HandedTime oh t ) ) ) do
+            blamedOuterTime :: Endpoint ( HandedTime h t )
+            blamedOuterTime = pickEndpoint @h @Outer blamedTask
+          when ( not $ overloaded blamedOuterTime ( coerce currentSubsetInnerTime :: Endpoint ( HandedTime oh t ) ) ) do
             let
               constraint :: Constraint t
               constraint = handedTimeConstraint currentSubsetInnerTime
@@ -785,7 +1021,7 @@ edgeFinding = do
               subsetText = foldMap ( \ tk -> "  * \"" <> taskNames Boxed.Vector.! tk <> "\"\n" ) currentTaskSubset
               afterOrBefore, laterOrEarlier :: Text
               ( afterOrBefore, laterOrEarlier )
-                | NotEarlierThan _ _ <- constraint
+                | NotEarlierThan _ <- constraint
                 = ( "after", "start after" )
                 | otherwise
                 = ( "before", "finish before" )
@@ -797,7 +1033,7 @@ edgeFinding = do
                 "As a consequence, the task is constrained to " <> laterOrEarlier <> "\n\
                 \  * " <> Text.pack ( show currentSubsetInnerTime ) <> "\n\n"
             -- TODO: add precedence to precedence graph to avoid unnecessary duplication of effort.
-            tell
+            constrain
               ( Constraints
                 { constraints    = IntMap.singleton blamedTaskNb constraint
                 , justifications = reason
@@ -816,13 +1052,13 @@ edgeFinding = do
 -- The emitted constraints are logged (using the 'MonadState' instance),
 -- but not applied.
 makespan
-  :: forall f1 f2 s task t m tvec ivec
-  .  ( MonadReader ( Tasks tvec ivec task t ) m
-     , MonadState  ( Constraints t ) m
-     , MonadBase (ST s) m
+  :: forall f1 f2 s task t m bvec uvec
+  .  ( MonadReader ( TaskInfos bvec uvec task t ) m
+     , MonadState  ( TaskUpdates t ) m
+     , PrimMonad m, s ~ PrimState m
      , Num t, Ord t, Bounded t, Show t
-     , ReadableVector m (Task task t) ( tvec (Task task t) )
-     , ReadableVector m Int           ( ivec Int )
+     , ReadableVector m (Task task t) ( bvec ( Task task t ) )
+     , ReadableVector m Int           ( uvec Int )
      , Foldable f1
      , Foldable f2
      )
@@ -832,7 +1068,7 @@ makespan
   -> m ()
 makespan label taskNbs mkspans = do
 
-  allTasks@( Tasks { taskNames, taskInfos = TaskInfos { tasks } } ) <- ask
+  allTasks@( TaskInfos { taskNames, taskAvails } ) <- ask
   let
     nbTasks :: Int
     nbTasks = Boxed.Vector.length taskNames
@@ -842,22 +1078,22 @@ makespan label taskNbs mkspans = do
   -- TODO: here we create full size task trees.
   -- At the cost of recomputing some rankings, we could instead create
   -- task trees the size of the given subset of tasks.
-  treeECT <- liftBase $ newTree @Earliest @(BaseDurationInfo Earliest t) nbTasks
-  treeLST <- liftBase $ newTree @Latest   @(BaseDurationInfo Latest   t) nbTasks
+  treeECT <- newTree @Earliest @(BaseDurationInfo Earliest t) nbTasks
+  treeLST <- newTree @Latest   @(BaseDurationInfo Latest   t) nbTasks
   ( subsetECT, subsetLST ) <-
     ( `execStateT` ( top, top ) ) $ for_ taskNbs \ taskNb -> do
-      task <- lift $ tasks `unsafeIndex` taskNb
+      task <- lift $ taskAvails `unsafeIndex` taskNb
       let
         infoECT :: BaseDurationInfo Earliest t
         infoECT =
           DurationInfo
-            { subsetInnerTime = pickEndPoint @Earliest @Inner task
+            { subsetInnerTime = pickEndpoint @Earliest @Inner task
             , totalDuration   = taskDuration task
             }
         infoLST :: BaseDurationInfo Latest t
         infoLST =
           DurationInfo
-            { subsetInnerTime = pickEndPoint @Latest   @Inner task
+            { subsetInnerTime = pickEndpoint @Latest   @Inner task
             , totalDuration   = taskDuration task
             }
       subsetECT <- lift $ subsetInnerTime <$> propagateLeafChange @_ @m treeECT infoECT allTasks taskNb
@@ -871,7 +1107,7 @@ makespan label taskNbs mkspans = do
     -- because the subset must be in progress near the end of the makespan range.
     when ( validInterval $ Interval subsetECT ( end mkspan ) ) do
       let
-        latestStart :: EndPoint ( LatestTime t )
+        latestStart :: Endpoint ( LatestTime t )
         latestStart = cap • ( coerce subsetECT /\ end mkspan )
         outside :: Interval t
         outside = Interval ( start mkspan ) latestStart
@@ -879,12 +1115,12 @@ makespan label taskNbs mkspans = do
         outsides = Intervals ( Seq.singleton outside )
       when ( validInterval outside ) do
         for_ taskNbs \ taskNb -> do
-          avail <- taskAvailability <$> tasks `unsafeIndex` taskNb
+          avail <- taskAvailability <$> taskAvails `unsafeIndex` taskNb
           let
             removedIntervals :: Intervals t
             removedIntervals = avail /\ outsides
           unless ( null $ intervals removedIntervals ) do
-            tell
+            constrain
               ( Constraints
                 { constraints    = IntMap.singleton taskNb ( Outside outsides )
                 , justifications =
@@ -901,7 +1137,7 @@ makespan label taskNbs mkspans = do
     -- because the subset must be in progress near the start of the makespan range.
     when ( validInterval $ Interval ( start mkspan ) subsetLST ) do
       let
-        earliestEnd :: EndPoint ( EarliestTime t )
+        earliestEnd :: Endpoint ( EarliestTime t )
         earliestEnd = cap • ( coerce subsetLST /\ start mkspan )
         outside :: Interval t
         outside = Interval earliestEnd ( end mkspan )
@@ -909,12 +1145,12 @@ makespan label taskNbs mkspans = do
         outsides = Intervals ( Seq.singleton outside )
       when ( validInterval outside ) do
         for_ taskNbs \ taskNb -> do
-          avail <- taskAvailability <$> tasks `unsafeIndex` taskNb
+          avail <- taskAvailability <$> taskAvails `unsafeIndex` taskNb
           let
             removedIntervals :: Intervals t
             removedIntervals = avail /\ outsides
           unless ( null $ intervals removedIntervals ) do
-            tell
+            constrain
               ( Constraints
                 { constraints    = IntMap.singleton taskNb ( Outside outsides )
                 , justifications =

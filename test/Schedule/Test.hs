@@ -23,18 +23,10 @@ import qualified Data.Vector as Boxed.Vector
 import Schedule.Interval
   ( Interval(..), Intervals(..) )
 import Schedule.Propagators
-  ( Propagator(..), propagateConstraints
-  , prune, timetable, overloadCheck
-  , detectablePrecedences, notExtremal
-  , edgeFinding
-  )
 import Schedule.Task
-  ( Task(..), Tasks(..), tasks )
+  ( Task(..), TaskInfos(..) )
 import Schedule.Time
-  ( Time(..), Delta(..)
-  , Handedness
-    ( Earliest, Latest )
-  )
+  ( Time(..), Delta(..) )
 
 -------------------------------------------------------------------------------
 -- Notion of time used for the tests.
@@ -67,7 +59,7 @@ timeOfDayTask delta ivals =
 -- Test 'pruneIntervals' propagator.
 
 prunePropagators :: [ Propagator () Minutes ]
-prunePropagators = [ Propagator prune ]
+prunePropagators = [ prunePropagator ]
 
 pruneTasks :: [ ( TimeOfDayTask, Text ) ]
 pruneTasks =
@@ -87,8 +79,8 @@ testPrune = case mbExceptText of
   Just err
     -> Left err
   _ 
-    | tasks ( taskInfos endTasks ) /= Boxed.Vector.fromList expectedTasks 
-    -> Left ( "expected:\n" <> Text.pack ( show expectedTasks ) <> "\nactual:\n" <> Text.pack ( show ( tasks $ taskInfos endTasks ) ) )
+    | taskAvails endTasks /= Boxed.Vector.fromList expectedTasks
+    -> Left ( "expected:\n" <> Text.pack ( show expectedTasks ) <> "\nactual:\n" <> Text.pack ( show ( taskAvails endTasks ) ) )
   _ -> Right ()
   where
     ( endTasks, _endText, mbExceptText ) = propagateConstraints pruneTasks 10 prunePropagators
@@ -104,7 +96,7 @@ testPrune = case mbExceptText of
 -- Test 'overloadCheck'.
 
 overloadPropagators :: [ Propagator () Minutes ]
-overloadPropagators = [ Propagator overloadCheck ]
+overloadPropagators = [ overloadPropagator ]
 
 overloadTasks1 :: [ ( TimeOfDayTask, Text ) ]
 overloadTasks1 = [ ( task, "#1 (overloaded)" ) ]
@@ -132,7 +124,7 @@ overloadTasks4 = [ ( task, "#1 (not overloaded)" ) ]
 -- Test 'timetable' propagator.
 
 timetablePropagators :: [ Propagator () Minutes ]
-timetablePropagators = [ Propagator timetable ]
+timetablePropagators = [ timetablePropagator ]
 
 timetableTasks :: [ ( TimeOfDayTask, Text ) ]
 timetableTasks =
@@ -149,7 +141,7 @@ timetableTasks =
 -- Test detectable precedences.
 
 detectableSuccedencesPropagators :: [ Propagator () Minutes ]
-detectableSuccedencesPropagators = [ Propagator $ detectablePrecedences @Earliest ]
+detectableSuccedencesPropagators = [ detectablePrecedencesPropagator ]
 
 -- | Expect constraint: task #3 must be last, and thus start no earlier than 00h10.
 succedenceTasks :: [ ( TimeOfDayTask, Text ) ]
@@ -160,7 +152,7 @@ succedenceTasks = [ ( task1, "#1" ), ( task2, "#2"), ( task3, "#3 (last)" ) ]
     task3 = timeOfDayTask ( Minutes 3 ) [ ( 00 `h` 07, 00 `h` 17 ) ]
 
 detectablePrecedencesPropagators :: [ Propagator () Minutes ]
-detectablePrecedencesPropagators = [ Propagator $ detectablePrecedences @Latest ]
+detectablePrecedencesPropagators = [ detectableSuccedencesPropagator ]
 
 -- | Expect constraint: task #3 must be first, and thus end no later than 00h07.
 precedenceTasks :: [ ( TimeOfDayTask, Text ) ]
@@ -174,7 +166,7 @@ precedenceTasks = [ ( task1, "#1" ), ( task2, "#2"), ( task3, "#3 (first)" ) ]
 -- Test 'notExtremal' propagators.
 
 notLastPropagators :: [ Propagator () Minutes ]
-notLastPropagators = [ Propagator $ notExtremal @Earliest ]
+notLastPropagators = [ notLastPropagator ]
 
 -- | Expect constraint: task #3 must not be last, and thus finish no later than 00h17.
 notLastTasks :: [ ( TimeOfDayTask, Text ) ]
@@ -185,7 +177,7 @@ notLastTasks = [ ( task1, "#1" ), ( task2, "#2"), ( task3, "#3 (not last)" ) ]
     task3 = timeOfDayTask ( Minutes 2  ) [ ( 00 `h` 04, 00 `h` 20 ) ]
 
 notFirstPropagators :: [ Propagator () Minutes ]
-notFirstPropagators = [ Propagator $ notExtremal @Latest ]
+notFirstPropagators = [ notFirstPropagator ]
 
 -- | Expect constraint: task #3 must not be first, and thus start no earlier than 00h10.
 notFirstTasks :: [ ( TimeOfDayTask, Text ) ]
@@ -198,12 +190,12 @@ notFirstTasks = [ ( task1, "#1" ), ( task2, "#2"), ( task3, "#3 (not first)" ) ]
 -------------------------------------------------------------------------------
 -- Test 'edgeFinding' propagators.
 
-earliestEdgePropagators :: [ Propagator () Minutes ]
-earliestEdgePropagators = [ Propagator $ edgeFinding @Earliest ]
+edgeLastPropagators :: [ Propagator () Minutes ]
+edgeLastPropagators = [ edgeLastPropagator ]
 
 -- | Expect constraint: task #1 must be last, and thus start after 00h18.
-earliestEdgeTasks1 :: [ ( TimeOfDayTask, Text ) ]
-earliestEdgeTasks1 = [ ( task1, "#1 (last)" ), ( task2, "#2"), ( task3, "#3"), ( task4, "#4") ]
+edgeLastTasks1 :: [ ( TimeOfDayTask, Text ) ]
+edgeLastTasks1 = [ ( task1, "#1 (last)" ), ( task2, "#2"), ( task3, "#3"), ( task4, "#4") ]
   where
     task1 = timeOfDayTask ( Minutes 4 ) [ ( 00 `h` 04, 00 `h` 30 ) ]
     task2 = timeOfDayTask ( Minutes 3 ) [ ( 00 `h` 05, 00 `h` 13 ) ]
@@ -211,20 +203,20 @@ earliestEdgeTasks1 = [ ( task1, "#1 (last)" ), ( task2, "#2"), ( task3, "#3"), (
     task4 = timeOfDayTask ( Minutes 5 ) [ ( 00 `h` 13, 00 `h` 18 ) ]
 
 -- | Expect no new constraints.
-earliestEdgeTasks2 :: [ ( TimeOfDayTask, Text ) ]
-earliestEdgeTasks2 = [ ( task1, "#1 (last)" ), ( task2, "#2"), ( task3, "#3"), ( task4, "#4") ]
+edgeLastTasks2 :: [ ( TimeOfDayTask, Text ) ]
+edgeLastTasks2 = [ ( task1, "#1 (last)" ), ( task2, "#2"), ( task3, "#3"), ( task4, "#4") ]
   where
     task1 = timeOfDayTask ( Minutes 4 ) [ ( 00 `h` 19, 00 `h` 30 ) ]
     task2 = timeOfDayTask ( Minutes 3 ) [ ( 00 `h` 05, 00 `h` 13 ) ]
     task3 = timeOfDayTask ( Minutes 3 ) [ ( 00 `h` 05, 00 `h` 13 ) ]
     task4 = timeOfDayTask ( Minutes 5 ) [ ( 00 `h` 13, 00 `h` 18 ) ]
 
-latestEdgePropagators :: [ Propagator () Minutes ]
-latestEdgePropagators = [ Propagator $ edgeFinding @Latest ]
+edgeFirstPropagators :: [ Propagator () Minutes ]
+edgeFirstPropagators = [ edgeFirstPropagator ]
 
 -- | Expect constraint: task #1 must be last, and thus start after 00h18.
-latestEdgeTasks1 :: [ ( TimeOfDayTask, Text ) ]
-latestEdgeTasks1 = [ ( task1, "#1 (first)" ), ( task2, "#2"), ( task3, "#3"), ( task4, "#4") ]
+edgeFirstTasks1 :: [ ( TimeOfDayTask, Text ) ]
+edgeFirstTasks1 = [ ( task1, "#1 (first)" ), ( task2, "#2"), ( task3, "#3"), ( task4, "#4") ]
   where
     task1 = timeOfDayTask ( Minutes 4 ) [ ( 00 `h`  0, 00 `h` 26 ) ]
     task2 = timeOfDayTask ( Minutes 3 ) [ ( 00 `h` 17, 00 `h` 25 ) ]

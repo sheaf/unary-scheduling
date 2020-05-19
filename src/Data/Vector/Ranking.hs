@@ -3,6 +3,7 @@
 {-# LANGUAGE DeriveGeneric         #-}
 {-# LANGUAGE DerivingStrategies    #-}
 {-# LANGUAGE FlexibleInstances     #-}
+{-# LANGUAGE GADTs                 #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE NamedFieldPuns        #-}
 {-# LANGUAGE ScopedTypeVariables   #-}
@@ -20,8 +21,6 @@ import Control.Arrow
   ( first )
 import Control.Monad
   ( when )
-import Control.Monad.ST
-  ( ST )
 import Data.List
   ( sort )
 import GHC.Generics
@@ -36,6 +35,10 @@ import Data.Generics.Product.Constraints
   ( HasConstraints
     ( constraints )
   )
+
+-- primitive
+import Control.Monad.Primitive
+  ( PrimMonad(PrimState) )
 
 -- vector
 import qualified Data.Vector.Mutable as Boxed
@@ -63,20 +66,20 @@ data Ranking indices
   deriving stock    ( Show, Generic )
   deriving anyclass NFData
 
-instance Freeze m mvec vec => Freeze m (Ranking mvec) (Ranking vec) where
+instance Freeze m mvec vec => Freeze m ( Ranking mvec ) ( Ranking vec  ) where
   freeze       = constraints @( Freeze m ) freeze
   unsafeFreeze = constraints @( Freeze m ) unsafeFreeze
-instance Thaw   m vec mvec => Thaw   m (Ranking vec) (Ranking mvec) where
+instance Thaw   m vec mvec => Thaw   m ( Ranking vec  ) ( Ranking mvec ) where
   thaw         = constraints @( Thaw   m ) thaw
   unsafeThaw   = constraints @( Thaw   m ) unsafeThaw
 
 -------------------------------------------------------------------------------
 
 rankOn
-  :: ( Ord o )
+  :: ( Ord o, PrimMonad m, PrimState m ~ s )
   => ( a -> o )
   -> [ ( a, Int ) ]
-  -> ST s ( Ranking ( Unboxed.MVector s Int ) )
+  -> m ( Ranking ( Unboxed.MVector s Int ) )
 rankOn f as = do
   let sorted = fmap snd . sort . fmap ( first f ) $ as
   ordered <- Unboxed.Vector.unsafeThaw ( Unboxed.Vector.fromList sorted )
@@ -84,14 +87,15 @@ rankOn f as = do
   ranks   <- Unboxed.Vector.unsafeThaw ( Unboxed.Vector.fromList ranked )
   pure ( Ranking { ordered, ranks } )
 
-reorderAfterIncrease
-  :: forall s a o
-  .  ( Ord o )
+reorderAfterIncrease, reorderAfterDecrease
+  :: forall m s a o
+  .  ( Ord o, PrimMonad m, PrimState m ~ s )
   => Boxed.MVector s a
   -> Ranking ( Unboxed.MVector s Int )
   -> ( a -> o )
   -> Int
-  -> ST s ()
+  -> m ()
+
 reorderAfterIncrease allTasks ( Ranking { ordered, ranks } ) f i = do
   r <- ranks `Unboxed.Vector.unsafeRead` i
   when ( r + 1 < lg ) do
@@ -100,7 +104,7 @@ reorderAfterIncrease allTasks ( Ranking { ordered, ranks } ) f i = do
   where
     lg :: Int
     lg = Boxed.Vector.length allTasks
-    go :: o -> Int -> ST s ()
+    go :: o -> Int -> m ()
     go o r = do
       let
         r' = r + 1
@@ -112,21 +116,13 @@ reorderAfterIncrease allTasks ( Ranking { ordered, ranks } ) f i = do
         when ( r' + 1 < lg ) do
           go o r'
 
-reorderAfterDecrease
-  :: forall s a o
-  .  ( Ord o )
-  => Boxed.MVector s a
-  -> Ranking ( Unboxed.MVector s Int )
-  -> ( a -> o )
-  -> Int
-  -> ST s ()
 reorderAfterDecrease allTasks ( Ranking { ordered, ranks } ) f i = do
   r <- ranks `Unboxed.Vector.unsafeRead` i
   when ( r > 0 ) do
     o <- f <$> allTasks `Boxed.Vector.unsafeRead` i
     go o r
   where
-    go :: o -> Int -> ST s ()
+    go :: o -> Int -> m ()
     go o r = do
       let
         r' = r - 1

@@ -1,17 +1,8 @@
 packages: .
 
 constraints:
-  acts -finitary
-  bitvec -libgmp
+    acts -finitary
+  , bitvec -libgmp
 
--- instances for CPS WriterT monad transformer
-source-repository-package
-  type: git
-  location: https://github.com/mvv/transformers-base
-  tag: 7fa619f13b46d0bed43dc4b742cbb1fd9680d985
-
--- instances for CPS WriterT monad transformer
-source-repository-package
-  type: git
-  location: https://github.com/haskell/mtl
-  tag: 6b3d14b23568dccb849ccd8a95576148f6f79c0c
+allow-newer:
+  constraints-extras:constraints

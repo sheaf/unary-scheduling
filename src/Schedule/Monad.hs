@@ -1,39 +1,87 @@
 {-# LANGUAGE BlockArguments         #-}
 {-# LANGUAGE ConstraintKinds        #-}
 {-# LANGUAGE DataKinds              #-}
+{-# LANGUAGE DeriveGeneric          #-}
+{-# LANGUAGE DerivingStrategies     #-}
 {-# LANGUAGE FlexibleContexts       #-}
 {-# LANGUAGE FlexibleInstances      #-}
 {-# LANGUAGE FunctionalDependencies #-}
-{-# LANGUAGE KindSignatures         #-}
+{-# LANGUAGE GADTs                  #-}
+{-# LANGUAGE LambdaCase             #-}
 {-# LANGUAGE RankNTypes             #-}
 {-# LANGUAGE RecordWildCards        #-}
 {-# LANGUAGE ScopedTypeVariables    #-}
+{-# LANGUAGE StandaloneDeriving     #-}
 {-# LANGUAGE TypeApplications       #-}
-{-# LANGUAGE TypeSynonymInstances   #-}
+{-# LANGUAGE TypeFamilies           #-}
 
 module Schedule.Monad
   ( MonadSchedule
   , ScheduleMonad, runScheduleMonad
-  , SchedulableData
+  , constrain
+  , SchedulableData(..)
+  , TaskUpdates(..)
+  , Notifiee(..), Modifications
+  , BroadcastTarget(..), broadcastModifications
   ) where
 
 -- base
+import Control.Arrow
+  ( second )
 import Control.Category
   ( (>>>) )
 import Control.Monad.ST
   ( ST, runST )
+import Data.Bifunctor
+  ( bimap )
+import Data.Coerce
+  ( coerce )
 import Data.Function
   ( (&) )
+import Data.Functor.Identity
+  ( Identity(..) )
 import Data.Kind
   ( Constraint )
+import Data.Type.Equality
+  ( (:~:)(..) )
+import GHC.Generics
+  ( Generic )
 
 -- bitvec
 import Data.Bit
-  ( Bit (..) )
+  ( Bit(..) )
+
+-- constraints
+import Data.Constraint
+  ( Dict(..) )
+
+-- constraints-extras
+import Data.Constraint.Extras
+  ( ArgDict(..) )
+
+-- containers
+import Data.IntMap.Strict
+  ( IntMap )
+import qualified Data.IntMap.Strict as IntMap
+  ( keysSet, filter )
+import qualified Data.IntSet as IntSet
+  ( union )
+import Data.IntSet
+  ( IntSet )
+
+-- dependent-map
+import Data.Dependent.Map
+  ( DMap )
+import qualified Data.Dependent.Map as DMap
+  ( mapWithKey )
+
+-- lens
+import Control.Lens
+  ( over )
 
 -- generic-lens
 import Data.Generics.Product.Fields
-  ( field )
+  ( field' )
 
 -- mtl
 import Control.Monad.Except
@@ -41,7 +89,17 @@ import Control.Monad.Except
 import Control.Monad.Reader
   ( MonadReader )
 import Control.Monad.State
-  ( MonadState )
+  ( MonadState, modify' )
+
+-- primitive
+import Control.Monad.Primitive
+  ( PrimMonad(PrimState) )
+
+-- some
+import Data.GADT.Compare
+  ( GEq(..), GOrdering(..), GCompare(..) )
+import Data.GADT.Show
+  ( GShow(..) )
 
 -- text
 import Data.Text
@@ -55,19 +113,19 @@ import Control.Monad.Trans.Reader
 import Control.Monad.Trans.State.Strict
   ( StateT , runStateT )
 
--- transformers-base
-import Control.Monad.Base
-  ( MonadBase )
-
 -- vector
 import qualified Data.Vector as Boxed
   ( Vector )
 import qualified Data.Vector as Boxed.Vector
-  ( (!), fromList, length, unzip, unsafeThaw )
+  ( length, fromList, (!), unzip, unsafeThaw )
 
 -- unary-scheduling
 import Data.Vector.PhaseTransition
-  ( thaw, unsafeFreeze )
+  ( Freeze
+      ( unsafeFreeze )
+  , Thaw
+      ( thaw )
+  )
 import Data.Vector.Ranking
   ( rankOn )
 import Schedule.Constraint
@@ -75,41 +133,78 @@ import Schedule.Constraint
 import Schedule.Ordering
   ( Order(..), newOrderingMatrix )
 import Schedule.Task
-  ( Task(..), Tasks(..), TaskInfos(..)
-  , MutableTasks, ImmutableTasks
-  , est, lct, lst, ect
+  ( Task(..), TaskInfos(..)
+  , MutableTaskInfos, ImmutableTaskInfos
+  , est, lct, ect, lst
   )
 import Schedule.Tree
-  ( Propagatable ( overloaded ) )
+  ( Propagatable
+      ( overloaded )
+  )
 
 -------------------------------------------------------------------------------
+-- Schedule monad.
+
+data TaskUpdates t
+  = TaskUpdates
+  { taskConstraints :: !(Constraints t)
+  , tasksModified   :: !Modifications
+  }
+  deriving stock ( Show, Generic )
+
+instance Ord t => Semigroup ( TaskUpdates t ) where
+  TaskUpdates cts1 mods1 <> TaskUpdates cts2 mods2 =
+    TaskUpdates ( cts1 <> cts2 ) ( mods1 <> mods2 )
+instance Ord t => Monoid ( TaskUpdates t ) where
+  mempty = TaskUpdates mempty mempty
 
 type ScheduleMonad s task t =
-  ( ReaderT ( MutableTasks s task t )
+  ( ReaderT ( MutableTaskInfos s task t )
     ( ExceptT Text
-      ( StateT ( Constraints t )
+      ( StateT ( TaskUpdates t )
         ( ST s )
       )
     )
   )
 
 type MonadSchedule s task t m =
-  ( ( MonadReader ( MutableTasks s task t ) m
-    , MonadState  ( Constraints t ) m
-    , MonadError  Text m
-    , MonadBase (ST s) m
+  ( ( MonadReader ( MutableTaskInfos s task t ) m
+    , MonadState  ( TaskUpdates t ) m
+    , MonadError  Text   m
+    , PrimMonad m, PrimState m ~ s
     ) :: Constraint
   )
+
+runScheduleMonad
+  :: forall task t taskData a
+  .  ( Num t, Ord t, Bounded t
+     , SchedulableData taskData task t
+     )
+  => taskData
+  -> ( forall s. ScheduleMonad s task t a )
+  -> ( ImmutableTaskInfos task t, ( Either Text a, Constraints t ) )
+runScheduleMonad givenTasks ma = runST do
+  mutableTaskInfos <- initialTaskData givenTasks
+  res <- ma & ( ( `runReaderT` mutableTaskInfos ) >>> runExceptT >>> ( `runStateT` mempty ) )
+  finalTaskData <- unsafeFreeze mutableTaskInfos
+  pure ( finalTaskData, second taskConstraints res )
+
+constrain :: ( Ord t, MonadState ( TaskUpdates t ) m ) => Constraints t -> m ()
+constrain s = modify' ( over ( field' @"taskConstraints" ) ( <> s ) )
+
+-------------------------------------------------------------------------------
+-- Typeclass to abstract over different input data
+-- that can be provided to scheduling procedures.
 
 class    ( Num t, Ord t, Bounded t )
       => SchedulableData taskData task t | taskData -> task t
       where
-  initialTaskData :: taskData -> ST s ( MutableTasks s task t )
+  initialTaskData :: taskData -> ST s ( MutableTaskInfos s task t )
 
 instance ( Num t, Ord t, Bounded t )
-      => SchedulableData ( ImmutableTasks task t ) task t
+      => SchedulableData ( ImmutableTaskInfos task t ) task t
       where
-  initialTaskData = field @"taskInfos" thaw
+  initialTaskData = thaw
 
 instance ( Num t, Ord t, Bounded t )
       => SchedulableData [ ( Task task t, Text ) ] task t
@@ -132,26 +227,74 @@ instance ( Num t, Ord t, Bounded t )
           tk_i = immutableTasks Boxed.Vector.! i
           tk_j = immutableTasks Boxed.Vector.! j
         in Order ( Bit ( overloaded ( est tk_j ) ( lst tk_i ) ), Bit ( overloaded ( est tk_i ) ( lst tk_j ) ) )
-    tasks <- Boxed.Vector.unsafeThaw immutableTasks
+    taskAvails <- Boxed.Vector.unsafeThaw immutableTasks
     rankingEST <- rankOn est numberedTasks
     rankingLCT <- rankOn lct numberedTasks
     rankingLST <- rankOn lst numberedTasks
     rankingECT <- rankOn ect numberedTasks
     orderings  <- newOrderingMatrix n order
-    let
-      taskInfos = TaskInfos {..}
-    pure ( Tasks { .. } )
+    pure ( TaskInfos { .. } )
 
-runScheduleMonad
-  :: forall task t taskData a
-  .  ( Num t, Ord t, Bounded t
-     , SchedulableData taskData task t
-     )
-  => taskData
-  -> ( forall s. ScheduleMonad s task t a )
-  -> ( ImmutableTasks task t, ( Either Text a, Constraints t ) )
-runScheduleMonad givenTasks ma = runST do
-  mutableTaskData <- initialTaskData givenTasks
-  res <- ma & ( ( `runReaderT` mutableTaskData ) >>> runExceptT >>> ( `runStateT` mempty ) )
-  finalTaskData <- field @"taskInfos" unsafeFreeze mutableTaskData
-  pure ( finalTaskData, res )
+-------------------------------------------------------------------------------
+-- Keeping track of stale tasks,
+-- that need to be processed again by propagators
+-- which operate one task at a time (local propagators).
+
+-- | Keep track of all modifications in a dependent map.
+--
+-- Each object that needs to be notified has a separate key,
+-- with value the set of tasks that we want to notify have since been modified.
+type Modifications = DMap Notifiee Identity
+
+data BroadcastTarget
+  = TellEveryone
+  | TellEveryoneBut Text
+  deriving stock ( Show, Eq )
+
+broadcastModifications :: BroadcastTarget -> IntMap ( Bool, Bool ) -> Modifications -> Modifications
+broadcastModifications tgt newModifs =
+  DMap.mapWithKey \case
+    Coarse name
+      | TellEveryoneBut name /= tgt
+      -> coerce $ IntSet.union ( IntMap.keysSet $ IntMap.filter ( \case { ( False, False ) -> False; _ -> True } ) newModifs )
+    Fine name
+      | TellEveryoneBut name /= tgt
+      -> coerce $ bimap @(,)
+            ( IntSet.union ( IntMap.keysSet $ IntMap.filter fst newModifs ) )
+            ( IntSet.union ( IntMap.keysSet $ IntMap.filter snd newModifs ) )
+    _ -> id
+
+-- | Object which needs to be notified of modifications.
+--
+-- Either:
+--  * coarse notifications: a task has been modified.
+--  * fine notifications: a task's left/right endpoint has been modified.
+data Notifiee a where
+  Coarse :: Text -> Notifiee IntSet
+  Fine   :: Text -> Notifiee ( IntSet, IntSet )
+deriving stock instance Show ( Notifiee a )
+instance GEq Notifiee where
+  geq ( Coarse a ) ( Coarse b )
+    | a == b
+    = Just Refl
+  geq ( Fine a ) ( Fine b )
+    | a == b
+    = Just Refl
+  geq _ _ = Nothing
+instance GCompare Notifiee where
+  gcompare ( Coarse a ) ( Coarse b ) = case compare a b of
+    LT -> GLT
+    GT -> GGT
+    EQ -> GEQ
+  gcompare ( Fine a ) ( Fine b ) = case compare a b of
+    LT -> GLT
+    GT -> GGT
+    EQ -> GEQ
+  gcompare ( Coarse _ ) ( Fine _ ) = GLT
+  gcompare ( Fine _ ) ( Coarse _ ) = GGT
+instance GShow Notifiee where
+  gshowsPrec = showsPrec
+instance ArgDict c Notifiee where
+  type ConstraintsFor Notifiee c = ( c IntSet, c ( IntSet, IntSet ) )
+  argDict ( Coarse _ ) = Dict
+  argDict ( Fine   _ ) = Dict

@@ -3,13 +3,13 @@
 {-# LANGUAGE DeriveGeneric       #-}
 {-# LANGUAGE DerivingStrategies  #-}
 {-# LANGUAGE FlexibleContexts    #-}
+{-# LANGUAGE GADTs               #-}
 {-# LANGUAGE NamedFieldPuns      #-}
 {-# LANGUAGE OverloadedStrings   #-}
 {-# LANGUAGE PatternSynonyms     #-}
 {-# LANGUAGE PolyKinds           #-}
 {-# LANGUAGE RecordWildCards     #-}
 {-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TypeApplications    #-}
 {-# LANGUAGE ViewPatterns        #-}
 
 module Schedule.Constraint
@@ -24,12 +24,10 @@ module Schedule.Constraint
   where
 
 -- base
-import Control.Monad
-  ( when )
-import Control.Monad.ST
-  ( ST )
 import Data.Foldable
-  ( traverse_, foldl' )
+  ( foldl' )
+import Data.Maybe
+  ( fromMaybe )
 import GHC.Generics
   ( Generic )
 
@@ -37,19 +35,19 @@ import GHC.Generics
 import Data.IntMap.Strict
   ( IntMap )
 import qualified Data.IntMap.Strict as IntMap
-  ( empty, unionWith, foldrWithKey )
+  ( empty, unionWith, traverseWithKey )
 
 -- mtl
 import Control.Monad.Reader
   ( MonadReader ( ask ) )
 
+-- primitive
+import Control.Monad.Primitive
+  ( PrimMonad(PrimState) )
+
 -- text
 import Data.Text
   ( Text )
-
--- transformers-base
-import Control.Monad.Base
-  ( MonadBase ( liftBase ) )
 
 -- vector
 import qualified Data.Vector.Mutable as Boxed.MVector
@@ -63,13 +61,11 @@ import Data.Lattice
 import Data.Vector.Ranking
   ( reorderAfterIncrease, reorderAfterDecrease )
 import Schedule.Interval
-  ( Clusivity(..), EndPoint(..)
-  , Intervals(..)
+  ( Endpoint(..), Intervals(..)
   , cutBefore, cutAfter, remove
   )
 import Schedule.Task
-  ( Task(..), Tasks(..), TaskInfos(..)
-  , MutableTasks
+  ( Task(..), TaskInfos(..), MutableTaskInfos
   , est, lct, lst, ect
   )
 import Schedule.Time
@@ -83,22 +79,22 @@ import Schedule.Time
 
 data Constraint t
   = Constraint
-  { notEarlierThan :: Maybe ( EndPoint ( EarliestTime t ) )
-  , notLaterThan   :: Maybe ( EndPoint ( LatestTime   t ) )
+  { notEarlierThan :: Maybe ( Endpoint ( EarliestTime t ) )
+  , notLaterThan   :: Maybe ( Endpoint ( LatestTime   t ) )
   , outside        :: Maybe ( Intervals t )
   , inside         :: Maybe ( Intervals t )
   }
   deriving stock ( Show, Generic )
 
-pattern NotEarlierThan :: Ord t => EarliestTime t -> Clusivity -> Constraint t
-pattern NotEarlierThan t clu <- ( notEarlierThan -> Just ( EndPoint t clu ) )
+pattern NotEarlierThan :: Ord t => Endpoint ( EarliestTime t ) -> Constraint t
+pattern NotEarlierThan endpoint <- ( notEarlierThan -> Just endpoint )
   where
-    NotEarlierThan t clu = mempty { notEarlierThan = Just ( EndPoint t clu ) }
+    NotEarlierThan endpoint= mempty { notEarlierThan = Just endpoint }
 
-pattern NotLaterThan :: Ord t => LatestTime t -> Clusivity -> Constraint t
-pattern NotLaterThan t clu <- ( notLaterThan -> Just ( EndPoint t clu ) )
+pattern NotLaterThan :: Ord t => Endpoint ( LatestTime t ) -> Constraint t
+pattern NotLaterThan endpoint <- ( notLaterThan -> Just endpoint )
   where
-    NotLaterThan t clu = mempty { notLaterThan = Just ( EndPoint t clu ) }
+    NotLaterThan endpoint = mempty { notLaterThan = Just endpoint }
 
 pattern Outside :: Ord t => Intervals t -> Constraint t
 pattern Outside ivals <- ( outside -> Just ivals )
@@ -109,6 +105,9 @@ pattern Inside :: Ord t => Intervals t -> Constraint t
 pattern Inside ivals <- ( inside -> Just ivals )
   where
     Inside ivals = mempty { inside = Just ivals }
+
+pattern NoConstraint :: Constraint t
+pattern NoConstraint = Constraint Nothing Nothing Nothing Nothing
 
 instance Ord t => Semigroup ( Constraint t ) where
   Constraint e1 l1 o1 i1 <> Constraint e2 l2 o2 i2 = Constraint e l o i
@@ -125,7 +124,7 @@ instance Ord t => Semigroup ( Constraint t ) where
       combine f (Just a) (Just b) = Just (f a b)
 
 instance Ord t => Monoid ( Constraint t ) where
-  mempty = Constraint Nothing Nothing Nothing Nothing
+  mempty = NoConstraint
 
 data Constraints t
   = Constraints
@@ -141,36 +140,35 @@ instance Ord t => Monoid ( Constraints t ) where
   mempty = Constraints IntMap.empty mempty
 
 applyConstraints
-  :: ( MonadReader ( MutableTasks s task t ) m
-     , MonadBase (ST s) m
+  :: ( MonadReader ( MutableTaskInfos s task t ) m
+     , PrimMonad m, PrimState m ~ s
      , Num t, Ord t, Bounded t
      -- debugging
      , Show t, Show task
      )
   => Constraints t
-  -> m ()
-applyConstraints = itraverse_ applyConstraint . constraints
+  -> m ( IntMap ( Bool, Bool ) )
+applyConstraints = IntMap.traverseWithKey applyConstraint . constraints
 
 applyConstraint
-  :: ( MonadReader ( MutableTasks s task t ) m
-     , MonadBase (ST s) m
+  :: ( MonadReader ( MutableTaskInfos s task t )  m
+     , PrimMonad m, PrimState m ~ s
      , Num t, Ord t, Bounded t
      -- debugging
      , Show t, Show task
      )
   => Int
   -> Constraint t
-  -> m ()
+  -> m ( Bool, Bool )
+applyConstraint _ NoConstraint = pure ( False, False )
 applyConstraint i ( Constraint { .. } ) = do
+  taskInfos <- ask
   -- apply 'constrain to inside' first (useful in case restriction is not checked)
-  traverse_ ( constrainToInside  i ) inside
-  traverse_ ( constrainToAfter   i ) notEarlierThan
-  traverse_ ( constrainToBefore  i ) notLaterThan
-  traverse_ ( constrainToOutside i ) outside
-
-
-itraverse_ :: Applicative t => ( Int -> v -> t u ) -> IntMap v -> t ()
-itraverse_ f = IntMap.foldrWithKey ( \ k a b -> f k a *> b ) ( pure () )
+  ( l1, r1 ) <- fromMaybe ( False, False ) <$> traverse ( constrainToInside  taskInfos i ) inside
+  l2         <- fromMaybe False            <$> traverse ( constrainToAfter   taskInfos i ) notEarlierThan
+  r2         <- fromMaybe False            <$> traverse ( constrainToBefore  taskInfos i ) notLaterThan
+  ( l3, r3 ) <- fromMaybe ( False, False ) <$> traverse ( constrainToOutside taskInfos i ) outside
+  pure ( l1 || l2 || l3, r1 || r2 || r3 )
 
 -------------------------------------------------------------------------------
 
@@ -178,97 +176,119 @@ class HandedTimeConstraint (h :: Handedness) where
   -- | Constraint associated to a handed time:
   --   - @Earliest t@ : @NotEarlierThan t@
   --   - @Latest t@ : @NotLaterThan t@.
-  handedTimeConstraint :: Ord t => EndPoint (HandedTime h t) -> Constraint t
+  handedTimeConstraint :: Ord t => Endpoint (HandedTime h t) -> Constraint t
 instance HandedTimeConstraint Earliest where
-  handedTimeConstraint ( EndPoint t clu ) = NotEarlierThan t clu
+  handedTimeConstraint endpoint = NotEarlierThan endpoint
 instance HandedTimeConstraint Latest   where
-  handedTimeConstraint ( EndPoint t clu ) = NotLaterThan   t clu
+  handedTimeConstraint endpoint = NotLaterThan   endpoint
 
 -- | Apply the constraint: task must begin after the specified time.
 constrainToAfter
-  :: ( MonadReader ( MutableTasks s task t ) m
-     , MonadBase (ST s) m
-     , Num t, Ord t, Bounded t
+  :: ( Num t, Ord t, Bounded t
+     , PrimMonad m, PrimState m ~ s
      )
-  => Int
-  -> EndPoint ( EarliestTime t ) 
-  -> m ()
-constrainToAfter taskNo t = do
-  Tasks { taskInfos = TaskInfos { tasks, rankingEST, rankingECT } } <- ask
-  liftBase do
-    task@(Task { taskAvailability }) <- Boxed.MVector.unsafeRead tasks taskNo
-    let
-      newTaskAvailability = cutBefore t taskAvailability
-      newTask = task { taskAvailability = newTaskAvailability }
-    Boxed.MVector.unsafeWrite tasks taskNo newTask
-    reorderAfterIncrease tasks rankingEST est taskNo
-    reorderAfterIncrease tasks rankingECT ect taskNo
+  => MutableTaskInfos s task t
+  -> Int
+  -> Endpoint ( EarliestTime t )
+  -> m Bool
+constrainToAfter ( TaskInfos { taskAvails, rankingEST, rankingECT } ) taskNo t = do
+  task@(Task { taskAvailability }) <- Boxed.MVector.unsafeRead taskAvails taskNo
+  let
+    newTaskAvailability = cutBefore t taskAvailability
+    newTask = task { taskAvailability = newTaskAvailability }
+  if est newTask > est task
+  then do
+    Boxed.MVector.unsafeWrite taskAvails taskNo newTask
+    reorderAfterIncrease taskAvails rankingEST est taskNo
+    reorderAfterIncrease taskAvails rankingECT ect taskNo
+    pure True
+  else
+    pure False
 
 -- | Apply the constraint: task must end before the specified time.
 constrainToBefore
-  :: ( MonadReader ( MutableTasks s task t ) m
-     , MonadBase (ST s) m
-     , Num t, Ord t, Bounded t
+  :: ( Num t, Ord t, Bounded t
+     , PrimMonad m, PrimState m ~ s
      )
-  => Int
-  -> EndPoint ( LatestTime t ) 
-  -> m ()
-constrainToBefore taskNo t = do
-  Tasks { taskInfos = TaskInfos { tasks, rankingLCT, rankingLST } } <- ask
-  liftBase do
-    task@(Task { taskAvailability }) <- Boxed.MVector.unsafeRead tasks taskNo
-    let
-      newTaskAvailability = cutAfter t taskAvailability
-      newTask = task { taskAvailability = newTaskAvailability }
-    Boxed.MVector.unsafeWrite tasks taskNo newTask
-    reorderAfterDecrease tasks rankingLCT lct taskNo
-    reorderAfterDecrease tasks rankingLST lst taskNo
+  => MutableTaskInfos s task t
+  -> Int
+  -> Endpoint ( LatestTime t )
+  -> m Bool
+constrainToBefore ( TaskInfos { taskAvails, rankingLCT, rankingLST } ) taskNo t = do
+  task@(Task { taskAvailability }) <- Boxed.MVector.unsafeRead taskAvails taskNo
+  let
+    newTaskAvailability = cutAfter t taskAvailability
+    newTask = task { taskAvailability = newTaskAvailability }
+  if lct newTask < lct task
+  then do
+    Boxed.MVector.unsafeWrite taskAvails taskNo newTask
+    reorderAfterDecrease taskAvails rankingLCT lct taskNo
+    reorderAfterDecrease taskAvails rankingLST lst taskNo
+    pure True
+  else
+    pure False
 
 -- | Remove intervals from the domain of availability of a task.
 constrainToOutside
-  :: ( MonadReader ( MutableTasks s task t ) m
-     , MonadBase (ST s) m
-     , Num t, Ord t, Bounded t
+  :: ( Num t, Ord t, Bounded t
+     , PrimMonad m, PrimState m ~ s
      )
-  => Int
+  => MutableTaskInfos s task t
+  -> Int
   -> Intervals t
-  -> m ()
-constrainToOutside taskNo (Intervals ivalsToRemove) = do
-  Tasks { taskInfos = TaskInfos { .. } } <- ask
-  liftBase do
-    task@(Task { taskAvailability }) <- Boxed.MVector.unsafeRead tasks taskNo
-    let
-      newAvailability = foldl' remove taskAvailability ivalsToRemove
-      newTask = task { taskAvailability = newAvailability }
-    Boxed.MVector.unsafeWrite tasks taskNo newTask
-    when ( est newTask > est task ) do
-      reorderAfterIncrease tasks rankingEST est taskNo
-      reorderAfterIncrease tasks rankingECT ect taskNo
-    when ( lct newTask < lct task ) do
-      reorderAfterDecrease tasks rankingLCT lct taskNo
-      reorderAfterDecrease tasks rankingLST lst taskNo
+  -> m ( Bool, Bool )
+constrainToOutside ( TaskInfos { .. } ) taskNo ( Intervals ivalsToRemove ) = do
+  task@(Task { taskAvailability }) <- Boxed.MVector.unsafeRead taskAvails taskNo
+  let
+    newAvailability = foldl' remove taskAvailability ivalsToRemove
+    newTask = task { taskAvailability = newAvailability }
+  Boxed.MVector.unsafeWrite taskAvails taskNo newTask
+  l <-
+    if est newTask > est task
+    then do
+      reorderAfterIncrease taskAvails rankingEST est taskNo
+      reorderAfterIncrease taskAvails rankingECT ect taskNo
+      pure True
+    else
+      pure False
+  r <-
+    if lct newTask < lct task
+    then do
+      reorderAfterDecrease taskAvails rankingLCT lct taskNo
+      reorderAfterDecrease taskAvails rankingLST lst taskNo
+      pure True
+    else
+      pure False
+  pure ( l, r )
 
 -- | Reduce the domain of availability of a task.
 constrainToInside
-  :: ( MonadReader ( MutableTasks s task t ) m
-     , MonadBase (ST s) m
-     , Num t, Ord t, Bounded t
-     -- debugging
-     , Show task, Show t
+  :: ( Num t, Ord t, Bounded t
+     , PrimMonad m, PrimState m ~ s
      )
-  => Int
+  => MutableTaskInfos s task t
+  -> Int
   -> Intervals t
-  -> m ()
-constrainToInside taskNo shrunkDomain = do
-  Tasks { taskInfos = TaskInfos { .. } } <- ask
-  liftBase do
-    task@( Task { taskAvailability = oldDomain } ) <- Boxed.MVector.unsafeRead tasks taskNo
-    let
-      newTask = task { taskAvailability = oldDomain /\ shrunkDomain }
-    Boxed.MVector.unsafeWrite tasks taskNo newTask
-    when ( est newTask > est task ) do
-      reorderAfterIncrease tasks rankingEST est taskNo
-      reorderAfterIncrease tasks rankingECT ect taskNo
-    when ( lct newTask < lct task ) do
-      reorderAfterDecrease tasks rankingLCT lct taskNo
-      reorderAfterDecrease tasks rankingLST lst taskNo
+  -> m ( Bool, Bool )
+constrainToInside ( TaskInfos { .. } ) taskNo shrunkDomain = do
+  task@( Task { taskAvailability = oldDomain } ) <- Boxed.MVector.unsafeRead taskAvails taskNo
+  let
+    newTask = task { taskAvailability = oldDomain /\ shrunkDomain }
+  Boxed.MVector.unsafeWrite taskAvails taskNo newTask
+  l <-
+    if est newTask > est task
+    then do
+      reorderAfterIncrease taskAvails rankingEST est taskNo
+      reorderAfterIncrease taskAvails rankingECT ect taskNo
+      pure True
+    else
+      pure False
+  r <-
+    if lct newTask < lct task
+    then do
+      reorderAfterDecrease taskAvails rankingLCT lct taskNo
+      reorderAfterDecrease taskAvails rankingLST lst taskNo
+      pure True
+    else
+      pure False
+  pure ( l, r )

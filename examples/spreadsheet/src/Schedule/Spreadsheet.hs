@@ -1,10 +1,15 @@
+{-# LANGUAGE AllowAmbiguousTypes        #-}
 {-# LANGUAGE BlockArguments             #-}
+{-# LANGUAGE ConstraintKinds            #-}
 {-# LANGUAGE DataKinds                  #-}
 {-# LANGUAGE DerivingStrategies         #-}
 {-# LANGUAGE FlexibleContexts           #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE MagicHash                  #-}
 {-# LANGUAGE NamedFieldPuns             #-}
+{-# LANGUAGE NamedWildCards             #-}
 {-# LANGUAGE OverloadedStrings          #-}
+{-# LANGUAGE PartialTypeSignatures      #-}
 {-# LANGUAGE PatternSynonyms            #-}
 {-# LANGUAGE RecordWildCards            #-}
 {-# LANGUAGE ScopedTypeVariables        #-}
@@ -170,13 +175,15 @@ import Schedule.Interval
   ( Interval((:<=..<=)), Intervals(..)
   , insideLax
   )
+import Schedule.Monad
+  ( BroadcastTarget(..) )
 import Schedule.Ordering
   ( visualiseEdges )
 import Schedule.Search
   ( SearchState(..), search )
 import Schedule.Task
-  ( Task(..), Tasks(..), TaskInfos(..)
-  , ImmutableTasks
+  ( Task(..), TaskInfos(..)
+  , ImmutableTaskInfos
   )
 import Schedule.Time
   ( Delta(..), Time(..) )
@@ -237,7 +244,11 @@ scheduleSpreadsheet = do
             = toList
             $ fmap
                 ( \ StaffMemberData { memberName, memberMakespanRanges, memberAssignedTasks } ->
-                  Propagator $ makespan memberName memberAssignedTasks memberMakespanRanges
+                  Propagator
+                    { mbNotifiee     = Nothing
+                    , notifyTarget   = TellEveryone
+                    , runPropagator  = makespan memberName memberAssignedTasks memberMakespanRanges
+                    }
                 )
                 schedulingStaff
       = basicPropagators ++ makespanPropagators
@@ -275,7 +286,7 @@ scheduleSpreadsheet = do
         )
       case solutions searchRes of
         ( Arg cost bestSol : _ ) -> do
-          liftIO $ Text.writeFile "dotfile.txt" ( visualiseEdges . orderings . taskInfos $ bestSol )
+          liftIO $ Text.writeFile "dotfile.txt" ( visualiseEdges . orderings $ bestSol )
           liftIO $ Text.writeFile "cost.txt" ( Text.pack ( show cost ) )
           pure bestSol
         _ -> throwError ( NoSchedulingPossible "Search has found no results" )
@@ -310,7 +321,7 @@ data StaffMemberData
   { memberAvailability   :: !(Intervals Column)
   , memberName           :: !Text
   , memberMakespanRanges :: ![ ( Interval Column, Delta Column ) ]
-  , memberSchedulingCost :: ( ImmutableTasks ( Set Staff ) Column -> Double )
+  , memberSchedulingCost :: ( ImmutableTaskInfos ( Set Staff ) Column -> Double )
   , memberAssignedTasks  :: !(Set Int)
   }
 
@@ -324,7 +335,7 @@ data SchedulingData
   { schedulingStaff     :: !( Boxed.Vector StaffMemberData )
   , schedulingTasks     :: ![ ( Task ( Set Staff ) Column, Text ) ]
   , schedulingRanges    :: !SchedulingRanges
-  , totalSchedulingCost :: ( ImmutableTasks ( Set Staff ) Column -> Double )
+  , totalSchedulingCost :: ( ImmutableTaskInfos ( Set Staff ) Column -> Double )
   }
 
 newtype Staff = Staff { staffID :: Int }
@@ -405,7 +416,7 @@ parseSpreadsheet enableMakespanConstraints spreadsheet = runST $ runExceptT do
         else pure []
       -- Parsing individual staff member scheduling cost function (TODO)
       let
-        schedulingCost :: ImmutableTasks ( Set Staff ) Column -> Double
+        schedulingCost :: ImmutableTaskInfos ( Set Staff ) Column -> Double
         schedulingCost = const 0
       pure ( avail, name, makespanCt, schedulingCost )
 
@@ -470,7 +481,7 @@ parseSpreadsheet enableMakespanConstraints spreadsheet = runST $ runExceptT do
         )
         schedulingStaffInfo staffTasks
     -- Total scheduling cost function (TODO).
-    totalSchedulingCost :: ImmutableTasks ( Set Staff ) Column -> Double
+    totalSchedulingCost :: ImmutableTaskInfos ( Set Staff ) Column -> Double
     totalSchedulingCost = const 0
 
   -- Return the above info.
@@ -725,11 +736,11 @@ parseMakespanConstraints loc _ =
 -- unavailable task time slots with the value @0@.
 updateSpreadsheet
   :: SchedulingRanges
-  -> ImmutableTasks taskData Column
+  -> ImmutableTaskInfos taskData Column
   -> Boxed.Vector StaffMemberData
   -> Xlsx.Xlsx
   -> Xlsx.Xlsx
-updateSpreadsheet ( SchedulingRanges { .. } ) ( Tasks { taskNames, taskInfos = TaskInfos { tasks = taskAvails } } ) staff =
+updateSpreadsheet ( SchedulingRanges { .. } ) ( TaskInfos { taskNames, taskAvails } ) staff =
   over _cells ( Map.unionWith setCellText staffTasks . Map.mapWithKey makeCellUnavailable )
   where
     makeCellUnavailable :: ( Int,Int ) -> Xlsx.Cell -> Xlsx.Cell

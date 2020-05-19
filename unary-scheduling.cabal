@@ -25,6 +25,8 @@ common common
         ^>= 1.4.4.0
     , generic-lens
         >= 1.2.0.1 && < 2.0.0.0
+    , lens
+        ^>= 4.19.2
     , mtl
         ^>= 2.2.2
     , text
@@ -89,12 +91,18 @@ library
         ^>= 0.3.0.0
     , bitvec
         ^>= 1.0.3.0
+    , constraints
+        ^>= 0.12
+    , constraints-extras
+        ^>= 0.3.0.2
+    , dependent-map
+        ^>= 0.4.0.0
     , groups
         ^>= 0.4.0.0
     , primitive
         ^>= 0.7.0.0
-    , transformers-base
-        ^>= 0.4.5.2
+    , some
+        ^>= 1.0.1
 
   if flag(viz)
     build-depends:
@@ -131,8 +139,6 @@ executable schedule-spreadsheet
         ^>= 1.3.6.0
     , filepath
         ^>= 1.4.2.1
-    , lens
-        ^>= 4.19.1
     , optparse-applicative
         ^>= 0.15.1.0
     , time

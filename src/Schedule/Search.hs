@@ -1,21 +1,21 @@
-{-# LANGUAGE BlockArguments      #-}
-{-# LANGUAGE DataKinds           #-}
-{-# LANGUAGE DeriveAnyClass      #-}
-{-# LANGUAGE DeriveGeneric       #-}
-{-# LANGUAGE DerivingStrategies  #-}
-{-# LANGUAGE FlexibleContexts    #-}
-{-# LANGUAGE LambdaCase          #-}
-{-# LANGUAGE NamedFieldPuns      #-}
-{-# LANGUAGE OverloadedStrings   #-}
-{-# LANGUAGE RankNTypes          #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TypeApplications    #-}
+{-# LANGUAGE BlockArguments        #-}
+{-# LANGUAGE DataKinds             #-}
+{-# LANGUAGE DeriveAnyClass        #-}
+{-# LANGUAGE DeriveGeneric         #-}
+{-# LANGUAGE DerivingStrategies    #-}
+{-# LANGUAGE FlexibleContexts      #-}
+{-# LANGUAGE GADTs                 #-}
+{-# LANGUAGE NamedFieldPuns        #-}
+{-# LANGUAGE OverloadedStrings     #-}
+{-# LANGUAGE PolyKinds             #-}
+{-# LANGUAGE QuantifiedConstraints #-}
+{-# LANGUAGE RankNTypes            #-}
+{-# LANGUAGE ScopedTypeVariables   #-}
+{-# LANGUAGE TypeApplications      #-}
 
 module Schedule.Search where
 
 -- base
-import Control.Monad.ST
-  ( ST )
 import Data.Functor.Const
   ( Const(..) )
 import Data.Functor.Identity
@@ -24,8 +24,6 @@ import Data.List
   ( insert, sort )
 import Data.Maybe
   ( mapMaybe, listToMaybe )
-import Data.Monoid
-  ( Sum(..) )
 import Data.Semigroup
   ( Arg(..) )
 import GHC.Generics
@@ -35,9 +33,17 @@ import GHC.Generics
 import Data.Act
   ( Torsor((-->)) )
 
+-- containers
+import qualified Data.IntMap as IntMap
+  ( fromList )
+
 -- deepseq
 import Control.DeepSeq
   ( NFData )
+
+-- lens
+import Control.Lens
+  ( modifying )
 
 -- generic-lens
 import Data.Generics.Product.Fields
@@ -46,10 +52,8 @@ import Data.GenericLens.Internal
   ( over )
 
 -- mtl
-import Control.Monad.Except
-  ( MonadError )
 import Control.Monad.Reader
-  ( MonadReader, ask )
+  ( ask )
 import Control.Monad.State.Strict
   ( MonadState, get, put, modify' )
 
@@ -61,10 +65,6 @@ import Data.Text
 import Control.Monad.Trans.State.Strict
   ( execState )
 
--- transformers-base
-import Control.Monad.Base
-  ( MonadBase ( liftBase ) )
-
 -- vector
 import qualified Data.Vector as Boxed
   ( Vector )
@@ -73,17 +73,19 @@ import qualified Data.Vector as Boxed.Vector
 import qualified Data.Vector.Unboxed as Unboxed
   ( Vector )
 import qualified Data.Vector.Unboxed as Unboxed.Vector
-  ( (!), foldr )
+  ( (!) )
 
 -- unary-scheduling
 import Data.Vector.Generic.Index
   ( unsafeIndex )
 import Schedule.Constraint
-  ( constrainToBefore, constrainToAfter )
+  ( Constraints(..), Constraint(..) )
 import Schedule.Interval
-  ( EndPoint(..) )
+  ( Endpoint(..) )
 import Schedule.Monad
-  ( runScheduleMonad )
+  ( MonadSchedule
+  , runScheduleMonad, constrain
+  )
 import Schedule.Ordering
   ( Order(..)
   , OrderingMatrix(..), upperTriangular
@@ -92,7 +94,7 @@ import Schedule.Ordering
 import Schedule.Propagators
   ( Propagator, propagationLoop )
 import Schedule.Task
-  ( Task, Tasks(..), TaskInfos(..), MutableTasks, ImmutableTasks
+  ( Task, TaskInfos(..), ImmutableTaskInfos
   , est, ect, lst, lct
   )
 import Schedule.Time
@@ -110,7 +112,7 @@ data SearchDecision
 
 data SearchData task t
   = SearchData
-  { searchTasks    :: !(ImmutableTasks task t)
+  { searchTasks    :: !( ImmutableTaskInfos task t )
   , searchDecision :: !( Int, Int )
   }
   deriving stock ( Show, Generic )
@@ -118,7 +120,7 @@ data SearchData task t
 data SearchState task t
   = SearchState
   { pastDecisions       :: [ SearchData task t ]
-  , solutions           :: [ Arg Double ( ImmutableTasks task t ) ]
+  , solutions           :: [ Arg Double ( ImmutableTaskInfos task t ) ]
   , totalSolutionsFound :: !Int
   , totalDecisionsTaken :: !Int
   }
@@ -130,44 +132,54 @@ search
      , NFData t, NFData task
      , Show t, Show task
      )
-  => ( ImmutableTasks task t -> Double )
+  => ( ImmutableTaskInfos task t -> Double )
   -> Int
   -> [ Propagator task t ]
-  -> ImmutableTasks task t
+  -> ImmutableTaskInfos task t
   -> SearchState task t
 search cost maxSolutions propagators = ( `execState` initialState ) . findNextSearchStart
   where
 
     initialState :: SearchState task t
     initialState = SearchState
-      { pastDecisions = []
-      , solutions = []
+      { pastDecisions       = []
+      , solutions           = []
       , totalSolutionsFound = 0
       , totalDecisionsTaken = 0
       }
 
+    -- Find the precedence which would incur the largest adjustment in availability for the two tasks involved.
+    likelihood :: Task task t -> Task task t -> Delta t
+    likelihood tk tk' = min ( totalCut tk tk' ) ( totalCut tk' tk )
+      where
+        totalCut :: Task task t -> Task task t -> Delta t
+        totalCut tk_i tk_j =
+          max mempty ( handedTime ( endpoint ( lst tk_j ) ) --> handedTime ( endpoint ( lct tk_i ) ) )
+          <>
+          max mempty ( handedTime ( endpoint ( est tk_j ) ) --> handedTime ( endpoint ( ect tk_i ) ) )
+
     -- Search for the next precedence decision that can be taken.
-    findNextSearchStart :: MonadState ( SearchState task t ) m => ImmutableTasks task t -> m ()
-    findNextSearchStart currentTasks@( Tasks { taskInfos } ) =
-      case nextLikeliestPrecedence ( tasks taskInfos ) ( orderings taskInfos ) of
+    findNextSearchStart :: MonadState ( SearchState task t ) m => ImmutableTaskInfos task t -> m ()
+    findNextSearchStart taskInfos@( TaskInfos { taskAvails, orderings } )  =
+      case nextLikeliestPrecedence likelihood taskAvails orderings of
         -- No further decisions to make: make a note of the solution found and then backtrack to keep searching.
         Nothing -> do
           SearchState { totalSolutionsFound } <- get
           modify'
             $ over ( field' @"solutions" )
                 ( trace ( "found solution #" <> show ( totalSolutionsFound + 1 ) <> "\n" )
-                $ insertSolution maxSolutions currentTasks ( cost currentTasks )
+                $ insertSolution maxSolutions taskInfos ( cost taskInfos )
                 )
           backtrack
         -- A further search decision can be made:
         --  - make a search decision and compute its effect,
         --  - if the search can continue, add the decisions to the search state to enable backtracking.
         -- Choose the @ < @ decision first, as @ > @ is chosen only after backtracking.
-        Just ( i, j ) -> decide TryLT i j currentTasks
+        Just ( i, j ) -> decide TryLT i j taskInfos
 
     -- Take a decision: add a precedence, and if there were other choices that could have been made,
     -- add a point to backtrack to so that the search can continue with the other decisions.
-    decide :: MonadState ( SearchState task t ) m => SearchDecision -> Int -> Int -> ImmutableTasks task t -> m ()
+    decide :: MonadState ( SearchState task t ) m => SearchDecision -> Int -> Int -> ImmutableTaskInfos task t -> m ()
     decide decToTry i j currentTasks = do
 
       next <- case decToTry of
@@ -188,18 +200,21 @@ search cost maxSolutions propagators = ( `execState` initialState ) . findNextSe
             $ over ( field' @"totalDecisionsTaken" ) ( + 1 )
           pure $ runScheduleMonad currentTasks ( addEdge j i *> propagationLoop 1000 propagators )
       case next of
-        -- No results possible: record the (partial) solution, then backtrack.
+        -- No results possible: backtrack.
         ( _, ( Left _err, _ ) ) -> do
+          {-
           let
             remainingUnknowns :: Int
             remainingUnknowns
               = getSum
               . Unboxed.Vector.foldr ( (<>) . ( \case { Unknown -> 1 ; _ -> 0 } ) ) mempty
               $ ( orderingMatrix . orderings . taskInfos $ currentTasks )
-          --pastDecs <- ( map searchDecision . pastDecisions ) <$> get
-          --modify'
-          --  $ over ( field' @"solutions" )
-          --      ( insertSolution maxSolutions currentTasks ( Right ( Arg remainingUnknowns pastDecs ) ) )
+          pastDecs <- ( map searchDecision . pastDecisions ) <$> get
+          modify'
+            $ over ( field' @"solutions" )
+                ( insertSolution maxSolutions currentTasks ( Right ( Arg remainingUnknowns pastDecs ) ) )
+          -}
+          --trace ( "backtracking from depth " <> show ( length pastDecs ) <> "\n" )
           backtrack
         -- Search can continue: keep going.
         ( newTaskData, _ ) ->
@@ -223,50 +238,51 @@ insertSolution maxSolutions currentSolution currentCost
   = take maxSolutions
   . insert ( Arg currentCost currentSolution )
 
-
 -- | Obtain the indices for the most likely unknown precedence.
 nextLikeliestPrecedence
-  :: forall task t
-  .  ( Num t, Ord t, Bounded t )
-  =>  Boxed.Vector ( Task task t )
+  :: forall task t o
+  .  ( Num t, Ord t, Bounded t
+     , Ord o
+     )
+  => ( Task task t -> Task task t -> o )
+  -> Boxed.Vector ( Task task t )
   -> OrderingMatrix Unboxed.Vector
   -> Maybe ( Int, Int )
-nextLikeliestPrecedence allTasks ( OrderingMatrix { dim, orderingMatrix } )
+nextLikeliestPrecedence likelihood allTasks ( OrderingMatrix { dim, orderingMatrix } ) 
   = fmap ( \ ( Arg _ v ) -> v )
   . listToMaybe
   . sort
   . mapMaybe
     ( \ ( i, j ) -> case orderingMatrix Unboxed.Vector.! ( upperTriangular dim i j ) of
-        Unknown -> Just $ Arg ( likelihood i j ) ( i, j )
-        _       -> Nothing
+        Unknown -> 
+          let
+            tk_i, tk_j :: Task task t
+            tk_i = allTasks Boxed.Vector.! i
+            tk_j = allTasks Boxed.Vector.! j 
+          in
+            Just $ Arg ( likelihood tk_i tk_j ) ( i, j )
+        _ -> Nothing
     )
   $ [ ( i, j ) | i <- [ 0 .. dim - 1 ], j <- [ i + 1 .. dim - 1 ] ]
-  where
-    likelihood :: Int -> Int -> Delta t
-    likelihood i j =
-      let
-        tk_i, tk_j :: Task task t
-        tk_i = allTasks Boxed.Vector.! i
-        tk_j = allTasks Boxed.Vector.! j
-      in
-        min
-          ( handedTime ( endPoint ( lst tk_j ) ) --> handedTime ( endPoint ( lct tk_i ) ) )
-          ( handedTime ( endPoint ( est tk_j ) ) --> handedTime ( endPoint ( ect tk_i ) ) )
 
 -- | Add a precedence in the ordering matrix,
 -- inducing precedence constraints on all resulting transitive edges.
 addEdge
   :: forall m task t s
-  .  ( MonadReader ( MutableTasks s task t ) m
-     , MonadBase ( ST s ) m
-     , MonadError Text m
+  .  ( MonadSchedule s task t m
      , Num t, Ord t, Bounded t
      )
   => Int
   -> Int
   -> m ()
 addEdge start end = do
-  Tasks { taskNames, taskInfos = TaskInfos { tasks, orderings } } <- ask
+  TaskInfos { taskNames, taskAvails, orderings } <- ask
+
+  modifying ( field' @"taskConstraints" . field' @"justifications" )
+    ( <> 
+      "Search decision has introduced the precedence:\n\
+      \\"" <> taskNames Boxed.Vector.! start <> "\" < \"" <> taskNames Boxed.Vector.! end <> "\n\n"
+    )
 
   let
     addEdges :: m ()
@@ -278,10 +294,18 @@ addEdge start end = do
 
     propagateNewEdge :: Int -> Int -> m ()
     propagateNewEdge i j = do
-      tk_i <- liftBase $ tasks `unsafeIndex` i
-      tk_j <- liftBase $ tasks `unsafeIndex` j
-      constrainToBefore i ( lst tk_j )
-      constrainToAfter  j ( ect tk_i )
+      tk_i <- taskAvails `unsafeIndex` i
+      tk_j <- taskAvails `unsafeIndex` j
+      constrain
+        ( Constraints
+          { constraints
+              = IntMap.fromList
+              [ ( i, NotLaterThan   $ lst tk_j )
+              , ( j, NotEarlierThan $ ect tk_i )
+              ]
+          , justifications = ""
+          }
+        )
 
     errorMessage :: Either Int ( Int, Int ) -> Text
     errorMessage ( Left i ) =

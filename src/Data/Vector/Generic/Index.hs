@@ -26,7 +26,7 @@ import qualified Data.Vector.Generic.Mutable as Generic.MVector
 
 -------------------------------------------------------------------------------
 
-class ReadableVector m a vec | vec -> a where
+class Applicative m => ReadableVector m a vec | vec -> a where
   unsafeIndex :: vec -> Int -> m a
 
 instance {-# OVERLAPPING #-} ( PrimMonad m, s ~ PrimState m, Generic.MVector mvec a )

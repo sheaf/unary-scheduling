@@ -6,11 +6,10 @@
 {-# LANGUAGE MultiParamTypeClasses      #-}
 {-# LANGUAGE PatternSynonyms            #-}
 {-# LANGUAGE ScopedTypeVariables        #-}
-{-# LANGUAGE TypeApplications           #-}
 {-# LANGUAGE UndecidableInstances       #-}
 
 module Schedule.Interval
-  ( Clusivity(..), EndPoint(..)
+  ( Clusivity(..), Endpoint(..)
   , Interval(.., (:<..<), (:<..<=), (:<=..<), (:<=..<=))
   , validInterval
   , startTime, endTime, duration
@@ -81,63 +80,63 @@ instance Heyting Clusivity where
   negation Exclusive = Inclusive
   negation Inclusive = Exclusive
 
-data EndPoint t
-  = EndPoint
-    { endPoint  :: !t
+data Endpoint t
+  = Endpoint
+    { endpoint  :: !t
     , clusivity :: !Clusivity
     }
   deriving stock    ( Show, Eq, Generic )
   deriving anyclass NFData
 
-instance Ord t => Ord ( EndPoint ( EarliestTime t ) ) where
-  compare ( EndPoint t1 clu1 ) ( EndPoint t2 clu2 ) =
+instance Ord t => Ord ( Endpoint ( EarliestTime t ) ) where
+  compare ( Endpoint t1 clu1 ) ( Endpoint t2 clu2 ) =
     case compare t1 t2 of
       EQ -> compare clu2 clu1 -- flipped
       un -> un
 
-instance Ord t => Ord ( EndPoint ( LatestTime t ) ) where
-  compare ( EndPoint t1 clu1 ) ( EndPoint t2 clu2 ) =
+instance Ord t => Ord ( Endpoint ( LatestTime t ) ) where
+  compare ( Endpoint t1 clu1 ) ( Endpoint t2 clu2 ) =
     case compare t1 t2 of
       EQ -> compare clu1 clu2 -- not flipped
       un -> un
 
-instance Act s t => Act s ( EndPoint t ) where
-  s • EndPoint t clu = EndPoint ( s • t ) clu
+instance Act s t => Act s ( Endpoint t ) where
+  s • Endpoint t clu = Endpoint ( s • t ) clu
 
-instance Ord t => Lattice ( EndPoint ( EarliestTime t ) ) where
+instance Ord t => Lattice ( Endpoint ( EarliestTime t ) ) where
   -- Minimum.
-  EndPoint t1 clu1 \/ EndPoint t2 clu2 = case compare t1 t2 of
-    EQ -> EndPoint t1 ( clu1 \/ clu2 )
-    LT -> EndPoint t1 clu1
-    GT -> EndPoint t2 clu2
+  Endpoint t1 clu1 \/ Endpoint t2 clu2 = case compare t1 t2 of
+    EQ -> Endpoint t1 ( clu1 \/ clu2 )
+    LT -> Endpoint t1 clu1
+    GT -> Endpoint t2 clu2
   -- Maximum.
-  EndPoint t1 clu1 /\ EndPoint t2 clu2 = case compare t1 t2 of
-    EQ -> EndPoint t1 ( clu1 /\ clu2 )
-    LT -> EndPoint t2 clu2
-    GT -> EndPoint t1 clu1
+  Endpoint t1 clu1 /\ Endpoint t2 clu2 = case compare t1 t2 of
+    EQ -> Endpoint t1 ( clu1 /\ clu2 )
+    LT -> Endpoint t2 clu2
+    GT -> Endpoint t1 clu1
 
-instance Ord t => Lattice ( EndPoint ( LatestTime t ) ) where
+instance Ord t => Lattice ( Endpoint ( LatestTime t ) ) where
   -- Maximum.
-  EndPoint t1 clu1 \/ EndPoint t2 clu2 = case compare t1 t2 of
-    EQ -> EndPoint t1 ( clu1 \/ clu2 )
-    LT -> EndPoint t2 clu2
-    GT -> EndPoint t1 clu1
+  Endpoint t1 clu1 \/ Endpoint t2 clu2 = case compare t1 t2 of
+    EQ -> Endpoint t1 ( clu1 \/ clu2 )
+    LT -> Endpoint t2 clu2
+    GT -> Endpoint t1 clu1
   -- Minimum.
-  EndPoint t1 clu1 /\ EndPoint t2 clu2 = case compare t1 t2 of
-    EQ -> EndPoint t1 ( clu1 /\ clu2 )
-    LT -> EndPoint t1 clu1
-    GT -> EndPoint t2 clu2
+  Endpoint t1 clu1 /\ Endpoint t2 clu2 = case compare t1 t2 of
+    EQ -> Endpoint t1 ( clu1 /\ clu2 )
+    LT -> Endpoint t1 clu1
+    GT -> Endpoint t2 clu2
 
-instance ( Ord t, Bounded t ) => BoundedLattice ( EndPoint ( EarliestTime t ) ) where
-  bottom = EndPoint maxBound Exclusive
-  top    = EndPoint minBound Inclusive
-instance ( Ord t, Bounded t ) => BoundedLattice ( EndPoint ( LatestTime t ) ) where
-  bottom = EndPoint minBound Exclusive
-  top    = EndPoint maxBound Inclusive
+instance ( Ord t, Bounded t ) => BoundedLattice ( Endpoint ( EarliestTime t ) ) where
+  bottom = Endpoint maxBound Exclusive
+  top    = Endpoint minBound Inclusive
+instance ( Ord t, Bounded t ) => BoundedLattice ( Endpoint ( LatestTime t ) ) where
+  bottom = Endpoint minBound Exclusive
+  top    = Endpoint maxBound Inclusive
 
-instance Ord t => TotallyOrderedLattice ( EndPoint ( EarliestTime t ) ) where
+instance Ord t => TotallyOrderedLattice ( Endpoint ( EarliestTime t ) ) where
   -- Minimum.
-  e1@(Arg ( EndPoint t1 clu1 ) _) \./ e2@(Arg ( EndPoint t2 clu2 ) _) = case compare t1 t2 of
+  e1@(Arg ( Endpoint t1 clu1 ) _) \./ e2@(Arg ( Endpoint t2 clu2 ) _) = case compare t1 t2 of
     GT -> e2
     EQ
       | Exclusive <- clu1
@@ -145,7 +144,7 @@ instance Ord t => TotallyOrderedLattice ( EndPoint ( EarliestTime t ) ) where
       -> e2
     _ -> e1
   -- Maximum.
-  e1@(Arg ( EndPoint t1 clu1 ) _) /.\ e2@(Arg ( EndPoint t2 clu2 ) _) = case compare t1 t2 of
+  e1@(Arg ( Endpoint t1 clu1 ) _) /.\ e2@(Arg ( Endpoint t2 clu2 ) _) = case compare t1 t2 of
     GT -> e1
     EQ
       | Exclusive <- clu1
@@ -153,9 +152,9 @@ instance Ord t => TotallyOrderedLattice ( EndPoint ( EarliestTime t ) ) where
       -> e1
     _ -> e2
 
-instance Ord t => TotallyOrderedLattice ( EndPoint ( LatestTime t ) ) where
+instance Ord t => TotallyOrderedLattice ( Endpoint ( LatestTime t ) ) where
   -- Maximum.
-  e1@(Arg ( EndPoint t1 clu1 ) _) \./ e2@(Arg ( EndPoint t2 clu2 ) _) = case compare t1 t2 of
+  e1@(Arg ( Endpoint t1 clu1 ) _) \./ e2@(Arg ( Endpoint t2 clu2 ) _) = case compare t1 t2 of
     LT -> e2
     EQ
       | Exclusive <- clu1
@@ -163,7 +162,7 @@ instance Ord t => TotallyOrderedLattice ( EndPoint ( LatestTime t ) ) where
       -> e2
     _ -> e1
   -- Minimum.
-  e1@(Arg ( EndPoint t1 clu1 ) _) /.\ e2@(Arg ( EndPoint t2 clu2 ) _) = case compare t1 t2 of
+  e1@(Arg ( Endpoint t1 clu1 ) _) /.\ e2@(Arg ( Endpoint t2 clu2 ) _) = case compare t1 t2 of
     LT -> e1
     EQ
       | Exclusive <- clu1
@@ -177,30 +176,30 @@ instance Ord t => TotallyOrderedLattice ( EndPoint ( LatestTime t ) ) where
 -- | Non-empty interval.
 data Interval t
   = Interval
-  { start :: !(EndPoint (EarliestTime t))
-  , end   :: !(EndPoint (  LatestTime t))
+  { start :: !(Endpoint (EarliestTime t))
+  , end   :: !(Endpoint (  LatestTime t))
   }
   deriving stock    ( Show, Eq, Generic )
   deriving anyclass NFData
 
 {-# COMPLETE (:<..<), (:<=..<), (:<..<=), (:<=..<=) #-}
 pattern (:<..<), (:<=..<), (:<..<=), (:<=..<=) :: Time t -> Time t -> Interval t
-pattern (:<..<)   s e = Interval ( EndPoint ( EarliestTime s ) Exclusive ) ( EndPoint ( LatestTime e ) Exclusive )
-pattern (:<=..<)  s e = Interval ( EndPoint ( EarliestTime s ) Inclusive ) ( EndPoint ( LatestTime e ) Exclusive )
-pattern (:<..<=)  s e = Interval ( EndPoint ( EarliestTime s ) Exclusive ) ( EndPoint ( LatestTime e ) Inclusive )
-pattern (:<=..<=) s e = Interval ( EndPoint ( EarliestTime s ) Inclusive ) ( EndPoint ( LatestTime e ) Inclusive )
+pattern (:<..<)   s e = Interval ( Endpoint ( EarliestTime s ) Exclusive ) ( Endpoint ( LatestTime e ) Exclusive )
+pattern (:<=..<)  s e = Interval ( Endpoint ( EarliestTime s ) Inclusive ) ( Endpoint ( LatestTime e ) Exclusive )
+pattern (:<..<=)  s e = Interval ( Endpoint ( EarliestTime s ) Exclusive ) ( Endpoint ( LatestTime e ) Inclusive )
+pattern (:<=..<=) s e = Interval ( Endpoint ( EarliestTime s ) Inclusive ) ( Endpoint ( LatestTime e ) Inclusive )
 
 startTime :: Interval t -> EarliestTime t
-startTime = start >>> endPoint
+startTime = start >>> endpoint
 
 endTime :: Interval t -> LatestTime t
-endTime = end >>> endPoint
+endTime = end >>> endpoint
 
 duration :: Num t => Interval t -> Delta t
-duration ( Interval ( EndPoint ( EarliestTime s ) _ ) ( EndPoint ( LatestTime e ) _ ) ) = s --> e
+duration ( Interval ( Endpoint ( EarliestTime s ) _ ) ( Endpoint ( LatestTime e ) _ ) ) = s --> e
 
 validInterval :: Ord t => Interval t -> Bool
-validInterval ( Interval ( EndPoint ( EarliestTime s ) s_clu ) ( EndPoint ( LatestTime e ) e_clu ) ) =
+validInterval ( Interval ( Endpoint ( EarliestTime s ) s_clu ) ( Endpoint ( LatestTime e ) e_clu ) ) =
   case compare s e of
     LT -> True
     EQ 
@@ -221,7 +220,7 @@ inside = coerce inside'
   where
     inside' :: Time t -> Seq ( Interval t ) -> Bool
     inside' _ Empty = False
-    inside' t ( Interval ( EndPoint ( EarliestTime s ) s_clu ) ( EndPoint ( LatestTime e ) e_clu ) :<| ivals )
+    inside' t ( Interval ( Endpoint ( EarliestTime s ) s_clu ) ( Endpoint ( LatestTime e ) e_clu ) :<| ivals )
       = case compare t s of
           LT -> False
           EQ -> s_clu == Inclusive
@@ -236,7 +235,7 @@ insideLax = coerce insideLax'
   where
     insideLax' :: Time t -> Seq ( Interval t ) -> Bool
     insideLax' _ Empty = False
-    insideLax' t ( Interval ( EndPoint ( EarliestTime s ) _ ) ( EndPoint ( LatestTime e ) _ ) :<| ivals )
+    insideLax' t ( Interval ( Endpoint ( EarliestTime s ) _ ) ( Endpoint ( LatestTime e ) _ ) :<| ivals )
       = case compare t s of
           LT -> False
           EQ -> True
@@ -281,33 +280,33 @@ instance ( Ord t, Bounded t ) => BoundedLattice ( Intervals t ) where
   bottom = Intervals Empty
   top    = Intervals ( Seq.singleton $ Interval top top )
 
-cutBefore :: forall t. Ord t => EndPoint (EarliestTime t) -> Intervals t -> Intervals t
+cutBefore :: forall t. Ord t => Endpoint (EarliestTime t) -> Intervals t -> Intervals t
 cutBefore = coerce cutBefore'
   where
-    cutBefore' :: EndPoint (Time t) -> Seq (Interval t) -> Seq (Interval t)
+    cutBefore' :: Endpoint (Time t) -> Seq (Interval t) -> Seq (Interval t)
     cutBefore' _ Empty = Empty
-    cutBefore' cut@( EndPoint t clu ) full@( Interval ( EndPoint ( EarliestTime s ) s_clu ) ( EndPoint ( LatestTime e ) e_clu ) :<| ivals )
+    cutBefore' cut@( Endpoint t clu ) full@( Interval ( Endpoint ( EarliestTime s ) s_clu ) ( Endpoint ( LatestTime e ) e_clu ) :<| ivals )
       | t < s || ( t == s && ( clu == Exclusive || s_clu == Exclusive ) )
       = full
       | t < e
-      = Interval ( EndPoint ( EarliestTime t ) ( negation clu ) ) ( EndPoint ( LatestTime e ) e_clu ) :<| ivals
+      = Interval ( Endpoint ( EarliestTime t ) ( negation clu ) ) ( Endpoint ( LatestTime e ) e_clu ) :<| ivals
       | t == e && clu == Exclusive && e_clu == Inclusive
-      = Interval ( EndPoint ( EarliestTime e ) Inclusive ) ( EndPoint ( LatestTime e ) Inclusive ) :<| ivals
+      = Interval ( Endpoint ( EarliestTime e ) Inclusive ) ( Endpoint ( LatestTime e ) Inclusive ) :<| ivals
       | otherwise
       = cutBefore' cut ivals
 
-cutAfter :: forall t. Ord t => EndPoint (LatestTime t) -> Intervals t -> Intervals t
+cutAfter :: forall t. Ord t => Endpoint (LatestTime t) -> Intervals t -> Intervals t
 cutAfter = coerce cutAfter'
   where 
-    cutAfter' :: EndPoint (Time t) -> Seq (Interval t) -> Seq (Interval t)
+    cutAfter' :: Endpoint (Time t) -> Seq (Interval t) -> Seq (Interval t)
     cutAfter' _ Empty = Empty
-    cutAfter' cut@( EndPoint t clu ) full@( ivals :|> Interval ( EndPoint ( EarliestTime s ) s_clu ) ( EndPoint ( LatestTime e ) e_clu ) )
+    cutAfter' cut@( Endpoint t clu ) full@( ivals :|> Interval ( Endpoint ( EarliestTime s ) s_clu ) ( Endpoint ( LatestTime e ) e_clu ) )
       | e < t || ( e == t && ( clu == Exclusive || e_clu == Exclusive ) )
       = full
       | s < t
-      = ivals :|> Interval ( EndPoint ( EarliestTime s ) s_clu ) ( EndPoint ( LatestTime t ) ( negation clu ) )
+      = ivals :|> Interval ( Endpoint ( EarliestTime s ) s_clu ) ( Endpoint ( LatestTime t ) ( negation clu ) )
       | s == e && clu == Exclusive && s_clu == Inclusive
-      = ivals :|> Interval ( EndPoint ( EarliestTime s ) Inclusive ) ( EndPoint ( LatestTime s ) Inclusive )
+      = ivals :|> Interval ( Endpoint ( EarliestTime s ) Inclusive ) ( Endpoint ( LatestTime s ) Inclusive )
       | otherwise
       = cutAfter' cut ivals
 
@@ -317,8 +316,8 @@ remove = coerce remove'
     remove' :: Seq (Interval t) -> Interval t -> Seq (Interval t)
     remove' Empty _ = Empty
     remove'
-      full@( ival@( Interval ( EndPoint ( EarliestTime s ) s_clu ) ( EndPoint ( LatestTime e ) e_clu ) ) :<| ivals )
-      cut@( Interval ( EndPoint ( EarliestTime cut_s ) cut_s_clu ) ( EndPoint ( LatestTime cut_e ) cut_e_clu ) )
+      full@( ival@( Interval ( Endpoint ( EarliestTime s ) s_clu ) ( Endpoint ( LatestTime e ) e_clu ) ) :<| ivals )
+      cut@( Interval ( Endpoint ( EarliestTime cut_s ) cut_s_clu ) ( Endpoint ( LatestTime cut_e ) cut_e_clu ) )
         -- Cut ends before start of given intervals: nothing to remove.
         | cut_e < s || ( cut_e == s && ( s_clu == Exclusive || cut_e_clu == Exclusive ) )
         = full
@@ -329,11 +328,11 @@ remove = coerce remove'
         | cut_e < e || ( cut_e == e && ( e_clu == Inclusive && cut_e_clu == Exclusive ) )
         = if cut_s < s || ( cut_s == s && ( s_clu == Exclusive || cut_s_clu == Inclusive ) )
           -- Cut starts before start of current interval: only keep the end part of the current interval.
-          then Interval ( EndPoint ( EarliestTime cut_e ) ( negation cut_e_clu ) ) ( EndPoint ( LatestTime e ) e_clu )
+          then Interval ( Endpoint ( EarliestTime cut_e ) ( negation cut_e_clu ) ) ( Endpoint ( LatestTime e ) e_clu )
            :<| ivals
           -- Cut starts after start of current interval: remove middle part of interval.
-          else Interval ( EndPoint ( EarliestTime s ) s_clu ) ( EndPoint ( LatestTime cut_s ) ( negation cut_s_clu ) )
-           :<| Interval ( EndPoint ( EarliestTime cut_e ) ( negation cut_e_clu ) ) ( EndPoint ( LatestTime e ) e_clu )
+          else Interval ( Endpoint ( EarliestTime s ) s_clu ) ( Endpoint ( LatestTime cut_s ) ( negation cut_s_clu ) )
+           :<| Interval ( Endpoint ( EarliestTime cut_e ) ( negation cut_e_clu ) ) ( Endpoint ( LatestTime e ) e_clu )
            :<| ivals
         -- Cut ends after end of current interval: cut current interval, recurse onto next intervals.
         | otherwise
@@ -341,7 +340,7 @@ remove = coerce remove'
           -- Cut starts before start of current interval: current interval entirely removed.
           then ivals `remove'` cut
           -- Cut starts after start of current interval: only keep the beginning part of the current interval.
-          else Interval ( EndPoint ( EarliestTime s ) s_clu ) ( EndPoint ( LatestTime cut_s ) ( negation cut_s_clu ) )
+          else Interval ( Endpoint ( EarliestTime s ) s_clu ) ( Endpoint ( LatestTime cut_s ) ( negation cut_s_clu ) )
            :<| ivals `remove'` cut
 
 -- | Prunes away intervals shorter than specified amount.
@@ -355,8 +354,8 @@ pruneShorterThan = coerce pruneShorterThan'
   where
     pruneShorterThan' :: Delta t -> Seq (Interval t) -> Maybe ( Seq (Interval t), Seq (Interval t) )
     pruneShorterThan' _ Empty = Nothing
-    pruneShorterThan' delta ( ival@( Interval ( EndPoint ( EarliestTime s ) _ ) ( EndPoint ( LatestTime e ) _ ) ) :<| ivals )
+    pruneShorterThan' delta ( ival@( Interval ( Endpoint ( EarliestTime s ) _ ) ( Endpoint ( LatestTime e ) _ ) ) :<| ivals )
       | ( s --> e ) < delta
-      = Just ( mempty, Seq.singleton ival )     <> pruneShorterThan' delta ivals
+      = Just ( mempty, Seq.singleton ival )  <> pruneShorterThan' delta ivals
       | otherwise
-      = fmap ( first ( Seq.singleton ival <> ) ) $ pruneShorterThan' delta ivals
+      = ( first ( Seq.singleton ival <> ) ) <$> pruneShorterThan' delta ivals

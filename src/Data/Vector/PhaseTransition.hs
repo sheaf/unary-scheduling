@@ -1,5 +1,5 @@
 {-# LANGUAGE FlexibleInstances      #-}
-{-# LANGUAGE FunctionalDependencies #-}
+{-# LANGUAGE MultiParamTypeClasses  #-}
 {-# LANGUAGE TypeFamilies           #-}
 
 module Data.Vector.PhaseTransition where
@@ -11,6 +11,8 @@ import Control.Monad.Primitive
   )
 
 -- vector
+import qualified Data.Vector.Generic as Generic
+  ( Vector )
 import qualified Data.Vector.Generic as Generic.Vector
   ( Vector
     ( basicLength, basicUnsafeFreeze, basicUnsafeThaw, basicUnsafeCopy )
@@ -23,16 +25,16 @@ import qualified Data.Vector.Generic.Mutable.Base as Generic.MVector
 
 -------------------------------------------------------------------------------
 
-class PrimMonad m => Freeze m mut immut where
+class Applicative m => Freeze m mut immut where
   freeze       :: mut -> m immut
   unsafeFreeze :: mut -> m immut
 
-class PrimMonad m => Thaw m immut mut where
+class Applicative m => Thaw m immut mut where
   thaw       :: immut -> m mut
   unsafeThaw :: immut -> m mut
 
 instance ( PrimMonad m
-         , Generic.Vector.Vector vec a
+         , Generic.Vector vec a
          , s ~ PrimState m
          , mvec ~ Generic.Vector.Mutable vec
          )
@@ -45,7 +47,7 @@ instance ( PrimMonad m
     unsafeFreeze copy
 
 instance ( PrimMonad m
-         , Generic.Vector.Vector vec a
+         , Generic.Vector vec a
          , s ~ PrimState m
          , mvec ~ Generic.Vector.Mutable vec
          )
@@ -56,3 +58,10 @@ instance ( PrimMonad m
     copy <- Generic.MVector.basicUnsafeNew ( Generic.Vector.basicLength vec )
     Generic.Vector.basicUnsafeCopy copy vec
     pure copy
+
+instance Applicative m => Freeze m a a where
+  freeze       = pure
+  unsafeFreeze = pure
+instance Applicative m => Thaw m a a where
+  thaw       = pure
+  unsafeThaw = pure
