@@ -1,3 +1,4 @@
+
 {-# LANGUAGE BlockArguments        #-}
 {-# LANGUAGE DataKinds             #-}
 {-# LANGUAGE DeriveAnyClass        #-}
@@ -5,6 +6,7 @@
 {-# LANGUAGE DerivingStrategies    #-}
 {-# LANGUAGE FlexibleContexts      #-}
 {-# LANGUAGE GADTs                 #-}
+{-# LANGUAGE LambdaCase            #-}
 {-# LANGUAGE NamedFieldPuns        #-}
 {-# LANGUAGE OverloadedStrings     #-}
 {-# LANGUAGE PolyKinds             #-}
@@ -25,7 +27,7 @@ import Data.List
 import Data.Maybe
   ( mapMaybe, listToMaybe )
 import Data.Semigroup
-  ( Arg(..) )
+  ( Arg(..), Sum(..) )
 import GHC.Generics
   ( Generic )
 
@@ -73,7 +75,7 @@ import qualified Data.Vector as Boxed.Vector
 import qualified Data.Vector.Unboxed as Unboxed
   ( Vector )
 import qualified Data.Vector.Unboxed as Unboxed.Vector
-  ( (!) )
+  ( (!), foldr )
 
 -- unary-scheduling
 import Data.Vector.Generic.Index
@@ -117,10 +119,15 @@ data SearchData task t
   }
   deriving stock ( Show, Generic )
 
+data SolutionCost
+  = FullSolution    Double
+  | PartialSolution Int
+  deriving stock ( Eq, Ord, Show )
+
 data SearchState task t
   = SearchState
   { pastDecisions       :: [ SearchData task t ]
-  , solutions           :: [ Arg Double ( ImmutableTaskInfos task t ) ]
+  , solutions           :: [ Arg SolutionCost ( ImmutableTaskInfos task t ) ]
   , totalSolutionsFound :: !Int
   , totalDecisionsTaken :: !Int
   }
@@ -168,7 +175,7 @@ search cost maxSolutions propagators = ( `execState` initialState ) . findNextSe
           modify'
             $ over ( field' @"solutions" )
                 ( trace ( "found solution #" <> show ( totalSolutionsFound + 1 ) <> "\n" )
-                $ insertSolution maxSolutions taskInfos ( cost taskInfos )
+                $ insertSolution maxSolutions taskInfos ( FullSolution $ cost taskInfos )
                 )
           backtrack
         -- A further search decision can be made:
@@ -202,18 +209,16 @@ search cost maxSolutions propagators = ( `execState` initialState ) . findNextSe
       case next of
         -- No results possible: backtrack.
         ( _, ( Left _err, _ ) ) -> do
-          {-
           let
             remainingUnknowns :: Int
             remainingUnknowns
               = getSum
               . Unboxed.Vector.foldr ( (<>) . ( \case { Unknown -> 1 ; _ -> 0 } ) ) mempty
-              $ ( orderingMatrix . orderings . taskInfos $ currentTasks )
-          pastDecs <- ( map searchDecision . pastDecisions ) <$> get
+              $ ( orderingMatrix . orderings $ currentTasks )
+          --pastDecs <- ( map searchDecision . pastDecisions ) <$> get
           modify'
             $ over ( field' @"solutions" )
-                ( insertSolution maxSolutions currentTasks ( Right ( Arg remainingUnknowns pastDecs ) ) )
-          -}
+                ( insertSolution maxSolutions currentTasks ( PartialSolution $ remainingUnknowns ) )
           --trace ( "backtracking from depth " <> show ( length pastDecs ) <> "\n" )
           backtrack
         -- Search can continue: keep going.

@@ -392,7 +392,11 @@ instance
   , forall t. Num t => Act ( Delta t ) ( HandedTime h t )
   , forall t. Show t => Show ( HandedTime h  t )
   , forall t. Show t => Show ( HandedTime oh t )
-  ) => KnownHandedness h oh where
+  ) => KnownHandedness h oh
+  where
+  {-# SPECIALISE instance KnownHandedness Earliest Latest   #-}
+  {-# SPECIALISE instance KnownHandedness Latest   Earliest #-}
+
 
 -------------------------------------------------------------------------------
 -- Local propagators.

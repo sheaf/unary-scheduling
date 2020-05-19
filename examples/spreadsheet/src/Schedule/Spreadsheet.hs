@@ -38,6 +38,8 @@ import Data.Semigroup
   ( Arg(..) )
 import Data.Traversable
   ( for )
+import GHC.IO.Encoding
+  ( setLocaleEncoding, utf8 )
 import qualified Numeric
   ( readInt )
 import System.Environment
@@ -197,6 +199,8 @@ import Schedule.Time
 -- the expected format of the input spreadsheet.
 scheduleSpreadsheet :: ExceptT Error IO ()
 scheduleSpreadsheet = do
+
+  lift $ setLocaleEncoding utf8
 
   -- Get command line arguments: input/output spreadsheet file paths,
   -- whether to perform constraint propagation (if so, include filepath for logging) and search.
