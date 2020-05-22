@@ -82,7 +82,7 @@ import Data.Sequence
 
 -- deepseq
 import Control.DeepSeq
-  ( NFData )
+  ( NFData, deepseq )
 
 -- directory
 import qualified System.Directory as Directory
@@ -133,11 +133,11 @@ import qualified Data.Text.IO as Text
 
 -- time
 import qualified Data.Time.Clock.POSIX as Time
-  ( getPOSIXTime, posixSecondsToUTCTime )
+  ( POSIXTime, getPOSIXTime, posixSecondsToUTCTime )
 import qualified Data.Time.Format as Time
   ( formatTime, defaultTimeLocale)
 import qualified Data.Time.LocalTime as Time
-  ( getCurrentTimeZone, utcToLocalTime )
+  ( TimeZone, getCurrentTimeZone, utcToLocalTime )
 
 -- transformers
 import Control.Monad.Trans.Class
@@ -146,8 +146,6 @@ import Control.Monad.Trans.Except
   ( ExceptT(..)
   , runExceptT, withExceptT
   )
-import Control.Monad.IO.Class
-  ( liftIO )
 
 -- vector
 import qualified Data.Vector as Boxed
@@ -205,14 +203,8 @@ scheduleSpreadsheet = do
   -- Get command line arguments: input/output spreadsheet file paths,
   -- whether to perform constraint propagation (if so, include filepath for logging) and search.
   Args { .. } <- parseArgs
-  currentPosixTime <- lift Time.getPOSIXTime
-  currentTimeZone  <- lift Time.getCurrentTimeZone
-  let
-    formattedTime :: String
-    formattedTime = Time.formatTime Time.defaultTimeLocale "%0Y-%m-%d %H:%M:%S"
-                  . Time.utcToLocalTime currentTimeZone
-                  . Time.posixSecondsToUTCTime
-                  $ currentPosixTime
+  startTime       <- lift Time.getPOSIXTime
+  currentTimeZone <- lift Time.getCurrentTimeZone
 
   -- Read input spreadsheet.
   let
@@ -266,9 +258,7 @@ scheduleSpreadsheet = do
   for_ constraintLoggingPath \ justificationsPath -> do
     -- Log constraint propagation information.
     lift $ Text.appendFile justificationsPath
-      ( "\n" <> Text.replicate 25 "-" <> "\n" <>
-      "-- " <> Text.pack formattedTime <> " --\n" <>
-      Text.replicate 25 "-" <> "\n\n-------\n" <>
+      ( timeBox currentTimeZone startTime <>
       "Input:  " <> Text.pack inputPath <> "\n" <>
       "Output: " <> Text.pack outputPath <> "\n-------\n\n" <>
       justifications
@@ -282,24 +272,28 @@ scheduleSpreadsheet = do
     if useSearch
     then do
       let
-        searchRes :: SearchState (Set Staff) Column
+        searchRes :: SearchState ( Set Staff ) Column
         searchRes = search totalSchedulingCost 10 propagators afterPropTasks
-      liftIO $ Text.appendFile "search_statistics.txt"
-        ( "Found " <> Text.pack ( show ( totalSolutionsFound searchRes ) ) <> " solutions after "
-        <> Text.pack ( show ( totalDecisionsTaken searchRes ) ) <> " decisions\n\n"
-        )
+      lift do
+        timeNow <- deepseq searchRes Time.getPOSIXTime
+        Text.appendFile "search_statistics.txt"
+          ( timeBox currentTimeZone timeNow <>
+          "Found " <> Text.pack ( show ( totalSolutionsFound searchRes ) ) <> " solutions after "
+          <> Text.pack ( show ( totalDecisionsTaken searchRes ) ) <> " decisions\n\n"
+          )
       case solutions searchRes of
         ( Arg cost bestSol : _ ) -> do
-          liftIO $ Text.writeFile "dotfile.txt" ( visualiseEdges . orderings $ bestSol )
-          liftIO $ Text.writeFile "cost.txt" ( Text.pack ( show cost ) )
+          lift $ Text.writeFile "dotfile.txt" ( visualiseEdges . orderings $ bestSol )
+          lift $ Text.writeFile "cost.txt" ( Text.pack ( show cost ) )
           pure bestSol
         _ -> throwError ( NoSchedulingPossible "Search has found no results" )
     else pure afterPropTasks
 
   -- Write output spreadsheet with updated availability information.
+  finalTime <- lift Time.getPOSIXTime
   let
     outputData =
-      Xlsx.fromXlsx currentPosixTime
+      Xlsx.fromXlsx finalTime
         ( updateSpreadsheet schedulingRanges finalTasks schedulingStaff spreadsheet )
   lift $ LazyByteString.writeFile outputPath outputData
 
@@ -788,6 +782,18 @@ updateSpreadsheet ( SchedulingRanges { .. } ) ( TaskInfos { taskNames, taskAvail
     setCellText :: Xlsx.Cell -> Xlsx.Cell -> Xlsx.Cell
     setCellText ( TextCell text ) cell = cell { Xlsx._cellValue = Just ( Xlsx.CellText text ) }
     setCellText _ cell = cell
+
+formatTime :: Time.TimeZone -> Time.POSIXTime -> String
+formatTime timeZone
+  = Time.formatTime Time.defaultTimeLocale "%0Y-%m-%d %H:%M:%S"
+  . Time.utcToLocalTime timeZone
+  . Time.posixSecondsToUTCTime
+
+timeBox :: Time.TimeZone -> Time.POSIXTime -> Text
+timeBox timeZone time =
+  "\n" <> Text.replicate 25 "-" <> "\n" <>
+  "-- " <> Text.pack ( formatTime timeZone time ) <> " --\n" <>
+  Text.replicate 25 "-" <> "\n\n"
 
 -------------------------------------------------------------------------------
 -- Error handling.

@@ -46,8 +46,6 @@ import Data.Functor.Identity
   ( Identity(..) )
 import Data.Kind
   ( Type )
-import Data.Maybe
-  ( fromJust )
 import Data.Semigroup
   ( Arg(..) )
 import Data.Foldable
@@ -60,12 +58,12 @@ import Data.Act
 -- containers
 import qualified Data.IntMap.Strict as IntMap
   ( singleton )
+import Data.IntSet
+  ( IntSet )
+import qualified Data.IntSet as IntSet
+  ( fromList, delete )
 import qualified Data.Sequence as Seq
   ( singleton )
-import Data.Set
-  ( Set )
-import qualified Data.Set as Set
-  ( fromList, delete )
 
 -- dependent-map
 import qualified Data.Dependent.Map.Lens as DMap
@@ -81,7 +79,7 @@ import Data.Generics.Product.Fields
 import Control.Lens
   ( assign )
 import Control.Lens.Fold
-  ( forOf_ )
+  ( forOf_, foldMapOf )
 import qualified Data.IntSet.Lens as IntSet
   ( members )
 
@@ -166,7 +164,7 @@ import Schedule.Time
 import Schedule.Tree
   ( newTree, cloneTree, fmapTree
   , Propagatable
-    ( overloaded, handedIndex, inHandedOrder, propagateLeafChange )
+    ( overloaded, handedIndex, handedPrecedences, inHandedOrder, propagateLeafChange )
   , DurationInfo(..), BaseDurationInfo
   , DurationExtraInfo(..)
   )
@@ -319,13 +317,6 @@ propagationLoop
   -> [ Propagator task t ]
   -> ScheduleMonad s task t ()
 propagationLoop maxLoopIterations propagators = do
-  -- Initialise the dependent map of modifications,
-  -- so that there is a key for each propagator which needs
-  -- to be notified of modifications.
-  for_ propagators \ Propagator { mbNotifiee } -> case mbNotifiee of
-    Nothing              -> pure ()
-    Just ( Coarse name ) -> assign ( field' @"tasksModified" . DMap.dmat ( Coarse name ) ) ( Just mempty )
-    Just ( Fine   name ) -> assign ( field' @"tasksModified" . DMap.dmat ( Fine   name ) ) ( Just mempty )
   -- Apply the currently existing constraints, notifying
   -- all propagators that need this information.
   -- Then start the propagation loop.
@@ -418,8 +409,15 @@ prune
   => m ()
 prune = do
   TaskInfos { taskNames, taskAvails } <- ask
-  Identity toUpdate <- fromJust . view ( field' @"tasksModified" . DMap.dmat ( Coarse "prune" ) ) <$> get
-  forOf_ IntSet.members toUpdate \ taskNb -> do
+  let
+    nbTasks :: Int
+    nbTasks = Boxed.Vector.length taskNames
+  mbToUpdate <- view ( field' @"tasksModified" . DMap.dmat ( Coarse "prune" ) ) <$> get
+  let
+    forEachModifiedTask = case mbToUpdate of
+      Nothing                    -> for_ [ 0 .. nbTasks - 1 ]
+      Just ( Identity toUpdate ) -> forOf_ IntSet.members toUpdate
+  forEachModifiedTask \ taskNb -> do
     task <- taskAvails `unsafeIndex` taskNb
     for_ ( pruneShorterThan ( taskDuration task ) ( taskAvailability task ) ) \ ( kept, removed ) ->
       constrain
@@ -429,6 +427,7 @@ prune = do
             "The following time slots have been removed from \"" <> taskNames Boxed.Vector.! taskNb <> "\",\n\
             \as they are too short to allow the task to complete:\n" <>
             ( Text.pack ( show removed ) ) <> "\n\n"
+          , precedences    = mempty
           }
         )
   assign ( field' @"tasksModified" . DMap.dmat ( Coarse "prune" ) ) ( Just mempty )
@@ -454,9 +453,13 @@ timetable = do
   let
     nbTasks :: Int
     nbTasks = Boxed.Vector.length taskNames
-  Identity toUpdate <- fromJust . view ( field' @"tasksModified" . DMap.dmat ( Coarse "timetable" ) ) <$> get
+  mbToUpdate <- view ( field' @"tasksModified" . DMap.dmat ( Coarse "timetable" ) ) <$> get
   assign ( field' @"tasksModified" . DMap.dmat ( Coarse "timetable" ) ) ( Just mempty )
-  forOf_ IntSet.members toUpdate \ taskNb -> do
+  let
+    forEachModifiedTask = case mbToUpdate of
+      Nothing                    -> for_ [ 0 .. nbTasks - 1 ]
+      Just ( Identity toUpdate ) -> forOf_ IntSet.members toUpdate
+  forEachModifiedTask \ taskNb -> do
     task <- taskAvails `unsafeIndex` taskNb
     let
       taskLST = lst task
@@ -483,6 +486,7 @@ timetable = do
                   \As a result, the intervals \n\
                   \  * " <> Text.pack ( show removedIntervals ) <> "\n\
                   \have been removed from \"" <> taskNames Boxed.Vector.! otherTaskNb <> "\"\n\n"
+                , precedences    = mempty
                 }
               )
 
@@ -545,6 +549,7 @@ precedenceMatrix = do
           ( Constraints
             { constraints    = IntMap.singleton taskNb constraint
             , justifications = reason
+            , precedences    = mempty
             }
           )
       | otherwise
@@ -555,7 +560,7 @@ precedenceMatrix = do
         otherTask   <-                                         taskAvails `unsafeIndex` otherTaskNb
         let
           otherTaskOuterTime :: Endpoint ( HandedTime h t )
-          otherTaskOuterTime = pickEndpoint @h @Inner otherTask
+          otherTaskOuterTime = pickEndpoint @h @Outer otherTask
           otherTaskDuration :: Delta t
           otherTaskDuration = taskDuration otherTask
         order <- readOrdering orderings otherTaskNb taskNb
@@ -690,7 +695,7 @@ detectablePrecedences = do
         innerLoop taskNb currTask i j js
 
     innerLoop :: Int -> Task task t -> Int -> Int -> [Int] -> m ()
-    innerLoop taskNb currentTask i j js = do
+    innerLoop taskNb currentTask i j otherTaskNbs = do
       otherTaskNb <- ( ordered $ view ( _ranking @oh @Inner ) allTasks ) `unsafeIndex` ( handedIndex @h nbTasks j )
       otherTask   <-                                          taskAvails `unsafeIndex` otherTaskNb
       let
@@ -711,12 +716,16 @@ detectablePrecedences = do
         void $ propagateLeafChange tree nodeInfo allTasks otherTaskNb
       let
         j' :: Int
-        js' :: [Int]
-        ( j', js' ) = if addNode then ( j + 1, j : js ) else ( j, js )
+        otherTaskNbs' :: [Int]
+        ( j', otherTaskNbs' )
+          | addNode
+          = ( j + 1, if otherTaskNb == taskNb then otherTaskNbs else otherTaskNb : otherTaskNbs )
+          | otherwise
+          = ( j, otherTaskNbs )
 
       if addNode && j' < nbTasks
       then
-        innerLoop taskNb currentTask i j' js'
+        innerLoop taskNb currentTask i j' otherTaskNbs'
       else do
         -- End of inner loop: gather results.
         when ( j > 0 ) do
@@ -734,8 +743,8 @@ detectablePrecedences = do
               currentTaskSubset :: Text
               currentTaskSubset =
                 foldMap
-                  ( \ tk -> if tk == taskNb then "" else "  * \"" <> taskNames Boxed.Vector.! tk <> "\"\n" )
-                  js'
+                  ( \ tk -> "  * \"" <> taskNames Boxed.Vector.! tk <> "\"\n" )
+                  otherTaskNbs
               constraint :: Constraint t
               constraint = handedTimeConstraint excludeCurrentTaskSubsetInnerTime
               succedeOrPrecede, earlierOrLater :: Text
@@ -756,10 +765,11 @@ detectablePrecedences = do
               ( Constraints
                 { constraints    = IntMap.singleton taskNb constraint
                 , justifications = reason
+                , precedences    = IntMap.singleton taskNb ( handedPrecedences @h $ IntSet.fromList otherTaskNbs )
                 }
               )
         -- Continue to next iteration of outer loop.
-        go ( i + 1 ) j' js'
+        go ( i + 1 ) j' otherTaskNbs'
 
   go 0 0 []
 
@@ -860,6 +870,7 @@ notExtremal = do
               ( Constraints
                 { constraints    = IntMap.singleton currentTaskNb constraint
                 , justifications = reason
+                , precedences    = mempty
                 }
               )
 
@@ -965,7 +976,7 @@ edgeFinding = do
   -- Loop over `j`, reverse ranking by other outer time ( decreasing latest completion time / increasing earliest start time ).
 
   let
-    go :: Int -> Set Int -> m ()
+    go :: Int -> IntSet -> m ()
     go j currentTaskSubset = when ( j > 1 ) do
       taskNb <- ( ordered $ view ( _ranking @oh @Outer ) allTasks ) `unsafeIndex` ( handedIndex @h nbTasks j )
       task   <-                                          taskAvails `unsafeIndex` taskNb
@@ -997,11 +1008,11 @@ edgeFinding = do
         nextOtherOuterTime :: Endpoint ( HandedTime oh t )
         nextOtherOuterTime = pickEndpoint @oh @Outer nextTask
 
-      innerLoop j' ( Set.delete taskNb currentTaskSubset ) nextOtherOuterTime currentSubsetInnerTime currentSubsetExtraInnerTime
+      innerLoop j' ( IntSet.delete taskNb currentTaskSubset ) nextOtherOuterTime currentSubsetInnerTime currentSubsetExtraInnerTime
 
     innerLoop
       :: Int
-      -> Set Int
+      -> IntSet
       -> Endpoint ( HandedTime oh t )
       -> Endpoint ( HandedTime h t )
       -> Maybe ( Arg ( Endpoint ( HandedTime h t ) ) Int )
@@ -1022,7 +1033,7 @@ edgeFinding = do
               constraint :: Constraint t
               constraint = handedTimeConstraint currentSubsetInnerTime
               subsetText :: Text
-              subsetText = foldMap ( \ tk -> "  * \"" <> taskNames Boxed.Vector.! tk <> "\"\n" ) currentTaskSubset
+              subsetText = foldMapOf IntSet.members ( \ tk -> "  * \"" <> taskNames Boxed.Vector.! tk <> "\"\n" ) currentTaskSubset
               afterOrBefore, laterOrEarlier :: Text
               ( afterOrBefore, laterOrEarlier )
                 | NotEarlierThan _ <- constraint
@@ -1041,6 +1052,7 @@ edgeFinding = do
               ( Constraints
                 { constraints    = IntMap.singleton blamedTaskNb constraint
                 , justifications = reason
+                , precedences    = IntMap.singleton blamedTaskNb ( handedPrecedences @h currentTaskSubset )
                 }
               )
           -- Continue to see if more activities can be removed.
@@ -1048,7 +1060,7 @@ edgeFinding = do
     innerLoop j currentTaskSubset _ _ _
       = go j currentTaskSubset
 
-  go ( nbTasks - 1 ) ( Set.fromList [ 0 .. ( nbTasks - 1 ) ] )
+  go ( nbTasks - 1 ) ( IntSet.fromList [ 0 .. ( nbTasks - 1 ) ] )
 
 
 -- | Constrain a set of tasks to have a maximum makespan in given intervals (experimental).
@@ -1135,6 +1147,7 @@ makespan label taskNbs mkspans = do
                   \As a result, the intervals \n\
                   \  * " <> Text.pack ( show removedIntervals ) <> "\n\
                   \have been removed from this task.\n\n"
+                , precedences    = mempty
                 }
               )
     -- Check whether we need to constrain tasks to not finish near the end of the makespan range,
@@ -1165,5 +1178,6 @@ makespan label taskNbs mkspans = do
                   \As a result, the intervals \n\
                   \  * " <> Text.pack ( show removedIntervals ) <> "\n\
                   \have been removed from this task.\n\n"
+                , precedences    = mempty
                 }
               )

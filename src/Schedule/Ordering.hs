@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns               #-}
 {-# LANGUAGE BlockArguments             #-}
 {-# LANGUAGE CPP                        #-}
 {-# LANGUAGE DeriveAnyClass             #-}
@@ -11,13 +12,15 @@
 {-# LANGUAGE PatternSynonyms            #-}
 {-# LANGUAGE ScopedTypeVariables        #-}
 {-# LANGUAGE StandaloneDeriving         #-}
+{-# LANGUAGE TypeApplications           #-}
 {-# LANGUAGE TypeFamilies               #-}
 {-# LANGUAGE UndecidableInstances       #-}
 
 module Schedule.Ordering
   ( Order(Order, LessThan, GreaterThan, Unknown, Equal)
   , OrderingMatrix(..), upperTriangular
-  , newOrderingMatrix, addEdgesTransitively
+  , newOrderingMatrix
+  , addIncidentEdges, addIncidentEdgesTransitively
   , readOrdering
 #ifdef VIZ
   , visualiseEdges
@@ -33,13 +36,13 @@ import Data.Bits
 import Data.Coerce
   ( coerce )
 import Data.Foldable
-  ( for_, foldr' )
+  ( for_ )
 import Data.Function
   ( (&) )
 import Data.Functor
   ( (<&>) )
 import Data.Monoid
-  ( Any(..) )
+  ( Any(..), Ap(..) )
 import Data.Traversable
   ( for )
 import GHC.Generics
@@ -49,9 +52,19 @@ import GHC.Generics
 import Data.Bit
   ( Bit (..) )
 
+-- containers
+import Data.IntSet
+  ( IntSet )
+
 -- deepseq
 import Control.DeepSeq
   ( NFData )
+
+-- lens
+import Control.Lens.Fold
+  ( foldMapOf, forOf_ )
+import qualified Data.IntSet.Lens as IntSet
+  ( members )
 
 -- mtl
 import Control.Monad.Except
@@ -189,50 +202,72 @@ newOrderingMatrix dim f = do
 upperTriangular :: Int -> Int -> Int -> Int
 upperTriangular d i j = j - 1 + i * d - ( ( ( i + 3 ) * i ) `shiftR` 1 )
 
--- | Mutate ordering matrix to specify edges from vertex @i@ to vertex @j@.
+-- | Mutate ordering matrix, writing the specified edges from vertex @i@ to vertex @j@.
 writeOrdering :: ( PrimMonad m, s ~ PrimState m ) => OrderingMatrix ( Unboxed.MVector s ) -> Order -> Int -> Int -> m ()
 writeOrdering ( OrderingMatrix { dim, orderingMatrix } ) order i j = case compare i j of
   EQ -> pure ()
   LT -> Unboxed.MVector.unsafeWrite orderingMatrix ( upperTriangular dim i j ) order
   GT -> Unboxed.MVector.unsafeWrite orderingMatrix ( upperTriangular dim j i ) ( reverseOrder order )
 
--- | Read stateful ordering matrix for edges from vertex @i@ to vertex @j@.
+-- | Read ordering matrix for edges from vertex @i@ to vertex @j@.
 readOrdering :: ( ReadableVector m Order ( vec Order ) ) => OrderingMatrix vec -> Int -> Int -> m Order
 readOrdering ( OrderingMatrix { dim, orderingMatrix } ) i j = case compare i j of
   EQ -> pure Equal
   LT -> unsafeIndex orderingMatrix ( upperTriangular dim i j )
   GT -> unsafeIndex orderingMatrix ( upperTriangular dim j i ) <&> reverseOrder
 
+-- | Mutate edge in an ordering matrix.
+modify'Ordering
+  :: ( PrimMonad m, s ~ PrimState m )
+  => OrderingMatrix ( Unboxed.MVector s ) -> ( Order -> Order ) -> Int -> Int -> m ()
+modify'Ordering mat f i j = do
+  o <- readOrdering mat i j
+  let
+    !o' = f o
+  writeOrdering mat o' i j
+
+-- | Add edges incident to a given vertex (without computing a transitive closure).
+addIncidentEdges
+  :: ( PrimMonad m, s ~ PrimState m )
+  => OrderingMatrix ( Unboxed.MVector s )
+  -> Int    -- ^ Fixed incidence vertex.
+  -> IntSet -- ^ New predecessors to the given vertex.
+  -> IntSet -- ^ New successors to the given vertex.
+  -> m ()
+addIncidentEdges mat v befores afters = do
+  forOf_ IntSet.members befores ( modify'Ordering mat ( GreaterThan \/ ) v )
+  forOf_ IntSet.members afters  ( modify'Ordering mat ( LessThan    \/ ) v )
+
 -- | King–Sagert insertion algorithm: add edges incident to a given vertex, and compute the transitive closure.
-addEdgesTransitively
-  :: forall m t1 t2 e s
-  .  ( Foldable t1, Foldable t2
-     , MonadError e m
+addIncidentEdgesTransitively
+  :: forall m e s
+  .  ( MonadError e m
      , PrimMonad m, s ~ PrimState m
      )
   => ( Int -> Int -> m () ) -- ^ Function to propagate information relative to a new precedence.
   -> ( Either Int ( Int, Int ) -> e ) -- ^ Function to give an error message.
   -> OrderingMatrix ( Unboxed.MVector s )
   -> Int    -- ^ Fixed incidence vertex.
-  -> t1 Int -- ^ New predecessors to the given vertex.
-  -> t2 Int -- ^ New successors to the given vertex.
+  -> IntSet -- ^ New predecessors to the given vertex.
+  -> IntSet -- ^ New successors to the given vertex.
   -> m ()
-addEdgesTransitively propagateNewEdge errorMessage mat@( OrderingMatrix { dim } ) v befores afters = do
+addIncidentEdgesTransitively propagateNewEdge errorMessage mat@( OrderingMatrix { dim } ) v befores afters = do
   -- Tally the new connections around vertex 'v': predecessors/successors of 'v' by way of new edges.
   new <- Unboxed.Vector.fromList <$>
     for [ 0 .. dim - 1 ] \ i ->
       if i == v
       then pure Unknown
-      else do
+      else getAp do
+        let
         -- New predecessors of 'v' (can reach 'v' from 'i' by making use of a new edge ending at 'v').
-        Any bef <- foldMapA ( \ u -> Any . unBit . fst . getOrder <$> readOrdering mat i u ) befores
+        Any bef <- foldMapOf IntSet.members ( \ u -> coerce @( m Any ) $ Any . unBit . fst . getOrder <$> readOrdering mat i u ) befores
         -- New successors of 'v' (can readch 'i' from 'v' by making use of a new edge starting at 'v').
-        Any aft <- foldMapA ( \ w -> Any . unBit . fst . getOrder <$> readOrdering mat w i ) afters
+        Any aft <- foldMapOf IntSet.members ( \ w -> coerce @( m Any ) $ Any . unBit . fst . getOrder <$> readOrdering mat w i ) afters
         let
           res :: Order
           res = Order ( Bit bef, Bit aft )
         when ( res == Equal ) do
-          throwError $ errorMessage ( Left i )
+          coerce @( m () ) $ throwError ( errorMessage ( Left i ) )
         pure res
 
   -- Add the transitive edges away from 'v'.
@@ -305,9 +340,3 @@ instance Generic.Vector Unboxed.Vector Order where
   elemseq ( VOrder v ) x y = Generic.Vector.elemseq v ( coerce x ) y
 
 instance Vector.Unbox Order
-
--------------------------------------------------------------------------------
--- Utility function only used in this module.
-
-foldMapA :: ( Applicative f, Foldable t, Monoid b ) => ( a -> f b ) -> t a -> f b
-foldMapA f = foldr' ( \ a b -> (<>) <$> f a <*> b ) ( pure mempty )

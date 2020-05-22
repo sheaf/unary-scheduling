@@ -18,10 +18,6 @@
 module Schedule.Search where
 
 -- base
-import Data.Functor.Const
-  ( Const(..) )
-import Data.Functor.Identity
-  ( Identity(..) )
 import Data.List
   ( insert, sort )
 import Data.Maybe
@@ -38,6 +34,8 @@ import Data.Act
 -- containers
 import qualified Data.IntMap as IntMap
   ( fromList )
+import qualified Data.IntSet as IntSet
+  ( singleton )
 
 -- deepseq
 import Control.DeepSeq
@@ -91,7 +89,7 @@ import Schedule.Monad
 import Schedule.Ordering
   ( Order(..)
   , OrderingMatrix(..), upperTriangular
-  , addEdgesTransitively
+  , addIncidentEdgesTransitively
   )
 import Schedule.Propagators
   ( Propagator, propagationLoop )
@@ -117,12 +115,14 @@ data SearchData task t
   { searchTasks    :: !( ImmutableTaskInfos task t )
   , searchDecision :: !( Int, Int )
   }
-  deriving stock ( Show, Generic )
+  deriving stock    ( Show, Generic )
+  deriving anyclass NFData
 
 data SolutionCost
   = FullSolution    Double
   | PartialSolution Int
-  deriving stock ( Eq, Ord, Show )
+  deriving stock    ( Eq, Ord, Show, Generic )
+  deriving anyclass NFData
 
 data SearchState task t
   = SearchState
@@ -131,7 +131,8 @@ data SearchState task t
   , totalSolutionsFound :: !Int
   , totalDecisionsTaken :: !Int
   }
-  deriving stock ( Show, Generic )
+  deriving stock    ( Show, Generic )
+  deriving anyclass NFData
 
 search
   :: forall task t
@@ -292,10 +293,10 @@ addEdge start end = do
   let
     addEdges :: m ()
     addEdges =
-      addEdgesTransitively
+      addIncidentEdgesTransitively
         propagateNewEdge errorMessage
         orderings
-        end ( Identity start ) ( Const () )
+        end ( IntSet.singleton start ) ( mempty )
 
     propagateNewEdge :: Int -> Int -> m ()
     propagateNewEdge i j = do
@@ -309,6 +310,7 @@ addEdge start end = do
               , ( j, NotEarlierThan $ ect tk_i )
               ]
           , justifications = ""
+          , precedences = mempty -- precedences are added by the 'addIncidentEdgesTransitively' function
           }
         )
 

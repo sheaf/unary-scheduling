@@ -115,7 +115,7 @@ data Task task t
   = Task
   { taskAvailability :: !(Intervals t)
   , taskDuration     :: !(Delta t)
-  , taskInfo         :: !task
+  , taskInfo         :: task
   }
   deriving stock    ( Show, Eq, Generic )
   deriving anyclass NFData

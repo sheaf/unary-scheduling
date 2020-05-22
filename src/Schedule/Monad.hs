@@ -256,7 +256,9 @@ broadcastModifications tgt newModifs =
   DMap.mapWithKey \case
     Coarse name
       | TellEveryoneBut name /= tgt
-      -> coerce $ IntSet.union ( IntMap.keysSet $ IntMap.filter ( \case { ( False, False ) -> False; _ -> True } ) newModifs )
+      -- Update even with ( False, False ) keys ( i.e. neither left or right adjusted),
+      -- as the task can still have been modified without its endpoints changing.
+      -> coerce $ IntSet.union ( IntMap.keysSet newModifs )
     Fine name
       | TellEveryoneBut name /= tgt
       -> coerce $ bimap @(,)

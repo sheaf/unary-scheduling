@@ -8,6 +8,7 @@
 {-# LANGUAGE OverloadedStrings   #-}
 {-# LANGUAGE PatternSynonyms     #-}
 {-# LANGUAGE PolyKinds           #-}
+{-# LANGUAGE RankNTypes          #-}
 {-# LANGUAGE RecordWildCards     #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE ViewPatterns        #-}
@@ -31,11 +32,17 @@ import Data.Maybe
 import GHC.Generics
   ( Generic )
 
--- containers
+-- containersi
 import Data.IntMap.Strict
   ( IntMap )
 import qualified Data.IntMap.Strict as IntMap
   ( empty, unionWith, traverseWithKey )
+import Data.IntSet
+  ( IntSet )
+
+-- lens
+import Control.Lens
+  ( itraverse_ )
 
 -- mtl
 import Control.Monad.Reader
@@ -64,6 +71,8 @@ import Schedule.Interval
   ( Endpoint(..), Intervals(..)
   , cutBefore, cutAfter, remove
   )
+import Schedule.Ordering
+  ( addIncidentEdges )
 import Schedule.Task
   ( Task(..), TaskInfos(..), MutableTaskInfos
   , est, lct, lst, ect
@@ -79,10 +88,10 @@ import Schedule.Time
 
 data Constraint t
   = Constraint
-  { notEarlierThan :: Maybe ( Endpoint ( EarliestTime t ) )
-  , notLaterThan   :: Maybe ( Endpoint ( LatestTime   t ) )
-  , outside        :: Maybe ( Intervals t )
-  , inside         :: Maybe ( Intervals t )
+  { notEarlierThan :: !( Maybe ( Endpoint ( EarliestTime t ) ) )
+  , notLaterThan   :: !( Maybe ( Endpoint ( LatestTime   t ) ) )
+  , outside        :: !( Maybe ( Intervals t ) )
+  , inside         :: !( Maybe ( Intervals t ) )
   }
   deriving stock ( Show, Generic )
 
@@ -128,16 +137,20 @@ instance Ord t => Monoid ( Constraint t ) where
 
 data Constraints t
   = Constraints
-  { constraints    :: IntMap ( Constraint t )
-  , justifications :: Text
+  { constraints    :: !( IntMap ( Constraint t ) )
+  , justifications :: !Text
+  , precedences    :: !( IntMap ( IntSet, IntSet ) )
   }
   deriving stock ( Show, Generic )
 
 instance Ord t => Semigroup ( Constraints t ) where
-  ( Constraints cts1 logs1 ) <> ( Constraints cts2 logs2 ) =
-    Constraints ( IntMap.unionWith (<>) cts1 cts2 ) ( logs1 <> logs2 )
+  ( Constraints cts1 logs1 precs1 ) <> ( Constraints cts2 logs2 precs2 ) =
+    Constraints
+      ( IntMap.unionWith (<>) cts1 cts2 )
+      ( logs1 <> logs2 )
+      ( IntMap.unionWith (<>) precs1 precs2 )
 instance Ord t => Monoid ( Constraints t ) where
-  mempty = Constraints IntMap.empty mempty
+  mempty = Constraints IntMap.empty mempty mempty
 
 applyConstraints
   :: ( MonadReader ( MutableTaskInfos s task t ) m
@@ -148,21 +161,23 @@ applyConstraints
      )
   => Constraints t
   -> m ( IntMap ( Bool, Bool ) )
-applyConstraints = IntMap.traverseWithKey applyConstraint . constraints
+applyConstraints ( Constraints { constraints, precedences } ) = do
+  taskInfos@( TaskInfos { orderings } ) <- ask
+  itraverse_ ( uncurry . addIncidentEdges orderings ) precedences
+  IntMap.traverseWithKey ( applyConstraint taskInfos ) constraints
 
 applyConstraint
-  :: ( MonadReader ( MutableTaskInfos s task t )  m
-     , PrimMonad m, PrimState m ~ s
+  :: ( PrimMonad m, PrimState m ~ s
      , Num t, Ord t, Bounded t
      -- debugging
      , Show t, Show task
      )
-  => Int
+  => MutableTaskInfos s task t
+  -> Int
   -> Constraint t
   -> m ( Bool, Bool )
-applyConstraint _ NoConstraint = pure ( False, False )
-applyConstraint i ( Constraint { .. } ) = do
-  taskInfos <- ask
+applyConstraint _ _ NoConstraint = pure ( False, False )
+applyConstraint taskInfos i ( Constraint { .. } ) = do
   -- apply 'constrain to inside' first (useful in case restriction is not checked)
   ( l1, r1 ) <- fromMaybe ( False, False ) <$> traverse ( constrainToInside  taskInfos i ) inside
   l2         <- fromMaybe False            <$> traverse ( constrainToAfter   taskInfos i ) notEarlierThan

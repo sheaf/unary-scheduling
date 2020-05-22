@@ -56,6 +56,8 @@ import Data.Act
   ( Act(..) )
 
 -- containers
+import Data.IntSet
+  ( IntSet )
 import Data.Set
   ( Set )
 import qualified Data.Set as Set
@@ -271,6 +273,7 @@ class Propagatable ( h :: Handedness ) where
     -> Int
 
   inHandedOrder :: Order -> Bool
+  handedPrecedences :: IntSet -> ( IntSet, IntSet )
 
   -- | Propagate a change from a leaf to the rest of a unary scheduling tree.
   --
@@ -289,6 +292,7 @@ instance Propagatable Earliest where
   handedIndex _ i = i
   inHandedOrder LessThan = True
   inHandedOrder _        = False
+  handedPrecedences m = ( m, mempty )
   propagateLeafChange tree@(Tree { treeVector }) val ( TaskInfos { rankingEST = Ranking { ranks } } ) taskIndex = do
     rankEST <- ranks `unsafeIndex` taskIndex
     let
@@ -302,6 +306,7 @@ instance Propagatable Latest where
   handedIndex nbTasks i = nbTasks - 1 - i
   inHandedOrder GreaterThan = True
   inHandedOrder _           = False
+  handedPrecedences m = ( mempty, m )
   propagateLeafChange tree@(Tree { treeVector }) val taskData taskIndex = do
     rankLCT <- ranks ( view ( _ranking @Latest @Outer ) taskData ) `unsafeIndex` taskIndex
     let
