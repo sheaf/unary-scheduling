@@ -1,4 +1,5 @@
 packages: .
+  , fingertree
 
 constraints:
     acts -finitary

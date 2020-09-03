@@ -32,7 +32,7 @@ import Data.Maybe
 import GHC.Generics
   ( Generic )
 
--- containersi
+-- containers
 import Data.IntMap.Strict
   ( IntMap )
 import qualified Data.IntMap.Strict as IntMap

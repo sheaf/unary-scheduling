@@ -17,6 +17,7 @@ module Schedule.Interval
   , inside, insideLax
   , Intervals(..)
   , cutBefore, cutAfter, remove, pruneShorterThan
+  , intersectIntervalsWith
   ) where
 
 -- base
@@ -247,14 +248,14 @@ insideLax = coerce insideLax'
 -- Intervals.
 
 -- | Ordered collection of non-overlapping intervals.
-newtype Intervals t = Intervals { intervals :: Seq (Interval t) }
+newtype Intervals t = Intervals { intervals :: Seq ( Interval t ) }
   deriving stock   Show
   deriving newtype ( Eq, NFData )
 
 instance Ord t => Lattice ( Intervals t ) where
   Intervals ivals1 \/ Intervals ivals2 = Intervals ( merge ( Seq.sortOn start ( ivals1 <> ivals2 ) ) )
     where
-      merge :: Seq (Interval t) -> Seq (Interval t)
+      merge :: Seq ( Interval t ) -> Seq ( Interval t )
       merge ( Interval s1 e1 :<| Interval s2 e2 :<| ivals )
         | validInterval ( Interval s2 e1 )
         = merge ( Interval s1 e2 :<| ivals )
@@ -263,10 +264,10 @@ instance Ord t => Lattice ( Intervals t ) where
       merge ivals = ivals
   Intervals ivals1 /\ Intervals ivals2 = Intervals ( go ivals1 ivals2 )
     where
-      go :: Seq (Interval t) -> Seq (Interval t) -> Seq (Interval t)
+      go :: Seq ( Interval t ) -> Seq ( Interval t ) -> Seq ( Interval t )
       go Empty _ = Empty
       go ( ival :<| ivals ) others = go' ival others <> go ivals others
-      go' :: Interval t -> Seq (Interval t) -> Seq (Interval t)
+      go' :: Interval t -> Seq ( Interval t ) -> Seq ( Interval t )
       go' _ Empty = Empty
       go' ival ( other :<| others )
         | handedTime ( endTime ival ) < handedTime ( startTime other )
@@ -276,14 +277,36 @@ instance Ord t => Lattice ( Intervals t ) where
         | otherwise
         = go' ival others
 
+-- | Compute the intersection of two collections of intervals,
+-- combining the values associated to the intervals using the provided combining function.
+intersectIntervalsWith
+  :: forall t a b c
+  .  Ord t
+  => ( a -> b -> c )
+  -> Seq ( Interval t, a ) -> Seq ( Interval t, b ) -> Seq ( Interval t, c )
+intersectIntervalsWith f = go
+  where
+    go :: Seq ( Interval t, a ) -> Seq ( Interval t, b ) -> Seq ( Interval t, c )
+    go Empty _ = Empty
+    go ( ( ival, a ) :<| ivals ) others = go' a ival others <> go ivals others
+    go' :: a -> Interval t -> Seq ( Interval t, b ) -> Seq ( Interval t, c )
+    go' _ _ Empty = Empty
+    go' a ival ( ( other, b ) :<| others )
+      | handedTime ( endTime ival ) < handedTime ( startTime other )
+      = Empty
+      | Just inter <- ival `intersection` other
+      = ( inter, f a b ) :<| go' a ival others
+      | otherwise
+      = go' a ival others
+
 instance ( Ord t, Bounded t ) => BoundedLattice ( Intervals t ) where
   bottom = Intervals Empty
   top    = Intervals ( Seq.singleton $ Interval top top )
 
-cutBefore :: forall t. Ord t => Endpoint (EarliestTime t) -> Intervals t -> Intervals t
+cutBefore :: forall t. Ord t => Endpoint ( EarliestTime t ) -> Intervals t -> Intervals t
 cutBefore = coerce cutBefore'
   where
-    cutBefore' :: Endpoint (Time t) -> Seq (Interval t) -> Seq (Interval t)
+    cutBefore' :: Endpoint (Time t) -> Seq ( Interval t ) -> Seq ( Interval t )
     cutBefore' _ Empty = Empty
     cutBefore' cut@( Endpoint t clu ) full@( Interval ( Endpoint ( EarliestTime s ) s_clu ) ( Endpoint ( LatestTime e ) e_clu ) :<| ivals )
       | t < s || ( t == s && ( clu == Exclusive || s_clu == Exclusive ) )
@@ -295,10 +318,10 @@ cutBefore = coerce cutBefore'
       | otherwise
       = cutBefore' cut ivals
 
-cutAfter :: forall t. Ord t => Endpoint (LatestTime t) -> Intervals t -> Intervals t
+cutAfter :: forall t. Ord t => Endpoint ( LatestTime t ) -> Intervals t -> Intervals t
 cutAfter = coerce cutAfter'
   where 
-    cutAfter' :: Endpoint (Time t) -> Seq (Interval t) -> Seq (Interval t)
+    cutAfter' :: Endpoint ( Time t ) -> Seq ( Interval t ) -> Seq ( Interval t )
     cutAfter' _ Empty = Empty
     cutAfter' cut@( Endpoint t clu ) full@( ivals :|> Interval ( Endpoint ( EarliestTime s ) s_clu ) ( Endpoint ( LatestTime e ) e_clu ) )
       | e < t || ( e == t && ( clu == Exclusive || e_clu == Exclusive ) )
@@ -313,7 +336,7 @@ cutAfter = coerce cutAfter'
 remove :: forall t. Ord t => Intervals t -> Interval t -> Intervals t
 remove = coerce remove'
   where
-    remove' :: Seq (Interval t) -> Interval t -> Seq (Interval t)
+    remove' :: Seq ( Interval t ) -> Interval t -> Seq ( Interval t )
     remove' Empty _ = Empty
     remove'
       full@( ival@( Interval ( Endpoint ( EarliestTime s ) s_clu ) ( Endpoint ( LatestTime e ) e_clu ) ) :<| ivals )
@@ -352,7 +375,7 @@ remove = coerce remove'
 pruneShorterThan :: forall t. ( Num t, Ord t ) => Delta t -> Intervals t -> Maybe ( Intervals t, Intervals t )
 pruneShorterThan = coerce pruneShorterThan'
   where
-    pruneShorterThan' :: Delta t -> Seq (Interval t) -> Maybe ( Seq (Interval t), Seq (Interval t) )
+    pruneShorterThan' :: Delta t -> Seq ( Interval t ) -> Maybe ( Seq ( Interval t ), Seq ( Interval t ) )
     pruneShorterThan' _ Empty = Nothing
     pruneShorterThan' delta ( ival@( Interval ( Endpoint ( EarliestTime s ) _ ) ( Endpoint ( LatestTime e ) _ ) ) :<| ivals )
       | ( s --> e ) < delta

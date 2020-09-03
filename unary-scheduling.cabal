@@ -70,10 +70,12 @@ library
 
   exposed-modules:
       Data.Lattice
+    , Data.Sequence.Insert
     , Data.Vector.Generic.Index
     , Data.Vector.PhaseTransition
     , Data.Vector.Ranking
     , Schedule.Constraint
+    , Schedule.Contention
     , Schedule.Interval
     , Schedule.Monad
     , Schedule.Ordering
@@ -97,6 +99,10 @@ library
         ^>= 0.3.0.2
     , dependent-map
         ^>= 0.4.0.0
+    , fingertree
+        ^>= 0.1.4.2
+    , generic-data
+        ^>= 0.8.3.0
     , groups
         ^>= 0.4.0.0
     , primitive

@@ -15,13 +15,17 @@
 {-# LANGUAGE ScopedTypeVariables   #-}
 {-# LANGUAGE TypeApplications      #-}
 
+{-# LANGUAGE RecordWildCards    #-}
+
 module Schedule.Search where
 
 -- base
 import Data.List
-  ( insert, sort )
+  ( sort )
 import Data.Maybe
   ( mapMaybe, listToMaybe )
+import Data.Ord
+  ( Down(..) )
 import Data.Semigroup
   ( Arg(..), Sum(..) )
 import GHC.Generics
@@ -36,6 +40,10 @@ import qualified Data.IntMap as IntMap
   ( fromList )
 import qualified Data.IntSet as IntSet
   ( singleton )
+import Data.Sequence
+  ( Seq(..) )
+import qualified Data.Sequence as Seq
+  ( singleton, length )
 
 -- deepseq
 import Control.DeepSeq
@@ -76,6 +84,8 @@ import qualified Data.Vector.Unboxed as Unboxed.Vector
   ( (!), foldr )
 
 -- unary-scheduling
+import qualified Data.Sequence.Insert as Seq
+  ( insertIntoSorted )
 import Data.Vector.Generic.Index
   ( unsafeIndex )
 import Schedule.Constraint
@@ -127,7 +137,7 @@ data SolutionCost
 data SearchState task t
   = SearchState
   { pastDecisions       :: [ SearchData task t ]
-  , solutions           :: [ Arg SolutionCost ( ImmutableTaskInfos task t ) ]
+  , solutions           :: Seq ( Arg ( Down SolutionCost ) ( ImmutableTaskInfos task t ) )
   , totalSolutionsFound :: !Int
   , totalDecisionsTaken :: !Int
   }
@@ -151,7 +161,7 @@ search cost maxSolutions propagators = ( `execState` initialState ) . findNextSe
     initialState :: SearchState task t
     initialState = SearchState
       { pastDecisions       = []
-      , solutions           = []
+      , solutions           = Empty
       , totalSolutionsFound = 0
       , totalDecisionsTaken = 0
       }
@@ -168,7 +178,7 @@ search cost maxSolutions propagators = ( `execState` initialState ) . findNextSe
 
     -- Search for the next precedence decision that can be taken.
     findNextSearchStart :: MonadState ( SearchState task t ) m => ImmutableTaskInfos task t -> m ()
-    findNextSearchStart taskInfos@( TaskInfos { taskAvails, orderings } )  =
+    findNextSearchStart taskInfos@( TaskInfos { taskAvails, orderings } ) =
       case nextLikeliestPrecedence likelihood taskAvails orderings of
         -- No further decisions to make: make a note of the solution found and then backtrack to keep searching.
         Nothing -> do
@@ -238,11 +248,26 @@ search cost maxSolutions propagators = ( `execState` initialState ) . findNextSe
           -- Try the @ T_i > T_j @ precedence now (the search should have already tried the other decision).
           decide TryGT i j searchTasks
 
--- | Insert a solution, bumping off old too-costly solutions if we exceeding the maximum number of solutions.
-insertSolution :: Ord cost => Int -> sol -> cost -> [ Arg cost sol ] -> [ Arg cost sol ]
-insertSolution maxSolutions currentSolution currentCost
-  = take maxSolutions
-  . insert ( Arg currentCost currentSolution )
+-- | Insert a solution, bumping off old too-costly solutions if we exceed the maximum number of solutions.
+insertSolution :: Ord cost => Int -> sol -> cost -> Seq ( Arg ( Down cost ) sol ) -> Seq ( Arg ( Down cost ) sol )
+insertSolution maxSolutions currentSolution currentCost Empty
+  | maxSolutions > 0
+  = Seq.singleton ( Arg ( Down currentCost ) currentSolution )
+  | otherwise
+  = Empty
+insertSolution maxSolutions currentSolution currentCost prevSols@( Arg ( Down worstCost ) worstSol :<| otherSols )
+  | currentCost >= worstCost
+  = if Seq.length prevSols >= maxSolutions
+    then prevSols
+    else Arg ( Down currentCost ) currentSolution :<| prevSols
+  | otherwise
+  = let
+      sols = Seq.insertIntoSorted ( Arg ( Down currentCost ) currentSolution ) otherSols
+    in
+      if Seq.length prevSols >= maxSolutions
+      then sols
+      else ( Arg ( Down worstCost ) worstSol ) :<| sols
+
 
 -- | Obtain the indices for the most likely unknown precedence.
 nextLikeliestPrecedence
