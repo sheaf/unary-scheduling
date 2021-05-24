@@ -1,9 +1,9 @@
-packages: .
-  , fingertree
+packages: .,
+  fingertree
 
 constraints:
-    acts -finitary
-  , bitvec -libgmp
+    acts -finitary,
+  bitvec -libgmp
 
 allow-newer:
   constraints-extras:constraints

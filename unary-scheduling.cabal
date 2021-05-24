@@ -99,6 +99,8 @@ library
         ^>= 0.3.0.2
     , dependent-map
         ^>= 0.4.0.0
+    , dependent-sum
+         >= 0.7.0.0 && < 0.8
     , fingertree
         ^>= 0.1.4.2
     , generic-data

@@ -125,10 +125,16 @@ data LinearPiece
   | Up
   deriving stock Show
 
+-- | Compute a single task's contribution to contention on a unary resource,
+-- assuming start times are uniformly distributed within the provided interval.
+--
+-- This is a piecewise function in the shape of a tent.
 intervalContention
   :: forall t
   .  ( Num t, Ord t )
-  => Delta t -> Interval t -> ( Delta t, Seq ( Interval t, LinearPiece ) )
+  => Delta t
+  -> Interval t
+  -> ( Delta t, Seq ( Interval t, LinearPiece ) )
 intervalContention dur ( Interval sp ep ) = case compare dur lg of
   LT -> ( invert dur <> lg
         , Seq.fromList
@@ -170,7 +176,7 @@ data Piece t f =
 --
 -- Nodes hold:
 --   - the maximum start and end points over all their descendants,
---     useful in the finger tree structure to quickly zoom into giving time domains,
+--     useful in the finger tree structure to quickly zoom into given time domains,
 --   - the maximum value of all the pieces below, together with their origin
 --     @ ArgMax d ( t, i ) @
 --     Here:
@@ -264,7 +270,7 @@ instance
 fmapPieces :: Measured v ( Piece t f ) => ( f -> f ) -> FingerTree v ( Piece t f ) -> FingerTree v ( Piece t f )
 fmapPieces upd = FingerTree.fmap' ( over ( field' @"pieceFunction" ) upd )
 
-updateContentionPiece
+addContentionPiece
   :: forall i t f d
   .  ( Ord t, Ord d, Ord i
      , Bounded t, Bounded d
@@ -273,22 +279,23 @@ updateContentionPiece
      , Monoid f
      )
   => i -> Piece t f -> Contention i t f d -> Contention i t f d
-updateContentionPiece
+addContentionPiece
   pieceNumber
   piece@( Piece { pieceStart = start, pieceEnd = end, pieceFunction = f } )
   ( Contention { contentionPieces = ps } )
   = Contention { contentionPieces = qs }
   where
     addedPiece :: Piece t ( Map i f )
-    addedPiece = ( over ( field @"pieceFunction" ) ( Map.singleton pieceNumber ) piece )
+    addedPiece = over ( field @"pieceFunction" ) ( Map.singleton pieceNumber ) piece
     qs :: Pieces i t d f
+    -- Start by sorting the pre-existing pieces into two, based on whether they end before or after the start of the piece we are adding.
     qs = case FingerTree.split ( \ ( Piece { pieceEnd = Max otherEnd } ) -> otherEnd >= start ) ps of
       ( endBefore, endAfter ) -> case endAfter of
         Empty
-        -- All existing pieces occur before the piece we are updating: add a new piece at the end.
+        -- The start of the piece we are adding occurs after all other pieces: add it at the end.
           -> ps :|> addedPiece
         ( pc@( Piece { pieceStart = nextStart } ) :<| nextEndAfters )
-        -- The start of the piece we are adding occurs outside existing pieces:
+        -- The start of the piece we are adding occurs outside of all pre-existing piece:
         --  - add a new interval starting from the new start point,
         --  - update other intervals that occur within the updated piece.
           | nextStart > start
