@@ -14,13 +14,8 @@ import Control.Monad.Primitive
 import qualified Data.Vector.Generic as Generic
   ( Vector )
 import qualified Data.Vector.Generic as Generic.Vector
-  ( Vector
-    ( basicLength, basicUnsafeFreeze, basicUnsafeThaw, basicUnsafeCopy )
-  , Mutable
-  )
-import qualified Data.Vector.Generic.Mutable.Base as Generic.MVector
-  ( MVector
-     ( basicLength, basicUnsafeNew, basicUnsafeCopy )
+  ( Mutable
+  , freeze, unsafeFreeze, thaw, unsafeThaw
   )
 
 -------------------------------------------------------------------------------
@@ -40,11 +35,8 @@ instance ( PrimMonad m
          )
       => Freeze m ( mvec s a ) ( vec a )
       where
-  unsafeFreeze = Generic.Vector.basicUnsafeFreeze
-  freeze mvec = do
-    copy <- Generic.MVector.basicUnsafeNew ( Generic.MVector.basicLength mvec )
-    Generic.MVector.basicUnsafeCopy copy mvec
-    unsafeFreeze copy
+  unsafeFreeze = Generic.Vector.unsafeFreeze
+  freeze       = Generic.Vector.freeze
 
 instance ( PrimMonad m
          , Generic.Vector vec a
@@ -53,11 +45,8 @@ instance ( PrimMonad m
          )
       => Thaw m ( vec a ) ( mvec s a )
       where
-  unsafeThaw = Generic.Vector.basicUnsafeThaw
-  thaw vec = do
-    copy <- Generic.MVector.basicUnsafeNew ( Generic.Vector.basicLength vec )
-    Generic.Vector.basicUnsafeCopy copy vec
-    pure copy
+  unsafeThaw = Generic.Vector.unsafeThaw
+  thaw       = Generic.Vector.thaw
 
 instance Applicative m => Freeze m a a where
   freeze       = pure

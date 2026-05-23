@@ -12,6 +12,7 @@
 {-# LANGUAGE RecordWildCards        #-}
 {-# LANGUAGE ScopedTypeVariables    #-}
 {-# LANGUAGE StandaloneDeriving     #-}
+{-# LANGUAGE TemplateHaskell        #-}
 {-# LANGUAGE TypeApplications       #-}
 {-# LANGUAGE TypeFamilies           #-}
 
@@ -51,13 +52,9 @@ import GHC.Generics
 import Data.Bit
   ( Bit(..) )
 
--- constraints
-import Data.Constraint
-  ( Dict(..) )
-
 -- constraints-extras
-import Data.Constraint.Extras
-  ( ArgDict(..) )
+import Data.Constraint.Extras.TH
+  ( deriveArgDict )
 
 -- containers
 import Data.IntMap.Strict
@@ -144,6 +141,16 @@ import Schedule.Tree
 
 -------------------------------------------------------------------------------
 -- Schedule monad.
+
+-- | Object which needs to be notified of modifications.
+--
+-- Either:
+--  * coarse notifications: a task has been modified.
+--  * fine notifications: a task's left/right endpoint has been modified.
+data Notifiee a where
+  Coarse :: Text -> Notifiee IntSet
+  Fine   :: Text -> Notifiee ( IntSet, IntSet )
+deriveArgDict ''Notifiee
 
 data TaskUpdates t
   = TaskUpdates
@@ -266,14 +273,6 @@ broadcastModifications tgt newModifs =
             ( IntSet.union ( IntMap.keysSet $ IntMap.filter snd newModifs ) )
     _ -> id
 
--- | Object which needs to be notified of modifications.
---
--- Either:
---  * coarse notifications: a task has been modified.
---  * fine notifications: a task's left/right endpoint has been modified.
-data Notifiee a where
-  Coarse :: Text -> Notifiee IntSet
-  Fine   :: Text -> Notifiee ( IntSet, IntSet )
 deriving stock instance Show ( Notifiee a )
 instance GEq Notifiee where
   geq ( Coarse a ) ( Coarse b )
@@ -296,7 +295,3 @@ instance GCompare Notifiee where
   gcompare ( Fine _ ) ( Coarse _ ) = GGT
 instance GShow Notifiee where
   gshowsPrec = showsPrec
-instance ArgDict c Notifiee where
-  type ConstraintsFor Notifiee c = ( c IntSet, c ( IntSet, IntSet ) )
-  argDict ( Coarse _ ) = Dict
-  argDict ( Fine   _ ) = Dict

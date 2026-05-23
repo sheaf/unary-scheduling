@@ -113,7 +113,7 @@ import Schedule.Time
 ---------------------------------------------------------------------------------------------------
 
 -- | Two types of unary scheduling trees:
--- 
+--
 --  - Earliest: compute earliest completion time, with leaves sorted by earliest start      time,
 --  - Latest  : compute latest   start      time, with leaves sorted by latest   completion time.
 newtype Tree ( h :: Handedness ) ( s :: Type ) ( a :: Type ) =
@@ -191,7 +191,7 @@ propagateChangeFromLeaf ( Tree { treeVector } ) a leafIndex = case lg of
         nodeValue = case childSide of
           LeftChild -> childValue      <> otherChildValue
           _         -> otherChildValue <> childValue
-      
+
       Boxed.MVector.unsafeWrite treeVector nodeIndex nodeValue
       if nodeIndex == 0
       then
@@ -234,7 +234,7 @@ toRoseTree ( Tree { treeVector } ) = do
     nbNodes :: Int
     nbNodes = Boxed.MVector.length treeVector
     go :: Int -> m ( Maybe ( Rose.Tree ( Int, a ) ) )
-    go i 
+    go i
       | i >= nbNodes
       = pure Nothing
       | otherwise
@@ -402,7 +402,7 @@ instance ( Lattice ( Endpoint ( HandedTime h t ) )
       where
   (<>)
     ( DurationInfo { subsetInnerTime = timeL, totalDuration = durL } )
-    ( DurationInfo { subsetInnerTime = timeR, totalDuration = durR } ) 
+    ( DurationInfo { subsetInnerTime = timeR, totalDuration = durR } )
     = DurationInfo
       { subsetInnerTime = ( durR • timeL ) /\ timeR
       -- ect = max ( ectL + durR ) ectR
@@ -445,7 +445,7 @@ instance ( Num t, Ord a
       { durationInfo = DurationInfo { subsetInnerTime = timeR, totalDuration = durR }
       , transitionAtoms = atomsR
       }
-    ) 
+    )
     = TTDurationInfo
       { durationInfo =
         DurationInfo
@@ -544,7 +544,7 @@ instance ( Num t, Ord t
     DurationExtraInfo
       { baseDurationInfo = mempty
       , extraDurationInfo =
-        DurationInfo 
+        DurationInfo
           { subsetInnerTime = Nothing
           , totalDuration   = Nothing
           }
@@ -562,24 +562,24 @@ instance ( Num t, Ord t, Ord a
       where
   (<>)
     ( TTDurationExtraInfo
-      { baseTTDurationInfo = baseInfoL@
+      { baseTTDurationInfo = baseInfoL@(
           TTDurationInfo
             {    durationInfo = DurationInfo { totalDuration =  baseDurationL, subsetInnerTime =  baseTimeL }
             , transitionAtoms = baseAtomsL
-            }
+            } )
       , extraTTDurationInfo =
           TTDurationInfo
             {    durationInfo = mbExtraInfoL
-            , transitionAtoms = extraAtomsL 
+            , transitionAtoms = extraAtomsL
             }
       }
     )
     ( TTDurationExtraInfo
-      { baseTTDurationInfo = baseInfoR@
+      { baseTTDurationInfo = baseInfoR@(
           TTDurationInfo
             {    durationInfo = DurationInfo { totalDuration =  baseDurationR }
             , transitionAtoms = baseAtomsR
-            }
+            } )
       , extraTTDurationInfo =
           TTDurationInfo
             {    durationInfo = mbExtraInfoR
@@ -604,7 +604,7 @@ instance ( Num t, Ord t, Ord a
     }
     where
       mbDurationAndResp :: Maybe ( Arg ( Delta t ) r )
-      mbDurationAndResp = 
+      mbDurationAndResp =
         foldrJusts ( coerce ( (<>) @( ArgMax ( Delta t ) r ) ) )
           [ totalDuration mbExtraInfoL <&> \ ( Arg extraDurationL extraDurationL_resp ) ->
             Arg ( extraDurationL <>  baseDurationR ) extraDurationL_resp
@@ -650,7 +650,7 @@ instance ( Num t, Ord t, Ord a
     , extraTTDurationInfo =
       TTDurationInfo
         { durationInfo =
-          DurationInfo 
+          DurationInfo
             { subsetInnerTime = Nothing
             , totalDuration   = Nothing
             }

@@ -1,9 +1,14 @@
-packages: .,
-  fingertree
+packages: .
 
 constraints:
     acts -finitary,
   bitvec -libgmp
 
+source-repository-package
+  type: git
+  location: https://github.com/sheaf/generic-lens
+  tag: c265eb236c8264a8a06241d6ea04443a6803c92c
+
 allow-newer:
-  constraints-extras:constraints
+  *:base, *:ghc-bignum, *:ghc-prim, *:ghc-internal, *:template-haskell,
+  generic-lens:text

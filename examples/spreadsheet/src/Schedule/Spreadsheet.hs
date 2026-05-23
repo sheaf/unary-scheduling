@@ -34,6 +34,8 @@ import Data.Foldable
   ( for_, toList )
 import Data.Functor
   ( ($>) )
+import Data.Ord
+  ( Down(..) )
 import Data.Semigroup
   ( Arg(..) )
 import Data.Traversable
@@ -49,10 +51,10 @@ import System.Exit
 import System.IO
   ( hPutStrLn, stderr )
 
--- ansi-wl-pprint
-import qualified Text.PrettyPrint.ANSI.Leijen as Pretty
+-- prettyprinter
+import qualified Prettyprinter as Pretty
   ( Doc
-  , linebreak, hardline, indent, hang
+  , line', hardline, indent, hang
   )
 
 -- attoparsec
@@ -69,8 +71,6 @@ import qualified Data.ByteString.Lazy as LazyByteString
   ( readFile, writeFile )
 
 -- containers
-import Data.Map.Strict
-  ( Map )
 import qualified Data.Map.Strict as Map
   ( lookup, mapWithKey, fromList, unionWith )
 import Data.Set
@@ -114,14 +114,15 @@ import Control.Monad.Except
 import qualified Options.Applicative as OptParse
   ( execParserPure, execCompletion, renderFailure
   , ParserResult(..), CompletionResult(..)
-  , Parser, ParserInfo(..), ParserPrefs(..)
+  , Parser, ParserInfo(..), ParserPrefs
+  , prefs, disambiguate, showHelpOnError, columns
   , strOption, strArgument, switch, flag, helper
   , long, short, metavar, value, help
   )
 import qualified Options.Applicative.Help.Chunk as OptParse
   ( Chunk(Chunk) )
 import qualified Options.Applicative.Types as OptParse
-  ( Backtracking(Backtrack), ArgPolicy(Intersperse) )
+  ( ArgPolicy(Intersperse) )
 
 -- text
 import Data.Text
@@ -161,6 +162,7 @@ import qualified Codec.Xlsx as Xlsx
   , Cell(..), CellValue(..)
   , CellFormula(..), FormulaExpression(..), Formula(..)
   , ParseError(..)
+  , RowIndex(..), ColumnIndex(..), CellMap
   , toXlsxEither, fromXlsx
   )
 
@@ -282,7 +284,7 @@ scheduleSpreadsheet = do
           <> Text.pack ( show ( totalDecisionsTaken searchRes ) ) <> " decisions\n\n"
           )
       case solutions searchRes of
-        ( Arg cost bestSol : _ ) -> do
+        ( _ :|> Arg ( Down cost ) bestSol ) -> do
           lift $ Text.writeFile "dotfile.txt" ( visualiseEdges . orderings $ bestSol )
           lift $ Text.writeFile "cost.txt" ( Text.pack ( show cost ) )
           pure bestSol
@@ -359,8 +361,12 @@ instance Show Column where
           units = Char.chr ( ones + Char.ord 'A' )
 
 -- | Traversal for obtaining the cells in the first worksheet of the spreadsheet.
-_cells :: Traversal' Xlsx.Xlsx ( Map ( Int,Int ) Xlsx.Cell )
+_cells :: Traversal' Xlsx.Xlsx Xlsx.CellMap
 _cells = field' @"_xlSheets" . ix 0 . typed @Xlsx.Worksheet . field' @"_wsCells"
+
+-- | Build an @xlsx@ cell key from a @( row, column )@ 'Int' pair.
+cellRef :: ( Int, Int ) -> ( Xlsx.RowIndex, Xlsx.ColumnIndex )
+cellRef ( r, c ) = ( Xlsx.RowIndex r, Xlsx.ColumnIndex c )
 
 -- | Parse a spreadsheet into scheduling information.
 --
@@ -385,7 +391,7 @@ _cells = field' @"_xlSheets" . ix 0 . typed @Xlsx.Worksheet . field' @"_wsCells"
 parseSpreadsheet :: Bool -> Xlsx.Xlsx -> Either Error SchedulingData
 parseSpreadsheet enableMakespanConstraints spreadsheet = runST $ runExceptT do
   let
-    cells :: Map ( Int, Int ) Xlsx.Cell
+    cells :: Xlsx.CellMap
     cells = view _cells spreadsheet
   when ( null cells ) do
     throwError ( SheetParseError "No cell data found in spreadsheet" )
@@ -408,7 +414,7 @@ parseSpreadsheet enableMakespanConstraints spreadsheet = runST $ runExceptT do
       name  <- parseText staffNameLocation cells
       makespanCt <-
         if enableMakespanConstraints
-        then case Map.lookup makespanConstraintLocation cells of
+        then case Map.lookup ( cellRef makespanConstraintLocation ) cells of
           Nothing   -> pure []
           Just cell -> parseMakespanConstraints makespanConstraintLocation cell
         else pure []
@@ -434,7 +440,7 @@ parseSpreadsheet enableMakespanConstraints spreadsheet = runST $ runExceptT do
       taskCellLocation = ( taskRow, 1 )
     taskStaffCell
       <- note ( SheetParseError $ "Missing cell data at " <> located taskCellLocation <> ": expected to find staff allocated to the task in that row." )
-       $ Map.lookup ( taskRow, 1 ) cells
+       $ Map.lookup ( cellRef ( taskRow, 1 ) ) cells
     taskStaffIDs <- parseTaskStaffIDs taskRow firstStaffRow lastStaffRow taskStaffCell
     let
       taskAvailability :: Intervals Column
@@ -490,7 +496,7 @@ parseSpreadsheet enableMakespanConstraints spreadsheet = runST $ runExceptT do
 --  - cells B1 & C1: first and last cells of tasks to be scheduled (range of rows),
 --  - cells B2 & C2: first and last cells of staff to be assigned to the tasks (range of rows),
 --  - cells B3 & C3: first and last cells of available time slots (range of columns).
-parseRanges :: Monad m => Map ( Int, Int ) Xlsx.Cell -> ExceptT Error m SchedulingRanges
+parseRanges :: Monad m => Xlsx.CellMap -> ExceptT Error m SchedulingRanges
 parseRanges cells = do
   firstStaffRow       <- fst <$> parseLocationFromCellFormulaAt "first staff row"           (2,2) cells
   lastStaffRow        <- fst <$> parseLocationFromCellFormulaAt "last staff row"            (2,3) cells
@@ -516,10 +522,10 @@ pattern TextCell text <- Xlsx.Cell { Xlsx._cellValue = Just ( Xlsx.CellText text
 -- | Obtains the location a cell is pointing at, in the case that the cell is pointing at a single other cell.
 --
 -- This corresponds to a spreadsheet formula of the form @=AB7@ (for instance).
-parseLocationFromCellFormulaAt :: MonadError Error m => Text -> ( Int, Int ) -> Map (Int, Int) Xlsx.Cell -> m ( Int, Int )
+parseLocationFromCellFormulaAt :: MonadError Error m => Text -> ( Int, Int ) -> Xlsx.CellMap -> m ( Int, Int )
 parseLocationFromCellFormulaAt desc loc cells = do
   cell <- note ( SheetParseError $ "Could not parse " <> desc <> " from cell formula: no cell at " <> located loc )
-        $ Map.lookup loc cells
+        $ Map.lookup ( cellRef loc ) cells
   case cell of
     SimpleFormulaCell formula
       -> case Atto.parseOnly ( location <* Atto.endOfInput ) formula of
@@ -556,7 +562,7 @@ located :: ( Int, Int ) -> Text
 located ( r, c ) = Text.pack ( show $ Column c ) <> Text.pack ( show r )
 
 -- | Parse the availability in a given row, as read off from the spreadsheet cells.
-parseAvailability :: Int -> Int -> Int -> Map ( Int, Int ) Xlsx.Cell -> Intervals Column
+parseAvailability :: Int -> Int -> Int -> Xlsx.CellMap -> Intervals Column
 parseAvailability firstCol lastCol row cells = Intervals $ go Empty firstCol
   where
     go :: Seq ( Interval Column ) -> Int -> Seq ( Interval Column )
@@ -569,22 +575,22 @@ parseAvailability firstCol lastCol row cells = Intervals $ go Empty firstCol
       = ivals
 
 -- | Returns the next available column in the given row, starting from the given column (inclusive).
-nextAvailableColumn :: Int -> Int -> Map ( Int, Int ) Xlsx.Cell -> Int -> Maybe Int
+nextAvailableColumn :: Int -> Int -> Xlsx.CellMap -> Int -> Maybe Int
 nextAvailableColumn _   lastCol _ col 
   | col > lastCol
   = Nothing
-nextAvailableColumn row lastCol cells col = case Map.lookup ( row, col ) cells of
+nextAvailableColumn row lastCol cells col = case Map.lookup ( cellRef ( row, col ) ) cells of
   Just cell -> case Xlsx._cellValue cell of
     Just ( Xlsx.CellDouble 0 ) -> nextAvailableColumn row lastCol cells ( col + 1 )
     _                          -> Just col
   _ -> nextAvailableColumn row lastCol cells ( col + 1 )
 
 -- | Returns the last available column in the given row, starting from the given column.
-lastAvailableColumnAfter :: Int -> Int -> Map ( Int, Int ) Xlsx.Cell -> Int -> Int
+lastAvailableColumnAfter :: Int -> Int -> Xlsx.CellMap -> Int -> Int
 lastAvailableColumnAfter _   lastCol _ prevAvailCol
   | prevAvailCol >= lastCol
   = prevAvailCol
-lastAvailableColumnAfter row lastCol cells prevAvailCol = case Map.lookup ( row, prevAvailCol + 1 ) cells of
+lastAvailableColumnAfter row lastCol cells prevAvailCol = case Map.lookup ( cellRef ( row, prevAvailCol + 1 ) ) cells of
   Just cell 
     | Just ( Xlsx.CellDouble 0 ) <- Xlsx._cellValue cell
     -> prevAvailCol
@@ -683,9 +689,9 @@ list open close sep ps = do
 -- | Obtain text from a cell.
 --
 -- Expects the cell to contain a constant plain text value, not rich text nor a formula.
-parseText :: MonadError Error m => ( Int, Int ) -> Map ( Int, Int ) Xlsx.Cell -> m Text
+parseText :: MonadError Error m => ( Int, Int ) -> Xlsx.CellMap -> m Text
 parseText loc cells
-  | Just ( TextCell text ) <- Map.lookup loc cells
+  | Just ( TextCell text ) <- Map.lookup ( cellRef loc ) cells
   = pure text
   | otherwise
   = throwError ( SheetParseError $ "Could not parse text in cell " <> located loc <> "." )
@@ -693,9 +699,9 @@ parseText loc cells
 -- | Obtain the task duration from a cell, in number of columns.
 --
 -- Expects the cell to contain a constant numeric value, not a formula.
-parseTaskDuration :: MonadError Error m => ( Int, Int ) -> Map ( Int, Int ) Xlsx.Cell -> m ( Delta Column )
+parseTaskDuration :: MonadError Error m => ( Int, Int ) -> Xlsx.CellMap -> m ( Delta Column )
 parseTaskDuration loc cells
-  | Just ( Xlsx.Cell { Xlsx._cellValue = Just ( Xlsx.CellDouble d ) } ) <- Map.lookup loc cells
+  | Just ( Xlsx.Cell { Xlsx._cellValue = Just ( Xlsx.CellDouble d ) } ) <- Map.lookup ( cellRef loc ) cells
   = pure $ Delta ( Column ( round d ) )
   | otherwise
   = throwError ( SheetParseError $ "Could not parse task duration expected in cell " <> located loc <> "." )
@@ -741,8 +747,8 @@ updateSpreadsheet
 updateSpreadsheet ( SchedulingRanges { .. } ) ( TaskInfos { taskNames, taskAvails } ) staff =
   over _cells ( Map.unionWith setCellText staffTasks . Map.mapWithKey makeCellUnavailable )
   where
-    makeCellUnavailable :: ( Int,Int ) -> Xlsx.Cell -> Xlsx.Cell
-    makeCellUnavailable ( r, c ) cell
+    makeCellUnavailable :: ( Xlsx.RowIndex, Xlsx.ColumnIndex ) -> Xlsx.Cell -> Xlsx.Cell
+    makeCellUnavailable ( Xlsx.RowIndex r, Xlsx.ColumnIndex c ) cell
       |  r < firstTaskRow
       || r > lastTaskRow
       || c < firstScheduleColumn
@@ -755,9 +761,9 @@ updateSpreadsheet ( SchedulingRanges { .. } ) ( TaskInfos { taskNames, taskAvail
       = cell
       | otherwise
       = cell { Xlsx._cellValue = Just ( Xlsx.CellDouble 0 ) }
-    staffTasks :: Map ( Int, Int ) Xlsx.Cell
+    staffTasks :: Xlsx.CellMap
     staffTasks = Map.fromList
-      [ ( ( i, 1 ), Xlsx.Cell Nothing ( Just ( Xlsx.CellText $ staffTaskText ( i - firstStaffRow ) ) ) Nothing Nothing )
+      [ ( ( Xlsx.RowIndex i, Xlsx.ColumnIndex 1 ), Xlsx.Cell Nothing ( Just ( Xlsx.CellText $ staffTaskText ( i - firstStaffRow ) ) ) Nothing Nothing )
       | i <- [ firstStaffRow .. lastStaffRow ]
       ]
     staffTaskText :: Int -> Text
@@ -864,37 +870,37 @@ parseArgs = do
       throwError ( ArgsError msg )
 
   where
-    header, desc, usageInfo :: Pretty.Doc
+    header, desc, usageInfo :: Pretty.Doc ann
     header = "schedule-spreadsheet - propagate unary scheduling constraints read from a spreadsheet"
     desc = "Computes up to date scheduling constraints read from a spreadsheet"
     usageInfo =
       "The scheduling information is expected to be provided within the spreadsheet in the following manner:"
-      <> Pretty.linebreak
-      <> Pretty.linebreak <>
+      <> Pretty.line'
+      <> Pretty.line' <>
         ( Pretty.indent 2
           ( "Range information, in the form of a formula pointing to another cell:"
-          <> Pretty.linebreak <>
+          <> Pretty.line' <>
             ( Pretty.indent 2
               (  Pretty.hang 2 "- in cells B1 & C1: point to first and last cells of tasks to be scheduled (range of rows),"
-              <> Pretty.linebreak
+              <> Pretty.line'
               <> Pretty.hang 2 "- in cells B2 & C2: point to first and last cells of staff to be assigned to the tasks (range of rows),"
-              <> Pretty.linebreak
+              <> Pretty.line'
               <> Pretty.hang 2 "- in cells B3 & C3: point to first and last cells of available time slots (range of columns)."
-              <> Pretty.linebreak
+              <> Pretty.line'
               )
             ) <> Pretty.hardline <>
             "Information for each task, in the same row as the task:"
-            <> Pretty.linebreak <>
+            <> Pretty.line' <>
             ( Pretty.indent 2
               (  Pretty.hang 2
-                  ( "- column A: staff assigned to the task in the row, in the form of a formula " <> Pretty.linebreak
+                  ( "- column A: staff assigned to the task in the row, in the form of a formula " <> Pretty.line'
                   <> Pretty.indent 4 "TEXTJOIN( delimiter, ignore_empty, staff_cell_1, staff_cell_2, ..., staff_cell_n )"
                   )
-              <> Pretty.linebreak
+              <> Pretty.line'
               <> Pretty.hang 2 "- column B: duration of the task, in number of columns,"
-              <> Pretty.linebreak
+              <> Pretty.line'
               <> Pretty.hang 2 "- for each scheduling column: availability value."
-              <> Pretty.linebreak
+              <> Pretty.line'
               )
             ) <> Pretty.hardline <>
             "Availability values for staff, for the available time columns, in each of the staff member rows."
@@ -903,12 +909,12 @@ parseArgs = do
             "Availability for staff and tasks is specified as follows:" <> Pretty.hardline <>
               ( Pretty.indent 2
                 (  Pretty.hang 2 "- an unavailable time slot corresponds to a cell value of 0,"
-                <> Pretty.linebreak
+                <> Pretty.line'
                 <> Pretty.hang 2 "- an available time slot is a cell with any other value."
                 )
               )
             <> Pretty.hardline <> Pretty.hardline <>
-            "Makespan constraints for staff members can also be specified in column B," <> Pretty.linebreak <>
+            "Makespan constraints for staff members can also be specified in column B," <> Pretty.line' <>
             "on the same row as the task (requires the --makespan flag)." <> Pretty.hardline <>
             "The format is as follows:" <> Pretty.hardline <>
               ( Pretty.indent 4 "TEXTJOIN(delim,bool,TEXTJOIN(delim,bool,start1,end1,makespan1),TEXTJOIN(delim,bool,start2,end2,makespan2)...)" )
@@ -916,15 +922,8 @@ parseArgs = do
          )
 
     parserPrefs :: OptParse.ParserPrefs
-    parserPrefs = OptParse.ParserPrefs
-      { OptParse.prefMultiSuffix     = ""
-      , OptParse.prefDisambiguate    = True
-      , OptParse.prefShowHelpOnError = True
-      , OptParse.prefShowHelpOnEmpty = False
-      , OptParse.prefBacktrack       = OptParse.Backtrack
-      , OptParse.prefColumns         = 80
-      , OptParse.prefHelpLongEquals  = False
-      }
+    parserPrefs = OptParse.prefs
+      ( OptParse.disambiguate <> OptParse.showHelpOnError <> OptParse.columns 80 )
 
     parserInfo :: OptParse.ParserInfo Args
     parserInfo = OptParse.ParserInfo

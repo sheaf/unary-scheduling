@@ -13,6 +13,7 @@
 {-# LANGUAGE ScopedTypeVariables        #-}
 {-# LANGUAGE TypeApplications           #-}
 {-# LANGUAGE UndecidableInstances       #-}
+{-# LANGUAGE ViewPatterns               #-}
 
 module Schedule.Contention where
 
@@ -51,9 +52,12 @@ import Control.DeepSeq
 
 -- fingertree
 import Data.FingerTree
-  ( FingerTree(..), Measured(..) )
+  ( FingerTree, Measured(..)
+  , ViewL(..), ViewR(..)
+  , viewl, viewr, (<|), (|>)
+  )
 import qualified Data.FingerTree as FingerTree
-  ( split, fmap' )
+  ( split, fmap', null, empty )
 
 -- generic-data
 import Generic.Data
@@ -87,6 +91,24 @@ import Schedule.Time
 
 -------------------------------------------------------------------------------
 
+pattern Empty :: Measured v a => FingerTree v a
+pattern Empty <- ( FingerTree.null -> True )
+  where Empty = FingerTree.empty
+
+infixr 5 :<|
+pattern (:<|) :: Measured v a => a -> FingerTree v a -> FingerTree v a
+pattern x :<| xs <- ( viewl -> x :< xs )
+  where x :<| xs = x <| xs
+{-# COMPLETE Empty, (:<|) #-}
+
+infixl 5 :|>
+pattern (:|>) :: Measured v a => FingerTree v a -> a -> FingerTree v a
+pattern xs :|> x <- ( viewr -> xs :> x )
+  where xs :|> x = xs |> x
+{-# COMPLETE Empty, (:|>) #-}
+
+-------------------------------------------------------------------------------
+
 -- | Joint contention criticality estimate,
 -- under the assumption that no precedence information
 -- between the two tasks is known.
@@ -107,9 +129,9 @@ taskContention ( Task { taskAvailability = Intervals ivals, taskDuration = dur }
   where
     totalArea     :: t
     controlPoints :: Map ( Time t ) ( Delta t )
-    ( Delta totalArea, controlPoints ) = 
+    ( Delta totalArea, controlPoints ) =
       foldl'
-        ( \ ( totArea, totPoints ) ival -> 
+        ( \ ( totArea, totPoints ) ival ->
           let
             ( area, points ) = intervalContention dur ival
           in
@@ -322,7 +344,7 @@ addContentionPiece
         --   - update the previous intervals,
         --   - add a new interval ending at the new endpoint.
           | previousEnd < end
-          -> 
+          ->
             (   fmapPieces ( Map.insert pieceNumber f ) previousStartBefores
             :|> addedPiece { pieceStart = previousEnd }
             )
@@ -331,7 +353,7 @@ addContentionPiece
         -- The piece we are adding ends inside an existing piece:
         --  - update the intervals up until the end,
         --  - split up the interval at the end.
-          -> 
+          ->
             (   fmapPieces ( Map.insert pieceNumber f ) ( previousStartBefores :|> pc { pieceEnd = end } )
             :|> pc { pieceStart = end }
             )
