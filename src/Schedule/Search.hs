@@ -20,6 +20,8 @@
 module Schedule.Search where
 
 -- base
+import Control.Monad
+  ( when )
 import Data.List
   ( sort )
 import Data.Maybe
@@ -140,9 +142,24 @@ data SearchState task t
   , solutions           :: Seq ( Arg ( Down SolutionCost ) ( ImmutableTaskInfos task t ) )
   , totalSolutionsFound :: !Int
   , totalDecisionsTaken :: !Int
+
+    -- Debug instrumentation
+  , openDepth           :: !Int -- ^ current number of open backtrack points (decision-stack depth)
+  , maxOpenDepth        :: !Int -- ^ largest decision-stack depth reached so far
+  , totalBacktracks     :: !Int -- ^ number of times the search has backtracked
   }
   deriving stock    ( Show, Generic )
   deriving anyclass NFData
+
+-- | How often (counted in decisions) the search emits a progress trace.
+-- Set to @0@ to disable progress tracing.
+traceEvery :: Int
+traceEvery = 1000
+
+-- | One-line summary of the best solution cost found so far (for logging).
+bestCostSummary :: Seq ( Arg ( Down SolutionCost ) x ) -> String
+bestCostSummary ( _ :|> Arg ( Down c ) _ ) = show c
+bestCostSummary _                          = "none"
 
 search
   :: forall task t
@@ -164,6 +181,9 @@ search cost maxSolutions propagators = ( `execState` initialState ) . findNextSe
       , solutions           = Empty
       , totalSolutionsFound = 0
       , totalDecisionsTaken = 0
+      , openDepth           = 0
+      , maxOpenDepth        = 0
+      , totalBacktracks     = 0
       }
 
     -- Find the precedence which would incur the largest adjustment in availability for the two tasks involved.
@@ -176,9 +196,22 @@ search cost maxSolutions propagators = ( `execState` initialState ) . findNextSe
           <>
           max mempty ( handedTime ( endpoint ( est tk_j ) ) --> handedTime ( endpoint ( ect tk_i ) ) )
 
+    -- Emit a periodic progress trace (every 'traceEvery' decisions).
+    logSearchProgress :: MonadState ( SearchState task t ) m => m ()
+    logSearchProgress = do
+      st <- get
+      when ( traceEvery > 0 && totalDecisionsTaken st `mod` traceEvery == 0 ) $
+        traceM $ "[search] decisions=" <> show ( totalDecisionsTaken st )
+              <> " openDepth="    <> show ( openDepth st )
+              <> " maxOpenDepth=" <> show ( maxOpenDepth st )
+              <> " solutionsFound=" <> show ( totalSolutionsFound st )
+              <> " backtracks="   <> show ( totalBacktracks st )
+              <> " best="         <> bestCostSummary ( solutions st )
+
     -- Search for the next precedence decision that can be taken.
     findNextSearchStart :: MonadState ( SearchState task t ) m => ImmutableTaskInfos task t -> m ()
-    findNextSearchStart taskInfos@( TaskInfos { taskAvails, orderings } ) =
+    findNextSearchStart taskInfos@( TaskInfos { taskAvails, orderings } ) = do
+      logSearchProgress
       case nextLikeliestPrecedence likelihood taskAvails orderings of
         -- No further decisions to make: make a note of the solution found and then backtrack to keep searching.
         Nothing -> do
@@ -207,15 +240,18 @@ search cost maxSolutions propagators = ( `execState` initialState ) . findNextSe
             -- Hence, if we are currently trying @ < @, then provide a backtracking point for @ > @.
             backtrackPoint :: SearchData task t
             backtrackPoint = SearchData { searchTasks = currentTasks, searchDecision = ( i, j ) }
-          modify'
-            $ over ( field' @"pastDecisions" ) ( backtrackPoint : )
-            . over ( field' @"totalDecisionsTaken" ) ( + 1 )
+          modify' \ s ->
+            s { pastDecisions       = backtrackPoint : pastDecisions s
+              , totalDecisionsTaken = totalDecisionsTaken s + 1
+              , openDepth           = openDepth s + 1
+              , maxOpenDepth        = max ( maxOpenDepth s ) ( openDepth s + 1 )
+              }
           pure $ runScheduleMonad currentTasks ( addEdge i j *> propagationLoop 1000 propagators )
         TryGT -> do
           -- Don't provide a backtracking point:
           -- at this stage we should have already tried @ T_i < T_j @.
-          modify'
-            $ over ( field' @"totalDecisionsTaken" ) ( + 1 )
+          modify' \ s ->
+            s { totalDecisionsTaken = totalDecisionsTaken s + 1 }
           pure $ runScheduleMonad currentTasks ( addEdge j i *> propagationLoop 1000 propagators )
       case next of
         -- No results possible: backtrack.
@@ -244,7 +280,11 @@ search cost maxSolutions propagators = ( `execState` initialState ) . findNextSe
         [] -> pure ()
         -- Found a point to backtrack to.
         ( SearchData { searchTasks, searchDecision = ( i, j ) } : prevDecs ) -> do
-          put ( oldSearchState { pastDecisions = prevDecs } )
+          put oldSearchState
+            { pastDecisions   = prevDecs
+            , openDepth       = openDepth oldSearchState - 1
+            , totalBacktracks = totalBacktracks oldSearchState + 1
+            }
           -- Try the @ T_i > T_j @ precedence now (the search should have already tried the other decision).
           decide TryGT i j searchTasks
 
@@ -279,17 +319,17 @@ nextLikeliestPrecedence
   -> Boxed.Vector ( Task task t )
   -> OrderingMatrix Unboxed.Vector
   -> Maybe ( Int, Int )
-nextLikeliestPrecedence likelihood allTasks ( OrderingMatrix { dim, orderingMatrix } ) 
+nextLikeliestPrecedence likelihood allTasks ( OrderingMatrix { dim, orderingMatrix } )
   = fmap ( \ ( Arg _ v ) -> v )
   . listToMaybe
   . sort
   . mapMaybe
     ( \ ( i, j ) -> case orderingMatrix Unboxed.Vector.! ( upperTriangular dim i j ) of
-        Unknown -> 
+        Unknown ->
           let
             tk_i, tk_j :: Task task t
             tk_i = allTasks Boxed.Vector.! i
-            tk_j = allTasks Boxed.Vector.! j 
+            tk_j = allTasks Boxed.Vector.! j
           in
             Just $ Arg ( likelihood tk_i tk_j ) ( i, j )
         _ -> Nothing
@@ -310,7 +350,7 @@ addEdge start end = do
   TaskInfos { taskNames, taskAvails, orderings } <- ask
 
   modifying ( field' @"taskConstraints" . field' @"justifications" )
-    ( <> 
+    ( <>
       "Search decision has introduced the precedence:\n\
       \\"" <> taskNames Boxed.Vector.! start <> "\" < \"" <> taskNames Boxed.Vector.! end <> "\n\n"
     )

@@ -576,7 +576,7 @@ precedenceMatrix = do
     task <- taskAvails `unsafeIndex` taskNb
     let
       taskOuterTime :: Endpoint ( HandedTime h t )
-      taskOuterTime = pickEndpoint @h @Inner task
+      taskOuterTime = pickEndpoint @h @Outer task
     go taskNb taskOuterTime top [] 0
 
 

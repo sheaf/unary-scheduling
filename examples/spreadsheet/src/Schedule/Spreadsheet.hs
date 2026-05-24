@@ -34,6 +34,8 @@ import Data.Foldable
   ( for_, toList )
 import Data.Functor
   ( ($>) )
+import Data.List
+  ( sortOn )
 import Data.Ord
   ( Down(..) )
 import Data.Semigroup
@@ -170,25 +172,31 @@ import qualified Codec.Xlsx as Xlsx
 import Data.Lattice
   ( Meet(..) )
 import Schedule.Propagators
-  ( propagateConstraints, Propagator(..), basicPropagators
+  ( propagateConstraints, propagationLoop, Propagator(..), basicPropagators
   , makespan
   )
 import Schedule.Interval
   ( Interval((:<=..<=)), Intervals(..)
+  , Endpoint(..)
   , insideLax
   )
 import Schedule.Monad
-  ( BroadcastTarget(..) )
+  ( BroadcastTarget(..), runScheduleMonad )
 import Schedule.Ordering
   ( visualiseEdges )
 import Schedule.Search
-  ( SearchState(..), search )
+  ( SearchState(..), search, addEdge )
 import Schedule.Task
   ( Task(..), TaskInfos(..)
   , ImmutableTaskInfos
+  , est, lst
   )
 import Schedule.Time
-  ( Delta(..), Time(..) )
+  ( Delta(..), Time(..), HandedTime(..) )
+
+-- schedule-spreadsheet
+import Schedule.Z3
+  ( unaryScheduleFeasibleZ3 )
 
 -------------------------------------------------------------------------------
 
@@ -228,6 +236,20 @@ scheduleSpreadsheet = do
   -- Log parsed data for debugging.
   lift $ writeFile "data.txt" ( show allSpreadsheetData )
   -}
+
+  -- If requested, use Z3 as an independent oracle to decide feasibility, then exit.
+  when useZ3 do
+    let
+      z3Tasks :: [ Task ( Set Staff ) Column ]
+      z3Tasks = map fst schedulingTasks
+    mbStarts <- lift $ unaryScheduleFeasibleZ3 z3Tasks
+    lift $ case mbStarts of
+      Just starts -> do
+        hPutStrLn stderr "Z3: SATISFIABLE - a feasible schedule exists."
+        hPutStrLn stderr ( "Task start times (column units): " <> show starts )
+      Nothing ->
+        hPutStrLn stderr "Z3: UNSATISFIABLE - no feasible schedule exists."
+    lift exitSuccess
 
   -- Perform constraint propagation (if enabled).
   let
@@ -271,7 +293,54 @@ scheduleSpreadsheet = do
 
   -- Search the remaining possibilities (if search is enabled).
   finalTasks <-
-    if useSearch
+    if useVerifyZ3
+    then do
+      -- Cross-check against Z3.
+      let
+        z3Tasks :: [ Task ( Set Staff ) Column ]
+        z3Tasks = map fst schedulingTasks
+      mbStarts <- lift $ unaryScheduleFeasibleZ3 z3Tasks
+      case mbStarts of
+        Nothing ->
+          throwError ( NoSchedulingPossible "Z3 reports the problem is infeasible; nothing to verify." )
+        Just starts -> do
+          let
+            -- Task indices in increasing Z3 start time, as consecutive precedences
+            -- (the transitive closure fills in the rest).
+            chain :: [ ( Int, Int ) ]
+            chain = let order = map snd $ sortOn fst $ zip starts [ 0 .. ] in zip order ( drop 1 order )
+            ti  :: ImmutableTaskInfos ( Set Staff ) Column
+            res :: Either Text ()
+            ( ti, ( res, _ ) ) =
+              runScheduleMonad schedulingTasks
+                ( for_ chain ( \ ( a, b ) -> addEdge a b ) *> propagationLoop 1000 propagators )
+            -- Tasks for which the Z3 start no longer lies within the tightened window.
+            violators :: [ Text ]
+            violators =
+              [ taskNames ti Boxed.Vector.! i
+                <> " (est=" <> Text.pack ( show estV )
+                <> " z3start=" <> Text.pack ( show st )
+                <> " lst=" <> Text.pack ( show lstV ) <> ")"
+              | ( i, s ) <- zip [ 0 .. ] starts
+              , let task = taskAvails ti Boxed.Vector.! i
+                    st   = Column ( fromInteger s )
+                    estV = getTime ( handedTime ( endpoint ( est task ) ) )
+                    lstV = getTime ( handedTime ( endpoint ( lst task ) ) )
+              , null ( intervals ( taskAvailability task ) ) || st < estV || st > lstV
+              ]
+          case res of
+            Left err ->
+              throwError ( NoSchedulingPossible
+                ( "VERIFY FAILED: we rejected the Z3 schedule.\n\n" <> err ) )
+            Right ()
+              | not ( null violators ) ->
+                throwError ( NoSchedulingPossible
+                  ( "VERIFY FAILED: propagation pruned the Z3 start of:\n  "
+                    <> Text.intercalate "\n  " violators ) )
+              | otherwise -> do
+                lift $ Text.hPutStrLn stderr "VERIFY: propagation is consistent with the Z3 solution."
+                pure ti
+    else if useSearch
     then do
       let
         searchRes :: SearchState ( Set Staff ) Column
@@ -281,7 +350,9 @@ scheduleSpreadsheet = do
         Text.appendFile "search_statistics.txt"
           ( timeBox currentTimeZone timeNow <>
           "Found " <> Text.pack ( show ( totalSolutionsFound searchRes ) ) <> " solutions after "
-          <> Text.pack ( show ( totalDecisionsTaken searchRes ) ) <> " decisions\n\n"
+          <> Text.pack ( show ( totalDecisionsTaken searchRes ) ) <> " decisions\n"
+          <> "Max decision-stack depth: " <> Text.pack ( show ( maxOpenDepth searchRes ) ) <> "\n"
+          <> "Total backtracks: "         <> Text.pack ( show ( totalBacktracks searchRes ) ) <> "\n\n"
           )
       case solutions searchRes of
         ( _ :|> Arg ( Down cost ) bestSol ) -> do
@@ -852,6 +923,8 @@ data Args
   , constraintLoggingPath  :: !(Maybe FilePath)
   , useSearch              :: !Bool
   , useMakespanConstraints :: !Bool
+  , useZ3                  :: !Bool
+  , useVerifyZ3            :: !Bool
   }
   deriving stock Show
 
@@ -927,7 +1000,7 @@ parseArgs = do
 
     parserInfo :: OptParse.ParserInfo Args
     parserInfo = OptParse.ParserInfo
-      { OptParse.infoParser      = OptParse.helper <*> ( Args <$> inputArg <*> outputArg <*> logArg <*> searchArg <*> makespanArg )
+      { OptParse.infoParser      = OptParse.helper <*> ( Args <$> inputArg <*> outputArg <*> logArg <*> searchArg <*> makespanArg <*> z3Arg <*> verifyZ3Arg )
       , OptParse.infoFullDesc    = True
       , OptParse.infoProgDesc    = OptParse.Chunk ( Just desc )
       , OptParse.infoHeader      = OptParse.Chunk ( Just header )
@@ -980,4 +1053,18 @@ parseArgs = do
         (  OptParse.long  "makespan"
         <> OptParse.short 'm'
         <> OptParse.help  "Enable makespan constraints (experimental)"
+        )
+
+    z3Arg :: OptParse.Parser Bool
+    z3Arg =
+      OptParse.switch
+        (  OptParse.long "z3"
+        <> OptParse.help "Use Z3 to decide feasibility"
+        )
+
+    verifyZ3Arg :: OptParse.Parser Bool
+    verifyZ3Arg =
+      OptParse.switch
+        (  OptParse.long "verify-z3"
+        <> OptParse.help "Solve with Z3 and check that we accept its solution"
         )

@@ -129,7 +129,8 @@ executable schedule-spreadsheet
     , examples/spreadsheet/app
 
   other-modules:
-    Schedule.Spreadsheet
+      Schedule.Spreadsheet
+    , Schedule.Z3
 
   main-is:
     Main.hs
@@ -152,6 +153,8 @@ executable schedule-spreadsheet
          >= 1.9.3     && < 1.17
     , xlsx
          >= 1.2.0     && < 1.3
+    , z3
+         >= 411       && < 413
 
   ghc-options:
     -threaded

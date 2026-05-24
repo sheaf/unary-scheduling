@@ -21,8 +21,6 @@ module Schedule.Interval
   ) where
 
 -- base
-import Control.Arrow
-  ( first )
 import Control.Category
   ( (>>>) )
 import Control.Monad
@@ -44,7 +42,7 @@ import Data.Sequence
     ( Empty, (:<|), (:|>) )
   )
 import qualified Data.Sequence as Seq
-  ( singleton, sortOn )
+  ( singleton, sortOn, partition )
 
 -- deepseq
 import Control.DeepSeq
@@ -303,33 +301,43 @@ instance ( Ord t, Bounded t ) => BoundedLattice ( Intervals t ) where
   bottom = Intervals Empty
   top    = Intervals ( Seq.singleton $ Interval top top )
 
+-- | Restrict availability to time not earlier than the given bound.
 cutBefore :: forall t. Ord t => Endpoint ( EarliestTime t ) -> Intervals t -> Intervals t
 cutBefore = coerce cutBefore'
   where
     cutBefore' :: Endpoint (Time t) -> Seq ( Interval t ) -> Seq ( Interval t )
     cutBefore' _ Empty = Empty
     cutBefore' cut@( Endpoint t clu ) full@( Interval ( Endpoint ( EarliestTime s ) s_clu ) ( Endpoint ( LatestTime e ) e_clu ) :<| ivals )
-      | t < s || ( t == s && ( clu == Exclusive || s_clu == Exclusive ) )
+      -- Bound at or before the interval start: nothing to cut, keep it whole.
+      | t < s || ( t == s && ( clu == Inclusive || s_clu == Exclusive ) )
       = full
+      -- Bound strictly inside the interval: move the start up to the bound.
       | t < e
-      = Interval ( Endpoint ( EarliestTime t ) ( negation clu ) ) ( Endpoint ( LatestTime e ) e_clu ) :<| ivals
-      | t == e && clu == Exclusive && e_clu == Inclusive
+      = Interval ( Endpoint ( EarliestTime t ) clu ) ( Endpoint ( LatestTime e ) e_clu ) :<| ivals
+      -- Bound on the interval end, kept on both sides: only the point @[e,e]@ survives.
+      | t == e && clu == Inclusive && e_clu == Inclusive
       = Interval ( Endpoint ( EarliestTime e ) Inclusive ) ( Endpoint ( LatestTime e ) Inclusive ) :<| ivals
+      -- Bound past the interval: drop it and recurse.
       | otherwise
       = cutBefore' cut ivals
 
+-- | Restrict availability to time not later than the given bound.
 cutAfter :: forall t. Ord t => Endpoint ( LatestTime t ) -> Intervals t -> Intervals t
 cutAfter = coerce cutAfter'
-  where 
+  where
     cutAfter' :: Endpoint ( Time t ) -> Seq ( Interval t ) -> Seq ( Interval t )
     cutAfter' _ Empty = Empty
     cutAfter' cut@( Endpoint t clu ) full@( ivals :|> Interval ( Endpoint ( EarliestTime s ) s_clu ) ( Endpoint ( LatestTime e ) e_clu ) )
-      | e < t || ( e == t && ( clu == Exclusive || e_clu == Exclusive ) )
+      -- Bound at or after the interval end: nothing to cut, keep it whole.
+      | e < t || ( e == t && ( clu == Inclusive || e_clu == Exclusive ) )
       = full
+      -- Bound strictly inside the interval: move the end down to the bound.
       | s < t
-      = ivals :|> Interval ( Endpoint ( EarliestTime s ) s_clu ) ( Endpoint ( LatestTime t ) ( negation clu ) )
-      | s == e && clu == Exclusive && s_clu == Inclusive
+      = ivals :|> Interval ( Endpoint ( EarliestTime s ) s_clu ) ( Endpoint ( LatestTime t ) clu )
+      -- Bound on the interval start, kept on both sides: only the point @[s,s]@ survives.
+      | t == s && clu == Inclusive && s_clu == Inclusive
       = ivals :|> Interval ( Endpoint ( EarliestTime s ) Inclusive ) ( Endpoint ( LatestTime s ) Inclusive )
+      -- Bound before the interval: drop it and recurse.
       | otherwise
       = cutAfter' cut ivals
 
@@ -376,9 +384,11 @@ pruneShorterThan :: forall t. ( Num t, Ord t ) => Delta t -> Intervals t -> Mayb
 pruneShorterThan = coerce pruneShorterThan'
   where
     pruneShorterThan' :: Delta t -> Seq ( Interval t ) -> Maybe ( Seq ( Interval t ), Seq ( Interval t ) )
-    pruneShorterThan' _ Empty = Nothing
-    pruneShorterThan' delta ( ival@( Interval ( Endpoint ( EarliestTime s ) _ ) ( Endpoint ( LatestTime e ) _ ) ) :<| ivals )
-      | ( s --> e ) < delta
-      = Just ( mempty, Seq.singleton ival )  <> pruneShorterThan' delta ivals
-      | otherwise
-      = ( first ( Seq.singleton ival <> ) ) <$> pruneShorterThan' delta ivals
+    pruneShorterThan' delta ivals
+      | null removed = Nothing
+      | otherwise    = Just ( kept, removed )
+      where
+        ( kept, removed ) = Seq.partition longEnough ivals
+        longEnough :: Interval t -> Bool
+        longEnough ( Interval ( Endpoint ( EarliestTime s ) _ ) ( Endpoint ( LatestTime e ) _ ) ) =
+          ( s --> e ) >= delta
