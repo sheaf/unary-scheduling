@@ -1,7 +1,3 @@
-{-# LANGUAGE FlexibleInstances      #-}
-{-# LANGUAGE FunctionalDependencies #-}
-{-# LANGUAGE TypeFamilies           #-}
-
 module Data.Vector.Generic.Index
   ( ReadableVector
     ( unsafeIndex )

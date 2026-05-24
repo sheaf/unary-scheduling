@@ -1,9 +1,4 @@
-{-# LANGUAGE PatternSynonyms #-}
-
-{-# LANGUAGE PartialTypeSignatures #-}
-{-# LANGUAGE NamedWildCards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TypeApplications #-}
 
 module Data.Sequence.Insert
   ( insertIntoSorted )

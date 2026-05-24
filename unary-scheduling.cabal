@@ -38,6 +38,37 @@ common common
   default-language:
     Haskell2010
 
+  default-extensions:
+    BangPatterns
+    BlockArguments
+    ConstraintKinds
+    DataKinds
+    DeriveAnyClass
+    DeriveGeneric
+    DerivingStrategies
+    DerivingVia
+    FlexibleContexts
+    FlexibleInstances
+    FunctionalDependencies
+    GADTs
+    GeneralizedNewtypeDeriving
+    InstanceSigs
+    LambdaCase
+    MagicHash
+    NamedFieldPuns
+    NamedWildCards
+    OverloadedStrings
+    PartialTypeSignatures
+    PatternSynonyms
+    PolyKinds
+    QuantifiedConstraints
+    RankNTypes
+    RecordWildCards
+    StandaloneDeriving
+    TypeApplications
+    TypeFamilyDependencies
+    TypeOperators
+
   ghc-options:
     -O2
     -fspecialise-aggressively

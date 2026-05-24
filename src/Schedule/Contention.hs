@@ -1,19 +1,6 @@
-{-# LANGUAGE DataKinds                  #-}
-{-# LANGUAGE DeriveAnyClass             #-}
-{-# LANGUAGE DeriveGeneric              #-}
-{-# LANGUAGE DerivingVia                #-}
-{-# LANGUAGE FlexibleContexts           #-}
-{-# LANGUAGE FlexibleInstances          #-}
-{-# LANGUAGE FunctionalDependencies     #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE InstanceSigs               #-}
-{-# LANGUAGE NamedFieldPuns             #-}
-{-# LANGUAGE PatternSynonyms            #-}
-{-# LANGUAGE RecordWildCards            #-}
-{-# LANGUAGE ScopedTypeVariables        #-}
-{-# LANGUAGE TypeApplications           #-}
-{-# LANGUAGE UndecidableInstances       #-}
-{-# LANGUAGE ViewPatterns               #-}
+{-# LANGUAGE ScopedTypeVariables  #-}
+{-# LANGUAGE UndecidableInstances #-}
+{-# LANGUAGE ViewPatterns         #-}
 
 module Schedule.Contention where
 
@@ -21,7 +8,7 @@ module Schedule.Contention where
 import Data.Coerce
   ( coerce )
 import Data.Foldable
-  ( fold, foldl' )
+  ( fold )
 import Data.Monoid
   ( Sum(..) )
 import Data.Semigroup
@@ -37,7 +24,7 @@ import Data.Act
 import Data.Map.Strict
   ( Map )
 import qualified Data.Map.Strict as Map
-  ( singleton, fromAscList
+  ( singleton
   , insert, unionWith
   , foldMapWithKey
   )

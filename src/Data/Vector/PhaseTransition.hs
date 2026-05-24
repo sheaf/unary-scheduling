@@ -1,7 +1,3 @@
-{-# LANGUAGE FlexibleInstances      #-}
-{-# LANGUAGE MultiParamTypeClasses  #-}
-{-# LANGUAGE TypeFamilies           #-}
-
 module Data.Vector.PhaseTransition where
 
 -- primitive

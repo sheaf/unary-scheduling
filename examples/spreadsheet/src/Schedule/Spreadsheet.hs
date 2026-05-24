@@ -1,19 +1,5 @@
-{-# LANGUAGE AllowAmbiguousTypes        #-}
-{-# LANGUAGE BlockArguments             #-}
-{-# LANGUAGE ConstraintKinds            #-}
-{-# LANGUAGE DataKinds                  #-}
-{-# LANGUAGE DerivingStrategies         #-}
-{-# LANGUAGE FlexibleContexts           #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE MagicHash                  #-}
-{-# LANGUAGE NamedFieldPuns             #-}
-{-# LANGUAGE NamedWildCards             #-}
-{-# LANGUAGE OverloadedStrings          #-}
-{-# LANGUAGE PartialTypeSignatures      #-}
-{-# LANGUAGE PatternSynonyms            #-}
-{-# LANGUAGE RecordWildCards            #-}
-{-# LANGUAGE ScopedTypeVariables        #-}
-{-# LANGUAGE TypeApplications           #-}
+{-# LANGUAGE AllowAmbiguousTypes #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module Schedule.Spreadsheet
   ( scheduleSpreadsheet, handleError )
