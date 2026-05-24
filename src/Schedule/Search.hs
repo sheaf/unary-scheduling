@@ -8,7 +8,7 @@ module Schedule.Search where
 import Control.Monad
   ( when )
 import Data.List
-  ( sort )
+  ( sortOn )
 import Data.Maybe
   ( mapMaybe, listToMaybe )
 import Data.Ord
@@ -77,6 +77,8 @@ import Data.Vector.Generic.Index
   ( unsafeIndex )
 import Schedule.Constraint
   ( Constraints(..), Constraint(..) )
+import Schedule.Contention
+  ( contentionScore )
 import Schedule.Interval
   ( Endpoint(..) )
 import Schedule.Monad
@@ -92,10 +94,10 @@ import Schedule.Propagators
   ( Propagator, propagationLoop )
 import Schedule.Task
   ( Task, TaskInfos(..), ImmutableTaskInfos
-  , est, ect, lst, lct
+  , est, ect, lct, lst
   )
 import Schedule.Time
-  ( HandedTime(..), Delta(..) )
+  ( Delta(..), HandedTime(..) )
 
 import Debug.Trace
 
@@ -106,6 +108,14 @@ data SearchDecision
   | TryGT
   deriving stock    ( Show, Generic )
   deriving anyclass NFData
+
+-- | How the search chooses the next pair of tasks whose precedence to branch on.
+data BranchHeuristic
+  = Contention
+    -- ^ Branch on the pair of tasks with peak joint contention
+  | WindowCut
+    -- ^ Branch on the pair of tasks whose least disruptive ordering shrinks the task windows most
+  deriving stock ( Show, Eq )
 
 data SearchData task t
   = SearchData
@@ -148,16 +158,17 @@ bestCostSummary _                          = "none"
 
 search
   :: forall task t
-  .  ( Num t, Ord t, Enum t, Bounded t
+  .  ( Num t, Ord t, Real t, Enum t, Bounded t
      , NFData t, NFData task
      , Show t, Show task
      )
   => ( ImmutableTaskInfos task t -> Double )
+  -> BranchHeuristic
   -> Int
   -> [ Propagator task t ]
   -> ImmutableTaskInfos task t
   -> SearchState task t
-search cost maxSolutions propagators = ( `execState` initialState ) . findNextSearchStart
+search cost branchHeuristic maxSolutions propagators = ( `execState` initialState ) . findNextSearchStart
   where
 
     initialState :: SearchState task t
@@ -171,9 +182,14 @@ search cost maxSolutions propagators = ( `execState` initialState ) . findNextSe
       , totalBacktracks     = 0
       }
 
-    -- Find the precedence which would incur the largest adjustment in availability for the two tasks involved.
-    likelihood :: Task task t -> Task task t -> Delta t
-    likelihood tk tk' = min ( totalCut tk tk' ) ( totalCut tk' tk )
+    -- Pick the next precedence to branch on, according to the selected heuristic.
+    nextPrecedence :: Boxed.Vector ( Task task t ) -> OrderingMatrix Unboxed.Vector -> Maybe ( Int, Int )
+    nextPrecedence = case branchHeuristic of
+      Contention -> nextLikeliestPrecedence ( \ tk tk' -> contentionScore tk tk' :: Double )
+      WindowCut  -> nextLikeliestPrecedence windowCut
+
+    windowCut :: Task task t -> Task task t -> Delta t
+    windowCut tk tk' = min ( totalCut tk tk' ) ( totalCut tk' tk )
       where
         totalCut :: Task task t -> Task task t -> Delta t
         totalCut tk_i tk_j =
@@ -197,7 +213,7 @@ search cost maxSolutions propagators = ( `execState` initialState ) . findNextSe
     findNextSearchStart :: MonadState ( SearchState task t ) m => ImmutableTaskInfos task t -> m ()
     findNextSearchStart taskInfos@( TaskInfos { taskAvails, orderings } ) = do
       logSearchProgress
-      case nextLikeliestPrecedence likelihood taskAvails orderings of
+      case nextPrecedence taskAvails orderings of
         -- No further decisions to make: make a note of the solution found and then backtrack to keep searching.
         Nothing -> do
           SearchState { totalSolutionsFound } <- get
@@ -307,7 +323,8 @@ nextLikeliestPrecedence
 nextLikeliestPrecedence likelihood allTasks ( OrderingMatrix { dim, orderingMatrix } )
   = fmap ( \ ( Arg _ v ) -> v )
   . listToMaybe
-  . sort
+  -- Pick the highest-scoring (most-constraining) pair first
+  . sortOn Down
   . mapMaybe
     ( \ ( i, j ) -> case orderingMatrix Unboxed.Vector.! ( upperTriangular dim i j ) of
         Unknown ->

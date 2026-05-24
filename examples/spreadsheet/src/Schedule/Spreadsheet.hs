@@ -171,7 +171,7 @@ import Schedule.Monad
 import Schedule.Ordering
   ( visualiseEdges )
 import Schedule.Search
-  ( SearchState(..), search, addEdge )
+  ( SearchState(..), search, addEdge, BranchHeuristic(..) )
 import Schedule.Task
   ( Task(..), TaskInfos(..)
   , ImmutableTaskInfos
@@ -330,7 +330,7 @@ scheduleSpreadsheet = do
     then do
       let
         searchRes :: SearchState ( Set Staff ) Column
-        searchRes = search totalSchedulingCost 10 propagators afterPropTasks
+        searchRes = search totalSchedulingCost branchHeuristic 10 propagators afterPropTasks
       lift do
         timeNow <- deepseq searchRes Time.getPOSIXTime
         Text.appendFile "search_statistics.txt"
@@ -911,6 +911,7 @@ data Args
   , useMakespanConstraints :: !Bool
   , useZ3                  :: !Bool
   , useVerifyZ3            :: !Bool
+  , branchHeuristic        :: !BranchHeuristic
   }
   deriving stock Show
 
@@ -986,7 +987,7 @@ parseArgs = do
 
     parserInfo :: OptParse.ParserInfo Args
     parserInfo = OptParse.ParserInfo
-      { OptParse.infoParser      = OptParse.helper <*> ( Args <$> inputArg <*> outputArg <*> logArg <*> searchArg <*> makespanArg <*> z3Arg <*> verifyZ3Arg )
+      { OptParse.infoParser      = OptParse.helper <*> ( Args <$> inputArg <*> outputArg <*> logArg <*> searchArg <*> makespanArg <*> z3Arg <*> verifyZ3Arg <*> heuristicArg )
       , OptParse.infoFullDesc    = True
       , OptParse.infoProgDesc    = OptParse.Chunk ( Just desc )
       , OptParse.infoHeader      = OptParse.Chunk ( Just header )
@@ -1053,4 +1054,11 @@ parseArgs = do
       OptParse.switch
         (  OptParse.long "verify-z3"
         <> OptParse.help "Solve with Z3 and check that we accept its solution"
+        )
+
+    heuristicArg :: OptParse.Parser BranchHeuristic
+    heuristicArg =
+      OptParse.flag Contention WindowCut
+        (  OptParse.long "window-cut-heuristic"
+        <> OptParse.help "Branch on the least-disruptive precedence (default: highest resource contention)"
         )

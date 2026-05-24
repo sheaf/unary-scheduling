@@ -8,7 +8,7 @@ module Schedule.Contention where
 import Data.Coerce
   ( coerce )
 import Data.Foldable
-  ( fold )
+  ( fold, toList )
 import Data.Monoid
   ( Sum(..) )
 import Data.Semigroup
@@ -25,7 +25,7 @@ import Data.Map.Strict
   ( Map )
 import qualified Data.Map.Strict as Map
   ( singleton
-  , insert, unionWith
+  , insert
   , foldMapWithKey
   )
 import Data.Sequence
@@ -67,14 +67,12 @@ import Schedule.Interval
   ( Clusivity(..), Endpoint(..)
   , Interval(..), startTime, endTime
   , Intervals(..)
-  , intersection, intersectIntervalsWith
+  , intersectIntervalsWith
   )
 import Schedule.Task
   ( Task(..) )
 import Schedule.Time
-  ( Time, EarliestTime, LatestTime
-  , Delta(..), HandedTime(..)
-  )
+  ( Time(..), Delta(..), HandedTime(..) )
 
 -------------------------------------------------------------------------------
 
@@ -102,30 +100,59 @@ pattern xs :|> x <- ( viewr -> xs :> x )
 --
 -- This is a piecewise-quadratic function, the product
 -- of the tasks' individual piecewise-linear contention functions.
-jointContention :: ( Num t, Real t , Ord t ) => Task task t -> Task task t -> Seq ( Interval t, Quadratic t )
+jointContention
+  :: ( Real t, Ord t, Fractional f )
+  => Task task t -> Task task t -> Seq ( Interval t, Quadratic f )
 jointContention tk1 tk2
   = intersectIntervalsWith multiplyLinear ( taskContention tk1 ) ( taskContention tk2 )
 
--- | Computes the piecewise linear contention function for a single task.
+-- | A scalar criticality score for the relative ordering of two tasks: the peak of
+-- their joint contention. The higher it is, the more the two tasks compete for the
+-- resource, so the search benefits from deciding their order sooner.
+contentionScore
+  :: ( Real t, Ord t, Fractional f, Ord f )
+  => Task task t -> Task task t -> f
+contentionScore tk1 tk2 =
+  maximum $ 0 :
+    [ m
+    | ( ival, q ) <- toList ( jointContention tk1 tk2 )
+    , let Arg m _ = argMaxQuadraticOn ( endpointTime ( startTime ival ) ) ( endpointTime ( endTime ival ) ) q
+    ]
+
+-- | The numeric time of a handed endpoint, in the (fractional) value domain.
+endpointTime :: ( Real t, Fractional f ) => HandedTime h t -> f
+endpointTime = realToFrac . getTime . handedTime
+
+-- | The piecewise-linear contention curve of a single task: for each availability
+-- interval, the (relative) likelihood that the task occupies the resource at a given
+-- instant, assuming a uniformly distributed start time. Normalised by the task's
+-- total scheduling slack so different tasks' curves are comparable; empty when the
+-- task has no slack.
 taskContention
-  :: forall task t
-  .  ( Num t, Real t, Ord t )
-  => Task task t -> Seq ( Interval t, Linear t )
-taskContention ( Task { taskAvailability = Intervals ivals, taskDuration = dur } ) = undefined {-
-  fmap ( \ ( Delta t ) -> realToFrac t / realToFrac totalArea ) controlPoints
+  :: forall task t f
+  .  ( Real t, Ord t, Fractional f )
+  => Task task t -> Seq ( Interval t, Linear f )
+taskContention ( Task { taskAvailability = Intervals ivals, taskDuration = dur } )
+  | totalArea <= 0 = mempty
+  | otherwise      = fmap ( \ ( ival, piece ) -> ( ival, lineOf ival piece ) ) pieces
   where
-    totalArea     :: t
-    controlPoints :: Map ( Time t ) ( Delta t )
-    ( Delta totalArea, controlPoints ) =
-      foldl'
-        ( \ ( totArea, totPoints ) ival ->
-          let
-            ( area, points ) = intervalContention dur ival
-          in
-          ( totArea <> area, Map.unionWith (<>) totPoints points )
-        )
-        mempty ivals
--}
+    contributions :: Seq ( Delta t, Seq ( Interval t, LinearPiece ) )
+    contributions = fmap ( intervalContention dur ) ivals
+    -- Total measure of feasible start times, normalising the curve.
+    totalArea :: t
+    totalArea = getSum ( foldMap ( Sum . getDelta . fst ) contributions )
+    pieces :: Seq ( Interval t, LinearPiece )
+    pieces = foldMap snd contributions
+    durF, areaF :: f
+    durF  = realToFrac ( getDelta dur )
+    areaF = realToFrac totalArea
+    -- A tent piece's slope is ±1/area (or flat at height dur/area), offset so it
+    -- vanishes at the ramp's outer endpoint.
+    lineOf :: Interval t -> LinearPiece -> Linear f
+    lineOf ival piece = case piece of
+      Up   -> Linear (         recip areaF ) ( negate ( endpointTime ( startTime ival ) ) / areaF )
+      Flat -> Linear           0             ( durF / areaF )
+      Down -> Linear ( negate ( recip areaF ) ) (        endpointTime ( endTime ival )   / areaF )
 
 
 data LinearPiece
@@ -240,32 +267,27 @@ multiplyLinear ( Linear { a, b } ) ( Linear { a = a', b = b' } )
 evalQuadratic :: Num t => Quadratic t -> t -> t
 evalQuadratic ( Quadratic { a2, a1, a0 } ) t = a0 + t * ( a1 + t * a2 )
 
+-- | Maximum of a quadratic over @[lo, hi]@, paired with where it is attained.
+-- Checks the endpoints and, for a downward parabola, the vertex if it lies inside
+-- (including the vertex for an upward parabola is harmless: an endpoint then wins).
+argMaxQuadraticOn :: ( Ord f, Fractional f ) => f -> f -> Quadratic f -> Arg f f
+argMaxQuadraticOn lo hi q@( Quadratic { a2, a1 } ) =
+  maximum $ at lo : at hi : [ at v | a2 /= 0, let v = negate a1 / ( 2 * a2 ), lo <= v, v <= hi ]
+  where
+    at x = Arg ( evalQuadratic q x ) x
+
 class Maximisable t f d | t f -> d where
   maximise :: Bounded ( Arg t i ) => Piece t ( Map i f ) -> ArgMax d ( t, i )
 
 instance ( Ord t, Fractional t ) => Maximisable t ( Quadratic t ) t where
   maximise :: forall i. Bounded ( Arg t i ) => Piece t ( Map i ( Quadratic t ) ) -> ArgMax t ( t, i )
-  maximise ( Piece { pieceFunction = summands, pieceStart = t0, pieceEnd = t1 } )
-    | a2 == 0
-    = if a1 >= 0
-      then maximumAt ( Arg ( a0 + a1 * t1 ) t1 )
-      else maximumAt ( Arg ( a0 + a1 * t0 ) t0 )
-    | otherwise
-    = maximumAt
-      $ maximum
-        [ Arg    ( evalQuadratic p t0 )            t0
-        , Arg    ( evalQuadratic p t1 )            t1
-        , Arg ( a0 - 0.25 * a1 * a1 / a2 ) ( - 0.5 * a1 / a2 )
-        ]
+  maximise ( Piece { pieceFunction = summands, pieceStart = t0, pieceEnd = t1 } ) =
+    Max ( Arg m ( x, i ) )
     where
-      a0, a1, a2 :: t
-      p@( Quadratic { a2, a1, a0 } ) = fold summands
-      maximumAt :: Arg t t -> ArgMax t ( t, i )
-      maximumAt ( Arg m x ) = Max ( Arg m ( x, i ) )
-        where
-          i :: i
-          Max ( Arg _ i ) =
-            Map.foldMapWithKey ( \ k q -> Max ( Arg ( evalQuadratic q x ) k ) ) summands
+      Arg m x = argMaxQuadraticOn t0 t1 ( fold summands )
+      -- Attribute the maximum to the summand contributing most there.
+      i :: i
+      Max ( Arg _ i ) = Map.foldMapWithKey ( \ k q -> Max ( Arg ( evalQuadratic q x ) k ) ) summands
 
 instance
      ( Ord t, Ord d, Ord i
