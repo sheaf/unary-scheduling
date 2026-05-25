@@ -11,8 +11,7 @@ module Schedule.Tree
 #endif
   , Propagatable(..)
   , DurationInfo(..), BaseDurationInfo
-  , TTDurationInfo(..), BaseTTDurationInfo
-  , DurationExtraInfo(..), TTDurationExtraInfo(..)
+  , DurationExtraInfo(..)
   )
   where
 
@@ -34,10 +33,7 @@ import Data.Kind
 import Data.Maybe
   ( catMaybes )
 import Data.Semigroup
-  ( Semigroup
-    ( stimes )
-  , Arg(..), Max(..), ArgMax
-  )
+  ( Arg(..), Max(..), ArgMax )
 
 -- acts
 import Data.Act
@@ -46,10 +42,6 @@ import Data.Act
 -- containers
 import Data.IntSet
   ( IntSet )
-import Data.Set
-  ( Set )
-import qualified Data.Set as Set
-  ( disjoint, empty )
 import qualified Data.Tree as Rose
   ( Tree(..) )
 
@@ -334,24 +326,6 @@ deriving stock instance ( Show t, Show ( HandedTime h t )         ) => Show ( Du
 deriving stock instance ( Show t, Show ( HandedTime h t ), Show l ) => Show ( DurationInfo ( MaybeLabelled l ) h t )
 
 ---------------------------------------------
--- Task tree with transition times.
-
--- | Estimation of earliest completion time / latest start time, with added transition times.
--- Assumes there is a fixed transition time between any two distinct transition atoms.
-data TTDurationInfo p h t a
-  = TTDurationInfo
-  { durationInfo    :: !(DurationInfo p h t)
-  , transitionAtoms :: !(Set a)
-  }
-
-type BaseTTDurationInfo = TTDurationInfo Normal
-
-deriving stock instance ( Eq t, Eq a )       => Eq ( TTDurationInfo Normal            h t a )
-deriving stock instance ( Eq t, Eq a, Eq l ) => Eq ( TTDurationInfo (MaybeLabelled l) h t a )
-deriving stock instance ( Show t, Show ( HandedTime h t ), Show a         ) => Show ( TTDurationInfo Normal              h t a )
-deriving stock instance ( Show t, Show ( HandedTime h t ), Show a, Show l ) => Show ( TTDurationInfo ( MaybeLabelled l ) h t a )
-
----------------------------------------------
 -- Coloured task tree.
 
 -- | Estimate of earliest completion time / latest start time, with extra tasks (coloured tasks).
@@ -363,18 +337,7 @@ data DurationExtraInfo h t r
   deriving stock Eq
 deriving stock instance ( Show t, Show (HandedTime h t ), Show r ) => Show ( DurationExtraInfo h t r )
 
----------------------------------------------
--- Coloured task tree with transition times.
-
--- | Estimate of earliest completion time / latest start time, with extra tasks and transition times.
-data TTDurationExtraInfo h t a r
-  = TTDurationExtraInfo
-  {  baseTTDurationInfo :: !(TTDurationInfo Normal            h t a)
-  , extraTTDurationInfo :: !(TTDurationInfo (MaybeLabelled r) h t a)
-  }
-  deriving stock Eq
-deriving stock instance ( Show t, Show (HandedTime h t ), Show a, Show r ) => Show ( TTDurationExtraInfo h t a r )
-
+-- NB: sequence-dependent transition (setup) times are not supported at the moment.
 
 ---------------------------------------------------------------------------------------------------
 -- Methods for propagating the different types of node information defined above.
@@ -402,64 +365,6 @@ instance ( Num t, BoundedLattice ( Endpoint ( HandedTime h t ) ), Act ( Delta t 
       => Monoid ( DurationInfo Normal h t )
       where
   mempty = DurationInfo { subsetInnerTime = top, totalDuration = mempty }
-
----------------------------------------------
--- Task tree with transition times.
-
-class TransitionCost a t where
-  transitionCost :: Delta t
-
-minTransitionCost :: forall a t. ( Num t, TransitionCost a t ) => Int -> Delta t
-minTransitionCost i
-  | i <= 1
-  = mempty
-  | otherwise
-  = stimes ( i - 1 ) ( transitionCost @a )
-
-instance ( Num t, Ord a
-         , TransitionCost a t
-         , Lattice ( Endpoint ( HandedTime h t ) )
-         , Act ( Delta t ) ( HandedTime h t )
-         )
-      => Semigroup ( TTDurationInfo Normal h t a )
-      where
-  (<>)
-    ( TTDurationInfo
-      { durationInfo = DurationInfo { subsetInnerTime = timeL, totalDuration = durL }
-      , transitionAtoms = atomsL
-      }
-    )
-    ( TTDurationInfo
-      { durationInfo = DurationInfo { subsetInnerTime = timeR, totalDuration = durR }
-      , transitionAtoms = atomsR
-      }
-    )
-    = TTDurationInfo
-      { durationInfo =
-        DurationInfo
-          { subsetInnerTime = ( ( durR <> minTransitionCost @a nbAtoms ) • timeL ) /\ timeR
-          -- ect = max ( ectL + durR + tt ) ectR
-          -- lst = min ( lstL - durR - tt ) lstR
-          , totalDuration   = durL <> durR
-          }
-      , transitionAtoms = atomsL <> atomsR
-      }
-    where
-      nbAtoms :: Int
-      nbAtoms
-        | not ( null atomsL ) && Set.disjoint atomsL atomsR
-        = length atomsR + 1
-        | otherwise
-        = length atomsR
-
-instance ( Num t, Ord a
-         , TransitionCost a t
-         , BoundedLattice ( Endpoint ( HandedTime h t ) )
-         , Act ( Delta t ) ( HandedTime h t )
-         )
-      => Monoid ( TTDurationInfo Normal h t a )
-      where
-  mempty = TTDurationInfo { durationInfo = mempty, transitionAtoms = mempty }
 
 ---------------------------------------------
 -- Coloured task tree.
@@ -538,110 +443,3 @@ instance ( Num t, Ord t
           }
       }
 
----------------------------------------------
--- Coloured task tree with transition times.
-
-instance ( Num t, Ord t, Ord a
-         , TransitionCost a t
-         , TotallyOrderedLattice ( Endpoint ( HandedTime h t ) )
-         , Act ( Delta t ) ( HandedTime h t )
-         )
-      => Semigroup ( TTDurationExtraInfo h t a r )
-      where
-  (<>)
-    ( TTDurationExtraInfo
-      { baseTTDurationInfo = baseInfoL@(
-          TTDurationInfo
-            {    durationInfo = DurationInfo { totalDuration =  baseDurationL, subsetInnerTime =  baseTimeL }
-            , transitionAtoms = baseAtomsL
-            } )
-      , extraTTDurationInfo =
-          TTDurationInfo
-            {    durationInfo = mbExtraInfoL
-            , transitionAtoms = extraAtomsL
-            }
-      }
-    )
-    ( TTDurationExtraInfo
-      { baseTTDurationInfo = baseInfoR@(
-          TTDurationInfo
-            {    durationInfo = DurationInfo { totalDuration =  baseDurationR }
-            , transitionAtoms = baseAtomsR
-            } )
-      , extraTTDurationInfo =
-          TTDurationInfo
-            {    durationInfo = mbExtraInfoR
-            , transitionAtoms = extraAtomsR
-            }
-      }
-    )
-    = TTDurationExtraInfo
-    {  baseTTDurationInfo = baseInfoL <> baseInfoR
-    , extraTTDurationInfo =
-      TTDurationInfo
-        { durationInfo =
-          DurationInfo
-            { totalDuration   = mbDurationAndResp
-            , subsetInnerTime = mbInnerTimeAndResp
-            }
-        -- Transition atoms are kept track of differently from the paper:
-        -- ONLY grey information is tabulated in this field
-        -- for the full estimation of minimum transition times, a calculation is done involving the base transition info too
-        , transitionAtoms = extraAtomsL <> extraAtomsR
-        }
-    }
-    where
-      mbDurationAndResp :: Maybe ( Arg ( Delta t ) r )
-      mbDurationAndResp =
-        foldrJusts ( coerce ( (<>) @( ArgMax ( Delta t ) r ) ) )
-          [ totalDuration mbExtraInfoL <&> \ ( Arg extraDurationL extraDurationL_resp ) ->
-            Arg ( extraDurationL <>  baseDurationR ) extraDurationL_resp
-          , totalDuration mbExtraInfoR <&> \ ( Arg extraDurationR extraDurationR_resp ) ->
-            Arg (  baseDurationL <> extraDurationR ) extraDurationR_resp
-          ]
-      mbInnerTimeAndResp :: Maybe ( Arg ( Endpoint ( HandedTime h t ) ) r )
-      mbInnerTimeAndResp =
-        foldrJusts (/.\)
-          [ subsetInnerTime mbExtraInfoR
-          , subsetInnerTime mbExtraInfoL <&> \ ( Arg extraInnerL extraInnerL_resp ) ->
-              Arg ( (  baseDurationR <> minTransitionCost @a baseNbAtoms         ) • extraInnerL )    extraInnerL_resp
-          , totalDuration   mbExtraInfoR <&> \ ( Arg extraDurationR extraDurationR_resp ) ->
-              Arg ( ( extraDurationR <> minTransitionCost @a baseAndExtraNbAtoms ) •   baseTimeL ) extraDurationR_resp
-          ]
-        -- ect* = maximum [ ectR*, ectL* + durR + tt, ectL + durR* + tt* ]
-        -- lst* = minimum [ lstR*, lstL* - durR - tt, lstL - durR* - tt* ]
-      nbAtomsR, baseNbAtoms, baseAndExtraNbAtoms :: Int
-      nbAtomsR = length baseAtomsR
-      ( baseNbAtoms, baseAndExtraNbAtoms ) =
-        case
-          ( not ( null baseAtomsL ) || Set.disjoint baseAtomsL baseAtomsR
-          , Set.disjoint extraAtomsR baseAtomsR
-          , Set.disjoint baseAtomsL extraAtomsR
-          )
-        of
-          ( False, False, _     ) -> ( nbAtomsR    , nbAtomsR     )
-          ( False, True , _     ) -> ( nbAtomsR    , nbAtomsR + 1 )
-          ( True , False, _     ) -> ( nbAtomsR + 1, nbAtomsR + 1 )
-          ( True , True , False ) -> ( nbAtomsR + 1, nbAtomsR + 1 )
-          ( True , True , True  ) -> ( nbAtomsR + 1, nbAtomsR + 2 )
-
-instance ( Num t, Ord t, Ord a
-         , TransitionCost a t
-         , BoundedLattice ( Endpoint ( HandedTime h t ) )
-         , TotallyOrderedLattice ( Endpoint ( HandedTime h t ) )
-         , Act ( Delta t ) ( HandedTime h t )
-         )
-      => Monoid ( TTDurationExtraInfo h t a r )
-      where
-  mempty = TTDurationExtraInfo
-    { baseTTDurationInfo = mempty
-    , extraTTDurationInfo =
-      TTDurationInfo
-        { durationInfo =
-          DurationInfo
-            { subsetInnerTime = Nothing
-            , totalDuration   = Nothing
-            }
-        , transitionAtoms = Set.empty
-        }
-    }
