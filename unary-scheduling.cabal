@@ -219,3 +219,29 @@ test-suite unary-scheduling-test
         >= 1.4   && < 1.6
     , tasty-hunit
         >= 0.10  && < 0.11
+
+test-suite unary-scheduling-z3-test
+
+  import: common
+
+  type:
+    exitcode-stdio-1.0
+
+  hs-source-dirs:
+    z3-test
+
+  main-is:
+    Main.hs
+
+  other-modules:
+    Schedule.Z3.Test
+
+  build-depends:
+      unary-scheduling
+    , z3-oracle
+    , tasty
+        >= 1.4   && < 1.6
+    , tasty-hedgehog
+        >= 1.4   && < 1.5
+    , hedgehog
+        >= 1.2   && < 1.6

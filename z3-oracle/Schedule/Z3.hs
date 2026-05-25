@@ -16,6 +16,8 @@ module Schedule.Z3
   where
 
 -- base
+import Control.Monad
+  ( when )
 import Data.Coerce
   ( Coercible, coerce )
 import Data.Foldable
@@ -26,6 +28,10 @@ import Data.Maybe
   ( catMaybes )
 import Data.Traversable
   ( for )
+
+-- mtl
+import Control.Monad.Reader
+  ( ask )
 
 -- containers
 import Data.Set
@@ -49,6 +55,8 @@ import Schedule.Interval
   ( Clusivity(..), Endpoint(..), Interval(..), Intervals(..), Measurable )
 import Schedule.Monad
   ( runScheduleMonad, SchedulableData )
+import Schedule.Ordering
+  ( Order(Unknown), readOrdering )
 import Schedule.Propagators
   ( Propagator, propagationLoop )
 import Schedule.Search
@@ -163,8 +171,14 @@ verifyAgainstZ3 propagators namedTasks = do
         ti  :: ImmutableTaskInfos task t
         res :: Either Text ()
         ( ti, ( res, _ ) ) =
-          runScheduleMonad namedTasks
-            ( for_ chain ( \ ( a, b ) -> addEdge a b ) *> propagationLoop 1000 propagators )
+          runScheduleMonad namedTasks do
+            -- Only post precedences that aren't already determined, as the
+            -- ordering matrix implementation doesn't deal with redundant edges.
+            TaskInfos { orderings } <- ask
+            for_ chain \ ( a, b ) -> do
+              o <- readOrdering orderings a b
+              when ( o == Unknown ) ( addEdge a b )
+            propagationLoop 1000 propagators
         -- Tasks whose Z3 start time no longer lies within the tightened window.
         violators :: [ Int ]
         violators =
