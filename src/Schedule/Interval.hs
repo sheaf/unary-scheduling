@@ -278,7 +278,7 @@ mkIntervals = Intervals . mergeSorted . Seq.sortOn start . Seq.filter ( not . is
         touchesOrOverlaps
           ( Endpoint ( LatestTime   e1_t ) e1_clu )
           ( Endpoint ( EarliestTime s2_t ) s2_clu )
-            = not $ isEmpty $
+            = isEmpty $
                Interval
                  ( Endpoint ( EarliestTime e1_t ) ( negation e1_clu ) )
                  ( Endpoint ( LatestTime   s2_t ) ( negation s2_clu ) )
