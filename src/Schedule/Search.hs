@@ -1,20 +1,18 @@
 
-{-# LANGUAGE OverloadedStrings     #-}
-{-# LANGUAGE ScopedTypeVariables   #-}
+{-# LANGUAGE OverloadedStrings   #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module Schedule.Search where
 
 -- base
 import Control.Monad
   ( when )
-import Data.List
-  ( sortOn )
-import Data.Maybe
-  ( mapMaybe, listToMaybe )
+import Control.Monad.ST
+  ( ST, runST )
 import Data.Ord
   ( Down(..) )
 import Data.Semigroup
-  ( Arg(..), Sum(..) )
+  ( Arg(..) )
 import GHC.Generics
   ( Generic )
 
@@ -41,38 +39,40 @@ import Control.Lens
 -- generic-lens
 import Data.Generics.Product.Fields
   ( field' )
-import Data.GenericLens.Internal
-  ( over )
 
--- mtl
-import Control.Monad.Reader
-  ( ask )
-import Control.Monad.State.Strict
-  ( MonadState, get, put, modify' )
+-- primitive
+import Data.Primitive.MutVar
+  ( newMutVar, readMutVar, writeMutVar, modifyMutVar' )
 
 -- text
 import Data.Text
   ( Text )
 
 -- transformers
+import Control.Monad.Reader
+  ( ask )
+import Control.Monad.Trans.Reader
+  ( runReaderT )
+import Control.Monad.Trans.Except
+  ( runExceptT )
 import Control.Monad.Trans.State.Strict
-  ( execState )
+  ( runStateT )
 
 -- vector
-import qualified Data.Vector as Boxed
-  ( Vector )
 import qualified Data.Vector as Boxed.Vector
   ( (!) )
-import qualified Data.Vector.Unboxed as Unboxed
-  ( Vector )
-import qualified Data.Vector.Unboxed as Unboxed.Vector
-  ( (!), foldr )
+import qualified Data.Vector.Mutable as Boxed.MVector
+  ( unsafeRead )
+import qualified Data.Vector.Unboxed.Mutable as Unboxed.MVector
+  ( unsafeRead )
 
 -- unary-scheduling
 import qualified Data.Sequence.Insert as Seq
   ( insertIntoSorted )
 import Data.Vector.Generic.Index
   ( unsafeIndex )
+import Data.Vector.PhaseTransition
+  ( Freeze(freeze), Thaw(thaw) )
 import Schedule.Constraint
   ( Constraint(..), tightenMany )
 import Schedule.Contention
@@ -81,7 +81,7 @@ import Schedule.Interval
   ( Endpoint(..), Measurable )
 import Schedule.Monad
   ( MonadSchedule
-  , runScheduleMonad, constrain
+  , constrain
   )
 import Schedule.Ordering
   ( Order(..)
@@ -96,16 +96,15 @@ import Schedule.Task
   )
 import Schedule.Time
   ( Delta(..), HandedTime(..) )
+import Schedule.Trail
+  ( Trail, newTrail, currentMark, undoTo
+  , orderingCellWriter
+  )
 
 import Debug.Trace
+  ( traceM )
 
 -------------------------------------------------------------------------------
-
-data SearchDecision
-  = TryLT
-  | TryGT
-  deriving stock    ( Show, Generic )
-  deriving anyclass NFData
 
 -- | How the search chooses the next pair of tasks whose precedence to branch on.
 data BranchHeuristic
@@ -115,34 +114,33 @@ data BranchHeuristic
     -- ^ Branch on the pair of tasks whose least disruptive ordering shrinks the task windows most
   deriving stock ( Show, Eq )
 
-data SearchData task t
-  = SearchData
-  { searchTasks    :: !( ImmutableTaskInfos task t )
-  , searchDecision :: !( Int, Int )
-  }
-  deriving stock    ( Show, Generic )
-  deriving anyclass NFData
-
 data SolutionCost
   = FullSolution    Double
   | PartialSolution Int
   deriving stock    ( Eq, Ord, Show, Generic )
   deriving anyclass NFData
 
+-- | Search state.
 data SearchState task t
   = SearchState
-  { pastDecisions       :: [ SearchData task t ]
-  , solutions           :: Seq ( Arg ( Down SolutionCost ) ( ImmutableTaskInfos task t ) )
+  { solutions           :: Seq ( Arg ( Down SolutionCost ) ( ImmutableTaskInfos task t ) )
   , totalSolutionsFound :: !Int
   , totalDecisionsTaken :: !Int
 
-    -- Debug instrumentation
+    -- Debug instrumentation (TODO: split this off)
   , openDepth           :: !Int -- ^ current number of open backtrack points (decision-stack depth)
   , maxOpenDepth        :: !Int -- ^ largest decision-stack depth reached so far
   , totalBacktracks     :: !Int -- ^ number of times the search has backtracked
   }
   deriving stock    ( Show, Generic )
   deriving anyclass NFData
+
+-- | A backtracking choice point.
+--
+-- Records the trail mark of the /parent/ state and the precedence pair @(i,j)@
+-- whose @ T_j < T_i @ alternative is still to be explored (the @ T_i < T_j @
+-- alternative having been tried first).
+data Frame = Frame !Int !Int !Int
 
 -- | How often (counted in decisions) the search emits a progress trace.
 -- Set to @0@ to disable progress tracing.
@@ -154,6 +152,8 @@ bestCostSummary :: Seq ( Arg ( Down SolutionCost ) x ) -> String
 bestCostSummary ( _ :|> Arg ( Down c ) _ ) = show c
 bestCostSummary _                          = "none"
 
+-- | Chronological backtracking search over task precedences, using one shared
+-- mutable state with in-place undo.
 search
   :: forall task t
   .  ( Num t, Measurable t, Real t, Enum t, Bounded t
@@ -166,25 +166,53 @@ search
   -> [ Propagator task t ]
   -> ImmutableTaskInfos task t
   -> SearchState task t
-search cost branchHeuristic maxSolutions propagators = ( `execState` initialState ) . findNextSearchStart
-  where
-
+search cost branchHeuristic maxSolutions propagators initialTasks = runST \ @s -> do
+  let
     initialState :: SearchState task t
     initialState = SearchState
-      { pastDecisions       = []
-      , solutions           = Empty
+      { solutions           = Empty
       , totalSolutionsFound = 0
       , totalDecisionsTaken = 0
       , openDepth           = 0
       , maxOpenDepth        = 0
       , totalBacktracks     = 0
       }
+  tis    <- thaw initialTasks
+  trail  <- newTrail
+  stRef  <- newMutVar initialState
+  stkRef <- newMutVar @_ @[ Frame ] []
 
-    -- Pick the next precedence to branch on, according to the selected heuristic.
-    nextPrecedence :: Boxed.Vector ( Task task t ) -> OrderingMatrix Unboxed.Vector -> Maybe ( Int, Int )
-    nextPrecedence = case branchHeuristic of
-      Contention -> nextLikeliestPrecedence ( \ tk tk' -> contentionScore tk tk' :: Double )
-      WindowCut  -> nextLikeliestPrecedence windowCut
+  -- Pick the next undecided precedence to branch on.
+  let
+    pickWith
+      :: forall o
+      .  Ord o
+      => ( Task task t -> Task task t -> o )
+      -> ST s ( Maybe ( Int, Int ) )
+    pickWith likelihood = loop 0 1 Nothing
+      where
+        OrderingMatrix { dim, orderingMatrix = mat } = orderings tis
+        tasks = taskAvails tis
+        loop :: Int -> Int -> Maybe ( Arg o ( Int, Int ) ) -> ST s ( Maybe ( Int, Int ) )
+        loop i j best
+          | i >= dim  = pure ( fmap ( \ ( Arg _ ij ) -> ij ) best )
+          | j >= dim  = loop ( i + 1 ) ( i + 2 ) best
+          | otherwise = do
+              o <- Unboxed.MVector.unsafeRead mat ( upperTriangular dim i j )
+              best' <- case o of
+                Unknown -> do
+                  tk_i <- Boxed.MVector.unsafeRead tasks i
+                  tk_j <- Boxed.MVector.unsafeRead tasks j
+                  let cand = Arg ( likelihood tk_i tk_j ) ( i, j )
+                  -- 'Arg' compares on the score only; ties keep the earlier
+                  -- (smaller-index) pair, matching the previous selection order.
+                  pure $ Just $ maybe cand ( max cand ) best
+                _ -> pure best
+              loop i ( j + 1 ) best'
+
+  let
+    maxIter :: Int
+    maxIter = 1000
 
     windowCut :: Task task t -> Task task t -> Delta t
     windowCut tk tk' = min ( totalCut tk tk' ) ( totalCut tk' tk )
@@ -195,10 +223,42 @@ search cost branchHeuristic maxSolutions propagators = ( `execState` initialStat
           <>
           max mempty ( handedTime ( endpoint ( est tk_j ) ) --> handedTime ( endpoint ( ect tk_i ) ) )
 
-    -- Emit a periodic progress trace (every 'traceEvery' decisions).
-    logSearchProgress :: MonadState ( SearchState task t ) m => m ()
-    logSearchProgress = do
-      st <- get
+    nextPrecedenceM :: ST s ( Maybe ( Int, Int ) )
+    nextPrecedenceM = case branchHeuristic of
+      Contention -> pickWith @Double      contentionScore
+      WindowCut  -> pickWith @( Delta t ) windowCut
+
+    -- Count remaining undecided precedences (for the partial-solution cost).
+    remainingUnknownsM :: ST s Int
+    remainingUnknownsM = countFrom 0 0
+      where
+        OrderingMatrix { dim, orderingMatrix = mat } = orderings tis
+        n = ( dim * ( dim - 1 ) ) `div` 2
+        countFrom k acc
+          | k >= n    = pure acc
+          | otherwise = do
+              o <- Unboxed.MVector.unsafeRead mat k
+              countFrom ( k + 1 ) ( if o == Unknown then acc + 1 else acc )
+
+    -- Apply a precedence @ T_a < T_b @ and propagate.
+    -- Returns @Left@ on conflict; mutations remain on the trail, to be
+    -- undone by backtracking.
+    stepNode :: Int -> Int -> ST s ( Either Text () )
+    stepNode a b = do
+      ( res, _ ) <-
+        runStateT
+          ( runExceptT
+            ( runReaderT
+                ( addEdge trail a b *> propagationLoop maxIter trail propagators )
+                tis
+            )
+          )
+          mempty
+      pure res
+
+    logProgress :: ST s ()
+    logProgress = do
+      st <- readMutVar stRef
       when ( traceEvery > 0 && totalDecisionsTaken st `mod` traceEvery == 0 ) $
         traceM $ "[search] decisions=" <> show ( totalDecisionsTaken st )
               <> " openDepth="    <> show ( openDepth st )
@@ -207,85 +267,86 @@ search cost branchHeuristic maxSolutions propagators = ( `execState` initialStat
               <> " backtracks="   <> show ( totalBacktracks st )
               <> " best="         <> bestCostSummary ( solutions st )
 
-    -- Search for the next precedence decision that can be taken.
-    findNextSearchStart :: MonadState ( SearchState task t ) m => ImmutableTaskInfos task t -> m ()
-    findNextSearchStart taskInfos@( TaskInfos { taskAvails, orderings } ) = do
-      logSearchProgress
-      case nextPrecedence taskAvails orderings of
-        -- No further decisions to make: make a note of the solution found and then backtrack to keep searching.
-        Nothing -> do
-          SearchState { totalSolutionsFound } <- get
-          modify'
-            $ over ( field' @"solutions" )
-                ( trace ( "found solution #" <> show ( totalSolutionsFound + 1 ) <> "\n" )
-                $ insertSolution maxSolutions taskInfos ( FullSolution $ cost taskInfos )
-                )
-          backtrack
-        -- A further search decision can be made:
-        --  - make a search decision and compute its effect,
-        --  - if the search can continue, add the decisions to the search state to enable backtracking.
-        -- Choose the @ < @ decision first, as @ > @ is chosen only after backtracking.
-        Just ( i, j ) -> decide TryLT i j taskInfos
+    -- Would a solution of the given cost actually be kept?
+    wouldInsert :: SolutionCost -> Seq ( Arg ( Down SolutionCost ) ( ImmutableTaskInfos task t ) ) -> Bool
+    wouldInsert curCost sols = case sols of
+      Empty -> maxSolutions > 0
+      ( Arg ( Down worstCost ) _ :<| _ ) ->
+        Seq.length sols < maxSolutions || curCost < worstCost
 
-    -- Take a decision: add a precedence, and if there were other choices that could have been made,
-    -- add a point to backtrack to so that the search can continue with the other decisions.
-    decide :: MonadState ( SearchState task t ) m => SearchDecision -> Int -> Int -> ImmutableTaskInfos task t -> m ()
-    decide decToTry i j currentTasks = do
+    recordFull :: ST s ()
+    recordFull = do
+      st   <- readMutVar stRef
+      snap <- freeze tis
+      let c = FullSolution ( cost snap )
+      traceM ( "found solution #" <> show ( totalSolutionsFound st + 1 ) )
+      writeMutVar stRef
+        st { solutions = insertSolution maxSolutions snap c ( solutions st ) }
 
-      next <- case decToTry of
-        TryLT -> do
-          let
-            -- We are always trying @ T_i < T_j @ before @ T_i > T_j @.
-            -- Hence, if we are currently trying @ < @, then provide a backtracking point for @ > @.
-            backtrackPoint :: SearchData task t
-            backtrackPoint = SearchData { searchTasks = currentTasks, searchDecision = ( i, j ) }
-          modify' \ s ->
-            s { pastDecisions       = backtrackPoint : pastDecisions s
-              , totalDecisionsTaken = totalDecisionsTaken s + 1
-              , openDepth           = openDepth s + 1
-              , maxOpenDepth        = max ( maxOpenDepth s ) ( openDepth s + 1 )
-              }
-          pure $ runScheduleMonad currentTasks ( addEdge i j *> propagationLoop 1000 propagators )
-        TryGT -> do
-          -- Don't provide a backtracking point:
-          -- at this stage we should have already tried @ T_i < T_j @.
-          modify' \ s ->
-            s { totalDecisionsTaken = totalDecisionsTaken s + 1 }
-          pure $ runScheduleMonad currentTasks ( addEdge j i *> propagationLoop 1000 propagators )
-      case next of
-        -- No results possible: backtrack.
-        ( _, ( Left _err, _ ) ) -> do
-          let
-            remainingUnknowns :: Int
-            remainingUnknowns
-              = getSum
-              . Unboxed.Vector.foldr ( (<>) . ( \case { Unknown -> 1 ; _ -> 0 } ) ) mempty
-              $ ( orderingMatrix . orderings $ currentTasks )
-          --pastDecs <- ( map searchDecision . pastDecisions ) <$> get
-          modify'
-            $ over ( field' @"solutions" )
-                ( insertSolution maxSolutions currentTasks ( PartialSolution $ remainingUnknowns ) )
-          --trace ( "backtracking from depth " <> show ( length pastDecs ) <> "\n" )
-          backtrack
-        -- Search can continue: keep going.
-        ( newTaskData, _ ) ->
-          findNextSearchStart newTaskData
+    recordPartial :: ST s ()
+    recordPartial = do
+      st        <- readMutVar stRef
+      remaining <- remainingUnknownsM
+      let c = PartialSolution remaining
+      when ( wouldInsert c ( solutions st ) ) do
+        snap <- freeze tis
+        writeMutVar stRef
+          st { solutions = insertSolution maxSolutions snap c ( solutions st ) }
 
-    backtrack :: MonadState ( SearchState task t ) m => m ()
+    -- Find the next decision from the current (live) state.
+    findNext :: ST s ()
+    findNext = do
+      logProgress
+      mb <- nextPrecedenceM
+      case mb of
+        -- No undecided precedence left: a full solution. Record it and
+        -- backtrack to keep searching for cheaper solutions.
+        Nothing -> recordFull *> backtrack
+        -- Branch: try @ T_i < T_j @ first, pushing a choice point for the
+        -- @ T_j < T_i @ alternative.
+        Just ( i, j ) -> do
+          m <- currentMark trail
+          modifyMutVar' stkRef ( Frame m i j : )
+          modifyMutVar' stRef \ st ->
+            st { totalDecisionsTaken = totalDecisionsTaken st + 1
+               , openDepth           = openDepth st + 1
+               , maxOpenDepth        = max ( maxOpenDepth st ) ( openDepth st + 1 )
+               }
+          res <- stepNode i j
+          case res of
+            Left  _ -> failBranch m
+            Right _ -> findNext
+
+    -- Pop a choice point and try its second (@ T_j < T_i @) alternative.
+    backtrack :: ST s ()
     backtrack = do
-      oldSearchState@( SearchState { pastDecisions = decs } ) <- get
-      case decs of
-        -- Nothing to backtrack to: finish.
+      stk <- readMutVar stkRef
+      case stk of
         [] -> pure ()
-        -- Found a point to backtrack to.
-        ( SearchData { searchTasks, searchDecision = ( i, j ) } : prevDecs ) -> do
-          put oldSearchState
-            { pastDecisions   = prevDecs
-            , openDepth       = openDepth oldSearchState - 1
-            , totalBacktracks = totalBacktracks oldSearchState + 1
-            }
-          -- Try the @ T_i > T_j @ precedence now (the search should have already tried the other decision).
-          decide TryGT i j searchTasks
+        ( Frame m i j : rest ) -> do
+          writeMutVar stkRef rest
+          modifyMutVar' stRef \ st ->
+            st { openDepth       = openDepth st - 1
+               , totalBacktracks = totalBacktracks st + 1
+               }
+          undoTo trail tis m
+          modifyMutVar' stRef \ st ->
+            st { totalDecisionsTaken = totalDecisionsTaken st + 1 }
+          res <- stepNode j i
+          case res of
+            Left  _ -> failBranch m
+            Right _ -> findNext
+
+    -- A branch failed: restore the parent state, record it as a partial
+    -- solution, and continue backtracking.
+    failBranch :: Int -> ST s ()
+    failBranch m = do
+      undoTo trail tis m
+      recordPartial
+      backtrack
+
+  findNext
+  readMutVar stRef
 
 -- | Insert a solution, bumping off old too-costly solutions if we exceed the maximum number of solutions.
 insertSolution :: Ord cost => Int -> sol -> cost -> Seq ( Arg ( Down cost ) sol ) -> Seq ( Arg ( Down cost ) sol )
@@ -307,35 +368,6 @@ insertSolution maxSolutions currentSolution currentCost prevSols@( Arg ( Down wo
       then sols
       else ( Arg ( Down worstCost ) worstSol ) :<| sols
 
-
--- | Obtain the indices for the most likely unknown precedence.
-nextLikeliestPrecedence
-  :: forall task t o
-  .  ( Num t, Ord t, Bounded t
-     , Ord o
-     )
-  => ( Task task t -> Task task t -> o )
-  -> Boxed.Vector ( Task task t )
-  -> OrderingMatrix Unboxed.Vector
-  -> Maybe ( Int, Int )
-nextLikeliestPrecedence likelihood allTasks ( OrderingMatrix { dim, orderingMatrix } )
-  = fmap ( \ ( Arg _ v ) -> v )
-  . listToMaybe
-  -- Pick the highest-scoring (most-constraining) pair first
-  . sortOn Down
-  . mapMaybe
-    ( \ ( i, j ) -> case orderingMatrix Unboxed.Vector.! ( upperTriangular dim i j ) of
-        Unknown ->
-          let
-            tk_i, tk_j :: Task task t
-            tk_i = allTasks Boxed.Vector.! i
-            tk_j = allTasks Boxed.Vector.! j
-          in
-            Just $ Arg ( likelihood tk_i tk_j ) ( i, j )
-        _ -> Nothing
-    )
-  $ [ ( i, j ) | i <- [ 0 .. dim - 1 ], j <- [ i + 1 .. dim - 1 ] ]
-
 -- | Add a precedence in the ordering matrix,
 -- inducing precedence constraints on all resulting transitive edges.
 addEdge
@@ -343,11 +375,12 @@ addEdge
   .  ( MonadSchedule s task t m
      , Num t, Measurable t, Bounded t
      )
-  => Int
+  => Trail s task t
+  -> Int
   -> Int
   -> m ()
-addEdge start end = do
-  TaskInfos { taskNames, taskAvails, orderings } <- ask
+addEdge trail start end = do
+  tis@( TaskInfos { taskNames, taskAvails, orderings } ) <- ask
 
   modifying ( field' @"taskConstraints" . field' @"justifications" )
     ( <>
@@ -359,6 +392,7 @@ addEdge start end = do
     addEdges :: m ()
     addEdges =
       addIncidentEdgesTransitively
+        ( orderingCellWriter trail tis )
         propagateNewEdge errorMessage
         orderings
         end ( IntSet.singleton start ) ( mempty )

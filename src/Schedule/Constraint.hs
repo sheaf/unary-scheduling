@@ -46,7 +46,7 @@ import Data.Text
 
 -- vector
 import qualified Data.Vector.Mutable as Boxed.MVector
-  ( unsafeRead, unsafeWrite )
+  ( unsafeRead )
 
 -- unary-scheduling
 import Data.Lattice
@@ -64,6 +64,11 @@ import Schedule.Ordering
 import Schedule.Task
   ( Task(..), TaskInfos(..), MutableTaskInfos
   , est, lct, lst, ect
+  )
+import Schedule.Trail
+  ( Trail
+  , recordSetTask, rankSwapper, orderingCellWriter
+  , RankKind(..), RankVec(..)
   )
 import Schedule.Time
   ( Handedness
@@ -185,12 +190,13 @@ applyConstraints
      -- debugging
      , Show t, Show task
      )
-  => Constraints t
+  => Trail s task t
+  -> Constraints t
   -> m ( IntMap ( Bool, Bool ) )
-applyConstraints ( Constraints { constraints, precedences } ) = do
+applyConstraints trail ( Constraints { constraints, precedences } ) = do
   taskInfos@( TaskInfos { orderings } ) <- ask
-  itraverse_ ( uncurry . addIncidentEdges orderings ) precedences
-  IntMap.traverseWithKey ( applyConstraint taskInfos ) constraints
+  itraverse_ ( uncurry . addIncidentEdges ( orderingCellWriter trail taskInfos ) orderings ) precedences
+  IntMap.traverseWithKey ( applyConstraint trail taskInfos ) constraints
 
 applyConstraint
   :: ( PrimMonad m, PrimState m ~ s
@@ -198,17 +204,18 @@ applyConstraint
      -- debugging
      , Show t, Show task
      )
-  => MutableTaskInfos s task t
+  => Trail s task t
+  -> MutableTaskInfos s task t
   -> Int
   -> Constraint t
   -> m ( Bool, Bool )
-applyConstraint _ _ NoConstraint = pure ( False, False )
-applyConstraint taskInfos i ( Constraint { .. } ) = do
+applyConstraint _ _ _ NoConstraint = pure ( False, False )
+applyConstraint trail taskInfos i ( Constraint { .. } ) = do
   -- apply 'constrain to inside' first (useful in case restriction is not checked)
-  ( l1, r1 ) <- fromMaybe ( False, False ) <$> traverse ( constrainToInside  taskInfos i ) inside
-  l2         <- fromMaybe False            <$> traverse ( constrainToAfter   taskInfos i ) notEarlierThan
-  r2         <- fromMaybe False            <$> traverse ( constrainToBefore  taskInfos i ) notLaterThan
-  ( l3, r3 ) <- fromMaybe ( False, False ) <$> traverse ( constrainToOutside taskInfos i ) outside
+  ( l1, r1 ) <- fromMaybe ( False, False ) <$> traverse ( constrainToInside  trail taskInfos i ) inside
+  l2         <- fromMaybe False            <$> traverse ( constrainToAfter   trail taskInfos i ) notEarlierThan
+  r2         <- fromMaybe False            <$> traverse ( constrainToBefore  trail taskInfos i ) notLaterThan
+  ( l3, r3 ) <- fromMaybe ( False, False ) <$> traverse ( constrainToOutside trail taskInfos i ) outside
   pure ( l1 || l2 || l3, r1 || r2 || r3 )
 
 -------------------------------------------------------------------------------
@@ -228,20 +235,21 @@ constrainToAfter
   :: ( Num t, Ord t, Bounded t
      , PrimMonad m, PrimState m ~ s
      )
-  => MutableTaskInfos s task t
+  => Trail s task t
+  -> MutableTaskInfos s task t
   -> Int
   -> Endpoint ( EarliestTime t )
   -> m Bool
-constrainToAfter ( TaskInfos { taskAvails, rankingEST, rankingECT } ) taskNo t = do
+constrainToAfter trail tis@( TaskInfos { taskAvails, rankingEST, rankingECT } ) taskNo t = do
   task@(Task { taskAvailability }) <- Boxed.MVector.unsafeRead taskAvails taskNo
   let
     newTaskAvailability = cutBefore t taskAvailability
     newTask = task { taskAvailability = newTaskAvailability }
   if est newTask > est task
   then do
-    Boxed.MVector.unsafeWrite taskAvails taskNo newTask
-    reorderAfterIncrease taskAvails rankingEST est taskNo
-    reorderAfterIncrease taskAvails rankingECT ect taskNo
+    recordSetTask trail tis taskNo newTask
+    reorderAfterIncrease ( rankSwapper trail tis ( Ordered ByEST ) ) ( rankSwapper trail tis ( Ranks ByEST ) ) taskAvails rankingEST est taskNo
+    reorderAfterIncrease ( rankSwapper trail tis ( Ordered ByECT ) ) ( rankSwapper trail tis ( Ranks ByECT ) ) taskAvails rankingECT ect taskNo
     pure True
   else
     pure False
@@ -251,20 +259,21 @@ constrainToBefore
   :: ( Num t, Ord t, Bounded t
      , PrimMonad m, PrimState m ~ s
      )
-  => MutableTaskInfos s task t
+  => Trail s task t
+  -> MutableTaskInfos s task t
   -> Int
   -> Endpoint ( LatestTime t )
   -> m Bool
-constrainToBefore ( TaskInfos { taskAvails, rankingLCT, rankingLST } ) taskNo t = do
+constrainToBefore trail tis@( TaskInfos { taskAvails, rankingLCT, rankingLST } ) taskNo t = do
   task@(Task { taskAvailability }) <- Boxed.MVector.unsafeRead taskAvails taskNo
   let
     newTaskAvailability = cutAfter t taskAvailability
     newTask = task { taskAvailability = newTaskAvailability }
   if lct newTask < lct task
   then do
-    Boxed.MVector.unsafeWrite taskAvails taskNo newTask
-    reorderAfterDecrease taskAvails rankingLCT lct taskNo
-    reorderAfterDecrease taskAvails rankingLST lst taskNo
+    recordSetTask trail tis taskNo newTask
+    reorderAfterDecrease ( rankSwapper trail tis ( Ordered ByLCT ) ) ( rankSwapper trail tis ( Ranks ByLCT ) ) taskAvails rankingLCT lct taskNo
+    reorderAfterDecrease ( rankSwapper trail tis ( Ordered ByLST ) ) ( rankSwapper trail tis ( Ranks ByLST ) ) taskAvails rankingLST lst taskNo
     pure True
   else
     pure False
@@ -274,29 +283,30 @@ constrainToOutside
   :: ( Num t, Ord t, Bounded t
      , PrimMonad m, PrimState m ~ s
      )
-  => MutableTaskInfos s task t
+  => Trail s task t
+  -> MutableTaskInfos s task t
   -> Int
   -> Intervals t
   -> m ( Bool, Bool )
-constrainToOutside ( TaskInfos { .. } ) taskNo ( Intervals ivalsToRemove ) = do
+constrainToOutside trail tis@( TaskInfos { .. } ) taskNo ( Intervals ivalsToRemove ) = do
   task@(Task { taskAvailability }) <- Boxed.MVector.unsafeRead taskAvails taskNo
   let
     newAvailability = foldl' remove taskAvailability ivalsToRemove
     newTask = task { taskAvailability = newAvailability }
-  Boxed.MVector.unsafeWrite taskAvails taskNo newTask
+  recordSetTask trail tis taskNo newTask
   l <-
     if est newTask > est task
     then do
-      reorderAfterIncrease taskAvails rankingEST est taskNo
-      reorderAfterIncrease taskAvails rankingECT ect taskNo
+      reorderAfterIncrease ( rankSwapper trail tis ( Ordered ByEST ) ) ( rankSwapper trail tis ( Ranks ByEST ) ) taskAvails rankingEST est taskNo
+      reorderAfterIncrease ( rankSwapper trail tis ( Ordered ByECT ) ) ( rankSwapper trail tis ( Ranks ByECT ) ) taskAvails rankingECT ect taskNo
       pure True
     else
       pure False
   r <-
     if lct newTask < lct task
     then do
-      reorderAfterDecrease taskAvails rankingLCT lct taskNo
-      reorderAfterDecrease taskAvails rankingLST lst taskNo
+      reorderAfterDecrease ( rankSwapper trail tis ( Ordered ByLCT ) ) ( rankSwapper trail tis ( Ranks ByLCT ) ) taskAvails rankingLCT lct taskNo
+      reorderAfterDecrease ( rankSwapper trail tis ( Ordered ByLST ) ) ( rankSwapper trail tis ( Ranks ByLST ) ) taskAvails rankingLST lst taskNo
       pure True
     else
       pure False
@@ -307,28 +317,29 @@ constrainToInside
   :: ( Num t, Measurable t, Bounded t
      , PrimMonad m, PrimState m ~ s
      )
-  => MutableTaskInfos s task t
+  => Trail s task t
+  -> MutableTaskInfos s task t
   -> Int
   -> Intervals t
   -> m ( Bool, Bool )
-constrainToInside ( TaskInfos { .. } ) taskNo shrunkDomain = do
+constrainToInside trail tis@( TaskInfos { .. } ) taskNo shrunkDomain = do
   task@( Task { taskAvailability = oldDomain } ) <- Boxed.MVector.unsafeRead taskAvails taskNo
   let
     newTask = task { taskAvailability = oldDomain /\ shrunkDomain }
-  Boxed.MVector.unsafeWrite taskAvails taskNo newTask
+  recordSetTask trail tis taskNo newTask
   l <-
     if est newTask > est task
     then do
-      reorderAfterIncrease taskAvails rankingEST est taskNo
-      reorderAfterIncrease taskAvails rankingECT ect taskNo
+      reorderAfterIncrease ( rankSwapper trail tis ( Ordered ByEST ) ) ( rankSwapper trail tis ( Ranks ByEST ) ) taskAvails rankingEST est taskNo
+      reorderAfterIncrease ( rankSwapper trail tis ( Ordered ByECT ) ) ( rankSwapper trail tis ( Ranks ByECT ) ) taskAvails rankingECT ect taskNo
       pure True
     else
       pure False
   r <-
     if lct newTask < lct task
     then do
-      reorderAfterDecrease taskAvails rankingLCT lct taskNo
-      reorderAfterDecrease taskAvails rankingLST lst taskNo
+      reorderAfterDecrease ( rankSwapper trail tis ( Ordered ByLCT ) ) ( rankSwapper trail tis ( Ranks ByLCT ) ) taskAvails rankingLCT lct taskNo
+      reorderAfterDecrease ( rankSwapper trail tis ( Ordered ByLST ) ) ( rankSwapper trail tis ( Ranks ByLST ) ) taskAvails rankingLST lst taskNo
       pure True
     else
       pure False

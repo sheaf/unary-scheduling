@@ -102,7 +102,7 @@ genInstance = do
 -- Properties.
 
 prop_propagation_sound_vs_z3 :: Property
-prop_propagation_sound_vs_z3 = withTests 100 $ property do
+prop_propagation_sound_vs_z3 = withTests 1000 $ property do
   namedTasks <- forAll genInstance
   verdict    <- evalIO ( verifyAgainstZ3 basicPropagators namedTasks )
   case verdict of

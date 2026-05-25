@@ -121,6 +121,8 @@ import Schedule.Task
   , MutableTaskInfos, ImmutableTaskInfos
   , est, lct, ect, lst
   )
+import Schedule.Trail
+  ( Trail, newTrail )
 import Schedule.Tree
   ( Propagatable
       ( overloaded )
@@ -170,17 +172,21 @@ type MonadSchedule s task t m =
     ) :: Constraint
   )
 
+-- | Run a one-shot scheduling computation: thaw a fresh mutable state, run the
+-- given action, and freeze the result.
 runScheduleMonad
   :: forall task t taskData a
   .  ( Num t, Measurable t, Bounded t
      , SchedulableData taskData task t
      )
   => taskData
-  -> ( forall s. ScheduleMonad s task t a )
+  -> ( forall s. Trail s task t -> ScheduleMonad s task t a )
+      -- ^ Action to run. Supplied with a fresh 'Trail' for backtracking.
   -> ( ImmutableTaskInfos task t, ( Either Text a, Constraints t ) )
-runScheduleMonad givenTasks ma = runST do
+runScheduleMonad givenTasks k = runST do
   mutableTaskInfos <- initialTaskData givenTasks
-  res <- ma & ( ( `runReaderT` mutableTaskInfos ) >>> runExceptT >>> ( `runStateT` mempty ) )
+  trail            <- newTrail
+  res <- k trail & ( ( `runReaderT` mutableTaskInfos ) >>> runExceptT >>> ( `runStateT` mempty ) )
   finalTaskData <- unsafeFreeze mutableTaskInfos
   pure ( finalTaskData, second taskConstraints res )
 

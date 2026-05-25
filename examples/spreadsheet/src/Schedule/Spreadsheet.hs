@@ -299,7 +299,7 @@ scheduleSpreadsheet = do
             res :: Either Text ()
             ( ti, ( res, _ ) ) =
               runScheduleMonad schedulingTasks
-                ( for_ chain ( \ ( a, b ) -> addEdge a b ) *> propagationLoop 1000 propagators )
+                ( \ trail -> for_ chain ( \ ( a, b ) -> addEdge trail a b ) *> propagationLoop 1000 trail propagators )
             -- Tasks for which the Z3 start no longer lies within the tightened window.
             violators :: [ Text ]
             violators =

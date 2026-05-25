@@ -187,14 +187,23 @@ upperTriangular :: Int -> Int -> Int -> Int
 upperTriangular d i j = j - 1 + i * d - ( ( ( i + 3 ) * i ) `shiftR` 1 )
 
 -- | Mutate ordering matrix, writing the specified edges from vertex @i@ to vertex @j@.
-writeOrdering :: ( PrimMonad m, s ~ PrimState m ) => OrderingMatrix ( Unboxed.MVector s ) -> Order -> Int -> Int -> m ()
-writeOrdering ( OrderingMatrix { dim, orderingMatrix } ) order i j = case compare i j of
+writeOrdering
+  :: Monad m
+  => ( Int -> Order -> m () ) -- ^ Physical cell write.
+  -> OrderingMatrix vec
+  -> Order
+  -> Int -> Int -> m ()
+writeOrdering writeCell ( OrderingMatrix { dim } ) order i j = case compare i j of
   EQ -> pure ()
-  LT -> Unboxed.MVector.unsafeWrite orderingMatrix ( upperTriangular dim i j ) order
-  GT -> Unboxed.MVector.unsafeWrite orderingMatrix ( upperTriangular dim j i ) ( reverseOrder order )
+  LT -> writeCell ( upperTriangular dim i j ) order
+  GT -> writeCell ( upperTriangular dim j i ) ( reverseOrder order )
 
 -- | Read ordering matrix for edges from vertex @i@ to vertex @j@.
-readOrdering :: ( ReadableVector m Order ( vec Order ) ) => OrderingMatrix vec -> Int -> Int -> m Order
+readOrdering
+  :: ( ReadableVector m Order ( vec Order ) )
+  => OrderingMatrix vec
+  -> Int -> Int
+  -> m Order
 readOrdering ( OrderingMatrix { dim, orderingMatrix } ) i j = case compare i j of
   EQ -> pure Equal
   LT -> unsafeIndex orderingMatrix ( upperTriangular dim i j )
@@ -203,24 +212,26 @@ readOrdering ( OrderingMatrix { dim, orderingMatrix } ) i j = case compare i j o
 -- | Mutate edge in an ordering matrix.
 modify'Ordering
   :: ( PrimMonad m, s ~ PrimState m )
-  => OrderingMatrix ( Unboxed.MVector s ) -> ( Order -> Order ) -> Int -> Int -> m ()
-modify'Ordering mat f i j = do
+  => ( Int -> Order -> m () ) -- ^ physical cell write
+  -> OrderingMatrix ( Unboxed.MVector s ) -> ( Order -> Order ) -> Int -> Int -> m ()
+modify'Ordering writeCell mat f i j = do
   o <- readOrdering mat i j
   let
     !o' = f o
-  writeOrdering mat o' i j
+  writeOrdering writeCell mat o' i j
 
 -- | Add edges incident to a given vertex (without computing a transitive closure).
 addIncidentEdges
   :: ( PrimMonad m, s ~ PrimState m )
-  => OrderingMatrix ( Unboxed.MVector s )
+  => ( Int -> Order -> m () ) -- ^ Physical cell write.
+  -> OrderingMatrix ( Unboxed.MVector s )
   -> Int    -- ^ Fixed incidence vertex.
   -> IntSet -- ^ New predecessors to the given vertex.
   -> IntSet -- ^ New successors to the given vertex.
   -> m ()
-addIncidentEdges mat v befores afters = do
-  forOf_ IntSet.members befores ( modify'Ordering mat ( GreaterThan \/ ) v )
-  forOf_ IntSet.members afters  ( modify'Ordering mat ( LessThan    \/ ) v )
+addIncidentEdges writeCell mat v befores afters = do
+  forOf_ IntSet.members befores ( modify'Ordering writeCell mat ( GreaterThan \/ ) v )
+  forOf_ IntSet.members afters  ( modify'Ordering writeCell mat ( LessThan    \/ ) v )
 
 -- | King–Sagert insertion algorithm: add edges incident to a given vertex, and compute the transitive closure.
 addIncidentEdgesTransitively
@@ -228,14 +239,15 @@ addIncidentEdgesTransitively
   .  ( MonadError e m
      , PrimMonad m, s ~ PrimState m
      )
-  => ( Int -> Int -> m () ) -- ^ Function to propagate information relative to a new precedence.
-  -> ( Either Int ( Int, Int ) -> e ) -- ^ Function to give an error message.
+  => ( Int -> Order -> m () )  -- ^ Physical cell write.
+  -> ( Int -> Int -> m () )    -- ^ Propagate information relative to a new precedence.
+  -> ( Either Int ( Int, Int ) -> e ) -- ^ Error message function.
   -> OrderingMatrix ( Unboxed.MVector s )
   -> Int    -- ^ Fixed incidence vertex.
   -> IntSet -- ^ New predecessors to the given vertex.
   -> IntSet -- ^ New successors to the given vertex.
   -> m ()
-addIncidentEdgesTransitively propagateNewEdge errorMessage mat@( OrderingMatrix { dim } ) v befores afters = do
+addIncidentEdgesTransitively writeCell propagateNewEdge errorMessage mat@( OrderingMatrix { dim } ) v befores afters = do
   -- Tally the new connections around vertex 'v': predecessors/successors of 'v' by way of new edges.
   new <- Unboxed.Vector.fromList <$>
     for [ 0 .. dim - 1 ] \ i ->
@@ -284,7 +296,7 @@ addIncidentEdgesTransitively propagateNewEdge errorMessage mat@( OrderingMatrix 
           Order ( Bit c_lt, Bit c_gt ) = c_ij
           res :: Order
           res = c_ij \/ p_ij
-        writeOrdering mat res i j
+        writeOrdering writeCell mat res i j
         if res == Equal
         then throwError $ errorMessage ( Right (i, j) )
         else do
@@ -301,7 +313,7 @@ addIncidentEdgesTransitively propagateNewEdge errorMessage mat@( OrderingMatrix 
       n = new Unboxed.Vector.! i
     unless ( n == Unknown ) do
       c <- readOrdering mat i v
-      writeOrdering mat ( c \/ n ) i v
+      writeOrdering writeCell mat ( c \/ n ) i v
       when ( unBit . fst . getOrder $ n ) do
         propagateNewEdge i v
       when ( unBit . snd . getOrder $ n ) do

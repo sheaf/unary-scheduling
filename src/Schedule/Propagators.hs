@@ -145,6 +145,8 @@ import Schedule.Task
   , PickEndpoint
     ( pickEndpoint, _ranking )
   )
+import Schedule.Trail
+  ( Trail )
 import Schedule.Time
   ( Delta
   , Handedness(..), OtherHandedness
@@ -195,7 +197,7 @@ timetablePropagator =
     { mbNotifiee    = Just ( Coarse "timetable" )
     , notifyTarget  = TellEveryone
     , runPropagator = timetable
-    }  
+    }
 overloadPropagator =
   Propagator
     { mbNotifiee    = Nothing
@@ -289,7 +291,7 @@ propagateConstraints
   -> [ Propagator task t ]
   -> ( ImmutableTaskInfos task t, Text, Maybe Text )
 propagateConstraints taskData maxLoopIterations propagators =
-  case runScheduleMonad taskData ( propagationLoop maxLoopIterations propagators ) of
+  case runScheduleMonad taskData ( \ trail -> propagationLoop maxLoopIterations trail propagators ) of
     ( updatedTasks, ( mbGaveUpText, Constraints { justifications } ) ) ->
       ( updatedTasks, justifications, either Just ( const Nothing ) mbGaveUpText )
 
@@ -303,9 +305,10 @@ propagationLoop
      , Show t, Show task
      )
   => Int
+  -> Trail s task t
   -> [ Propagator task t ]
   -> ScheduleMonad s task t ()
-propagationLoop maxLoopIterations propagators = do
+propagationLoop maxLoopIterations trail propagators = do
   -- Apply the currently existing constraints, notifying
   -- all propagators that need this information.
   -- Then start the propagation loop.
@@ -318,8 +321,11 @@ propagationLoop maxLoopIterations propagators = do
       = pure ()
     go i _
       | i >= maxLoopIterations
+      -- TODO: the caller has no way to distinguish genuine fixed point
+      -- from exhausted loop iterations, which can increase backtracking
+      -- significantly.
       = pure ()
-    go i ( Propagator { notifyTarget, runPropagator = runCurrentProp } : followingProps ) 
+    go i ( Propagator { notifyTarget, runPropagator = runCurrentProp } : followingProps )
       = do
         runCurrentProp
         updateConstraints notifyTarget
@@ -336,7 +342,7 @@ propagationLoop maxLoopIterations propagators = do
       then
         noCtsAction
       else do
-        modifs <- applyConstraints cts
+        modifs <- applyConstraints trail cts
         modify'
           -- Reset constraints: they have been applied.
           $ set  ( field' @"taskConstraints" . field' @"constraints" ) mempty
@@ -489,12 +495,12 @@ precedenceMatrix
      )
   => m ()
 precedenceMatrix = do
-  
+
   allTasks@( TaskInfos { taskNames, taskAvails, orderings } ) :: TaskInfos bvec uvec task t <- ask
   let
     nbTasks :: Int
     nbTasks = Boxed.Vector.length taskNames
-  
+
   let
     go :: Int -> Endpoint ( HandedTime h t ) -> Endpoint ( HandedTime h t ) -> [Int] -> Int -> m ()
     go taskNb taskOuterTime limitTime subsetTaskNbs j
@@ -611,14 +617,14 @@ overloadCheck = do
             \  - the following set of tasks cannot complete before\n\
             \      * " <> Text.pack ( show estimatedECT ) <> "\n"
             <> currentSubsetTaskNames <> "\n"
-        
+
         go (j+1) (taskNb:seenTaskNbs)
 
   go 0 []
 
 -- | Computes constraints deduced from detectable precedences.
 --
--- At 'Earliest' handedness, given a task `i`, 
+-- At 'Earliest' handedness, given a task `i`,
 -- this function finds subsets of tasks which must occur before `i`,
 -- because the earliest completion time of `i` occurs /after/ the latest start time of the subset.
 --
@@ -812,7 +818,7 @@ notExtremal = do
           associatedOtherInnerTime = pickEndpoint @oh @Inner relevantTask
         when
           -- check that the current task can't be scheduled after / before all the other tasks in the current subset
-          ( overloaded excludeCurrentTaskSubsetInnerTime ( pickEndpoint @oh @Inner currentTask ) 
+          ( overloaded excludeCurrentTaskSubsetInnerTime ( pickEndpoint @oh @Inner currentTask )
           -- check that this observation imposes a nontrivial constraint on the current task
           && not ( overloaded ( coerce associatedOtherInnerTime :: Endpoint ( HandedTime h t ) ) currentOtherOuterTime )
           )
@@ -957,7 +963,7 @@ edgeFinding = do
             }
         j' :: Int
         j' = j - 1
-      
+
       DurationExtraInfo
         { baseDurationInfo  = DurationInfo { subsetInnerTime = currentSubsetInnerTime      }
         , extraDurationInfo = DurationInfo { subsetInnerTime = currentSubsetExtraInnerTime }
@@ -965,7 +971,7 @@ edgeFinding = do
 
       nextTaskNb <- ( ordered $ view ( _ranking @oh @Outer ) allTasks ) `unsafeIndex` ( handedIndex @h nbTasks j' )
       nextTask   <-                                          taskAvails `unsafeIndex` nextTaskNb
-      
+
       let
         nextOtherOuterTime :: Endpoint ( HandedTime oh t )
         nextOtherOuterTime = pickEndpoint @oh @Outer nextTask
@@ -1128,3 +1134,7 @@ makespan label taskNbs mkspans = do
               \As a result, the intervals \n\
               \  * " <> Text.pack ( show removedIntervals ) <> "\n\
               \have been removed from this task.\n\n"
+{-
+TODO: take into account internal fragmentation or un-schedulable gaps in the
+makespan calculation.
+-}

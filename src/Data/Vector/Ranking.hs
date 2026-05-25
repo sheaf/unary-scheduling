@@ -41,7 +41,7 @@ import qualified Data.Vector.Unboxed as Unboxed.Vector
 import qualified Data.Vector.Unboxed.Mutable as Unboxed
   ( MVector )
 import qualified Data.Vector.Unboxed.Mutable as Unboxed.Vector
-  ( unsafeRead, unsafeSwap )
+  ( unsafeRead )
 
 -- unary-scheduling
 import Data.Vector.PhaseTransition
@@ -78,16 +78,20 @@ rankOn f as = do
   ranks   <- Unboxed.Vector.unsafeThaw ( Unboxed.Vector.fromList ranked )
   pure ( Ranking { ordered, ranks } )
 
+-- | Re-sort a ranking after the key of a single element has increased
+-- (resp. decreased), restoring the sorted invariant by adjacent swaps.
 reorderAfterIncrease, reorderAfterDecrease
   :: forall m s a o
   .  ( Ord o, PrimMonad m, PrimState m ~ s )
-  => Boxed.MVector s a
+  => ( Int -> Int -> m () ) -- ^ swap two positions in the 'ordered' permutation
+  -> ( Int -> Int -> m () ) -- ^ swap two positions in the 'ranks'   permutation
+  -> Boxed.MVector s a
   -> Ranking ( Unboxed.MVector s Int )
   -> ( a -> o )
   -> Int
   -> m ()
 
-reorderAfterIncrease allTasks ( Ranking { ordered, ranks } ) f i = do
+reorderAfterIncrease swapOrdered swapRanks allTasks ( Ranking { ordered, ranks } ) f i = do
   r <- ranks `Unboxed.Vector.unsafeRead` i
   when ( r + 1 < lg ) do
     o <- f <$> allTasks `Boxed.Vector.unsafeRead` i
@@ -102,12 +106,12 @@ reorderAfterIncrease allTasks ( Ranking { ordered, ranks } ) f i = do
       i' <- ordered `Unboxed.Vector.unsafeRead` r'
       o' <- f <$> allTasks `Boxed.Vector.unsafeRead` i'
       when ( o > o' ) do
-        Unboxed.Vector.unsafeSwap ordered r r'
-        Unboxed.Vector.unsafeSwap ranks   i i'
+        swapOrdered r r'
+        swapRanks   i i'
         when ( r' + 1 < lg ) do
           go o r'
 
-reorderAfterDecrease allTasks ( Ranking { ordered, ranks } ) f i = do
+reorderAfterDecrease swapOrdered swapRanks allTasks ( Ranking { ordered, ranks } ) f i = do
   r <- ranks `Unboxed.Vector.unsafeRead` i
   when ( r > 0 ) do
     o <- f <$> allTasks `Boxed.Vector.unsafeRead` i
@@ -120,7 +124,7 @@ reorderAfterDecrease allTasks ( Ranking { ordered, ranks } ) f i = do
       i' <- ordered `Unboxed.Vector.unsafeRead` r'
       o' <- f <$> allTasks `Boxed.Vector.unsafeRead` i'
       when ( o < o' ) do
-        Unboxed.Vector.unsafeSwap ordered r r'
-        Unboxed.Vector.unsafeSwap ranks   i i'
+        swapOrdered r r'
+        swapRanks   i i'
         when ( r' > 0 ) do
           go o r'

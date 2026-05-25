@@ -171,14 +171,14 @@ verifyAgainstZ3 propagators namedTasks = do
         ti  :: ImmutableTaskInfos task t
         res :: Either Text ()
         ( ti, ( res, _ ) ) =
-          runScheduleMonad namedTasks do
+          runScheduleMonad namedTasks \ trail -> do
             -- Only post precedences that aren't already determined, as the
             -- ordering matrix implementation doesn't deal with redundant edges.
             TaskInfos { orderings } <- ask
             for_ chain \ ( a, b ) -> do
               o <- readOrdering orderings a b
-              when ( o == Unknown ) ( addEdge a b )
-            propagationLoop 1000 propagators
+              when ( o == Unknown ) ( addEdge trail a b )
+            propagationLoop 1000 trail propagators
         -- Tasks whose Z3 start time no longer lies within the tightened window.
         violators :: [ Int ]
         violators =
