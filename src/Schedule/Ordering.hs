@@ -23,8 +23,6 @@ import Data.Coerce
   ( coerce )
 import Data.Foldable
   ( for_ )
-import Data.Function
-  ( (&) )
 import Data.Functor
   ( (<&>) )
 import Data.Monoid
@@ -256,30 +254,44 @@ addIncidentEdgesTransitively propagateNewEdge errorMessage mat@( OrderingMatrix 
           coerce @( m () ) $ throwError ( errorMessage ( Left i ) )
         pure res
 
-  -- Add the transitive edges away from 'v'.
+  -- Add the transitive edges away from 'v':
+  -- 'i' precedes 'j' exactly when 'i' is a predecessor of 'v' and 'j' is a successor of
+  -- 'v' (and symmetrically), where "predecessor/successor of 'v'" means a relation to
+  -- 'v' that either already held or is newly introduced (recorded in 'new').
   for_ [ ( i, j ) | i <- [ 0 .. dim - 1 ], i /= v, j <- [ i + 1 .. dim - 1 ], j /= v ] \ ( i, j ) -> do
     let
       n_i, n_j :: Order
       n_i = new Unboxed.Vector.! i
-      n_j = new Unboxed.Vector.! j & reverseOrder
-    unless ( n_i \/ n_j == Unknown ) do
+      n_j = new Unboxed.Vector.! j
+      -- The new relations of 'i' and 'j' to 'v'.
+      Order ( Bit bef_i, Bit aft_i ) = n_i
+      Order ( Bit bef_j, Bit aft_j ) = n_j
+    unless ( n_i == Unknown && n_j == Unknown ) do
       c_ij <- readOrdering mat i j
-      p_i  <- readOrdering mat i v
-      p_j  <- readOrdering mat v j
+      -- The relations of 'i' and 'j' to 'v' that already held.
+      Order ( Bit i_lt_v, Bit i_gt_v ) <- readOrdering mat i v
+      Order ( Bit v_lt_j, Bit v_gt_j ) <- readOrdering mat v j
       let
+        iPredV, iSuccV, jPredV, jSuccV :: Bool
+        iPredV = bef_i || i_lt_v   -- 'i' is a predecessor of 'v'
+        iSuccV = aft_i || i_gt_v   -- 'i' is a successor   of 'v'
+        jPredV = bef_j || v_gt_j   -- 'j' is a predecessor of 'v'
+        jSuccV = aft_j || v_lt_j   -- 'j' is a successor   of 'v'
         p_ij :: Order
-        p_ij = ( n_i /\ p_i ) \/ ( n_j /\ p_j ) \/ ( n_i /\ n_j )
+        p_ij = Order ( Bit ( iPredV && jSuccV ), Bit ( jPredV && iSuccV ) )
       unless ( p_ij == Unknown ) do
         let
+          Order ( Bit c_lt, Bit c_gt ) = c_ij
           res :: Order
           res = c_ij \/ p_ij
         writeOrdering mat res i j
         if res == Equal
         then throwError $ errorMessage ( Right (i, j) )
         else do
-          when ( unBit . fst . getOrder $ p_ij ) do
+          -- Propagate only edges that are genuinely new (not already present in 'c_ij').
+          when ( iPredV && jSuccV && not c_lt ) do
             propagateNewEdge i j
-          when ( unBit . snd . getOrder $ p_ij ) do
+          when ( jPredV && iSuccV && not c_gt ) do
             propagateNewEdge j i
 
   -- Add the connections around 'v'.
