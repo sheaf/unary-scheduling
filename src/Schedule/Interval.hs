@@ -9,6 +9,7 @@ module Schedule.Interval
   , intersection
   , inside, insideLax
   , Intervals(..)
+  , mkIntervals
   , cutBefore, cutAfter, remove, pruneShorterThan
   , intersectIntervalsWith
   ) where
@@ -35,7 +36,7 @@ import Data.Sequence
     ( Empty, (:<|), (:|>) )
   )
 import qualified Data.Sequence as Seq
-  ( singleton, sortOn, partition )
+  ( singleton, sortOn, partition, filter )
 
 -- deepseq
 import Control.DeepSeq
@@ -194,7 +195,7 @@ validInterval :: Ord t => Interval t -> Bool
 validInterval ( Interval ( Endpoint ( EarliestTime s ) s_clu ) ( Endpoint ( LatestTime e ) e_clu ) ) =
   case compare s e of
     LT -> True
-    EQ 
+    EQ
       | Inclusive <- s_clu
       , Inclusive <- e_clu
       -> True
@@ -243,52 +244,73 @@ newtype Intervals t = Intervals { intervals :: Seq ( Interval t ) }
   deriving stock   Show
   deriving newtype ( Eq, NFData )
 
+-- | Smart constructor for 'Intervals'.
+mkIntervals :: forall t. Ord t => Seq ( Interval t ) -> Intervals t
+mkIntervals = Intervals . mergeSorted . Seq.sortOn start . Seq.filter validInterval
+  where
+    mergeSorted :: Ord t => Seq (Interval t) -> Seq (Interval t)
+    mergeSorted ( Interval s1 e1 :<| Interval s2 e2 :<| ivals )
+      | touchesOrOverlaps e1 s2
+      = mergeSorted ( Interval s1 ( e1 \/ e2 ) :<| ivals )
+      | otherwise
+      = Interval s1 e1 :<| mergeSorted ( Interval s2 e2 :<| ivals )
+      where
+        touchesOrOverlaps :: Endpoint (LatestTime t) -> Endpoint (EarliestTime t) -> Bool
+        touchesOrOverlaps
+          ( Endpoint ( LatestTime   e1_t ) e1_clu )
+          ( Endpoint ( EarliestTime s2_t ) s2_clu )
+            = case compare e1_t s2_t of
+                GT -> True
+                EQ -> e1_clu == Inclusive && s2_clu == Inclusive
+                LT -> False
+    mergeSorted ivals = ivals
+
 instance Ord t => Lattice ( Intervals t ) where
-  Intervals ivals1 \/ Intervals ivals2 = Intervals ( merge ( Seq.sortOn start ( ivals1 <> ivals2 ) ) )
-    where
-      merge :: Seq ( Interval t ) -> Seq ( Interval t )
-      merge ( Interval s1 e1 :<| Interval s2 e2 :<| ivals )
-        | validInterval ( Interval s2 e1 )
-        = merge ( Interval s1 e2 :<| ivals )
-        | otherwise
-        = Interval s1 e1 :<| merge ( Interval s2 e2 :<| ivals )
-      merge ivals = ivals
+  -- Union: concatenate, then re-sort and merge into canonical form.
+  Intervals ivals1 \/ Intervals ivals2 = mkIntervals ( ivals1 <> ivals2 )
   Intervals ivals1 /\ Intervals ivals2 = Intervals ( go ivals1 ivals2 )
     where
-      go :: Seq ( Interval t ) -> Seq ( Interval t ) -> Seq ( Interval t )
+      go :: Seq ( Interval t  ) -> Seq ( Interval t  ) -> Seq ( Interval t )
       go Empty _ = Empty
-      go ( ival :<| ivals ) others = go' ival others <> go ivals others
-      go' :: Interval t -> Seq ( Interval t ) -> Seq ( Interval t )
-      go' _ Empty = Empty
-      go' ival ( other :<| others )
-        | handedTime ( endTime ival ) < handedTime ( startTime other )
-        = Empty
-        | Just inter <- ival `intersection` other
-        = inter :<| go' ival others
-        | otherwise
-        = go' ival others
+      go _ Empty = Empty
+      go as@( ivalA :<| as' ) bs@( ivalB :<| bs' ) =
+        let
+          overlaps =
+            case ivalA `intersection` ivalB of
+              Just ival -> ival :<| Empty
+              Nothing   -> Empty
+          rest =
+            case compare ( handedTime ( endTime ivalA ) ) ( handedTime ( endTime ivalB ) ) of
+              LT -> go as' bs
+              GT -> go as  bs'
+              EQ -> go as' bs
+        in overlaps <> rest
 
 -- | Compute the intersection of two collections of intervals,
 -- combining the values associated to the intervals using the provided combining function.
 intersectIntervalsWith
-  :: forall t a b c
-  .  Ord t
+  :: forall t a b c. Ord t
   => ( a -> b -> c )
   -> Seq ( Interval t, a ) -> Seq ( Interval t, b ) -> Seq ( Interval t, c )
 intersectIntervalsWith f = go
   where
     go :: Seq ( Interval t, a ) -> Seq ( Interval t, b ) -> Seq ( Interval t, c )
     go Empty _ = Empty
-    go ( ( ival, a ) :<| ivals ) others = go' a ival others <> go ivals others
-    go' :: a -> Interval t -> Seq ( Interval t, b ) -> Seq ( Interval t, c )
-    go' _ _ Empty = Empty
-    go' a ival ( ( other, b ) :<| others )
-      | handedTime ( endTime ival ) < handedTime ( startTime other )
-      = Empty
-      | Just inter <- ival `intersection` other
-      = ( inter, f a b ) :<| go' a ival others
-      | otherwise
-      = go' a ival others
+    go _ Empty = Empty
+    go as@( ( ivalA, a ) :<| as' ) bs@( ( ivalB, b ) :<| bs' ) =
+      let
+        overlaps =
+          case ivalA `intersection` ivalB of
+            Just ival -> ( ival, f a b ) :<| Empty
+            Nothing   -> Empty
+        rest
+          | handedTime (endTime ivalA) < handedTime (endTime ivalB)
+          = go as' bs
+          | handedTime (endTime ivalA) > handedTime (endTime ivalB)
+          = go as bs'
+          | otherwise
+          = go as' bs
+      in overlaps <> rest
 
 instance ( Ord t, Bounded t ) => BoundedLattice ( Intervals t ) where
   bottom = Intervals Empty
