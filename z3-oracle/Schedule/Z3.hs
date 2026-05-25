@@ -1,12 +1,27 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 
-module Schedule.Z3 where
+-- | A Z3-backed oracle for unary-scheduling.
+module Schedule.Z3
+  ( -- * Unary scheduling Z3 encoding
+    intervalIntBounds
+  , buildUnaryModel
+    -- * Feasibility oracle
+  , z3Feasible
+    -- * Differential validation
+  , Z3Verdict(..)
+  , verifyAgainstZ3
+    -- * Frustration-minimising reference solver
+  , unaryScheduleZ3
+  )
+  where
 
 -- base
 import Data.Coerce
   ( Coercible, coerce )
 import Data.Foldable
   ( for_, toList )
+import Data.List
+  ( sortOn )
 import Data.Maybe
   ( catMaybes )
 import Data.Traversable
@@ -15,8 +30,14 @@ import Data.Traversable
 -- containers
 import Data.Set
   ( Set )
-import qualified Data.Set as Set
-  ( )
+
+-- text
+import Data.Text
+  ( Text )
+
+-- vector
+import qualified Data.Vector as Boxed.Vector
+  ( (!) )
 
 -- z3
 import Z3.Monad
@@ -25,13 +46,20 @@ import qualified Z3.Monad as Z3
 
 -- unary-scheduling
 import Schedule.Interval
-  ( Clusivity(..), Endpoint(..), Interval(..), Intervals(..) )
+  ( Clusivity(..), Endpoint(..), Interval(..), Intervals(..), Measurable )
+import Schedule.Monad
+  ( runScheduleMonad, SchedulableData )
+import Schedule.Propagators
+  ( Propagator, propagationLoop )
+import Schedule.Search
+  ( addEdge )
 import Schedule.Task
-  ( Task(..) )
+  ( Task(..), TaskInfos(..), ImmutableTaskInfos, est, lst )
 import Schedule.Time
   ( Delta(..), Time(..), HandedTime(..) )
 
 --------------------------------------------------------------------------------
+-- Encoding.
 
 -- | Convert an interval's endpoints to the inclusive integer range @[s', e']@
 -- that Z3 reasons about.
@@ -41,15 +69,15 @@ intervalIntBounds ( Interval ( Endpoint ( EarliestTime ( Time s ) ) clu_s ) ( En
   , case clu_e of { Exclusive -> coerce e - 1; _ -> coerce e }
   )
 
--- | Build a unary-scheduling model: one integer start-time variable per
--- task, constrained to lie within its availability, plus a pairwise non-overlap
+-- | Build a unary-scheduling model: one integer start-time variable per task,
+-- constrained to lie within its availability, plus a pairwise non-overlap
 -- (disjunctive) constraint enforcing the unary resource.
 --
 -- Returns each task's @(index, startVar, durationVar)@ in input order.
 buildUnaryModel
-  :: forall t staff
+  :: forall task t
   .  Coercible t Int
-  => [ Task ( Set staff ) t ]
+  => [ Task task t ]
   -> Z3 [ ( Int, Z3.AST, Z3.AST ) ]
 buildUnaryModel tasks = do
   ts <- for ( zip [ 0 :: Int .. ] tasks ) \ ( taskNb, Task { taskAvailability, taskDuration } ) -> do
@@ -76,6 +104,86 @@ buildUnaryModel tasks = do
     Z3.assert =<< Z3.mkOr [ before, after ]
   pure ts
 
+--------------------------------------------------------------------------------
+-- Feasibility oracle.
+
+-- | Decide feasibility of the unary scheduling problem with Z3 (no objective),
+-- returning the start times (aligned with input order) of some feasible schedule,
+-- or 'Nothing' if the instance is infeasible.
+z3Feasible
+  :: forall task t
+  .  Coercible t Int
+  => [ Task task t ]
+  -> IO ( Maybe [ Integer ] )
+z3Feasible tasks = Z3.evalZ3 do
+  ts <- buildUnaryModel tasks
+  ( _res, mbStarts ) <- Z3.withModel \ model ->
+    mapM ( Z3.evalInt model . ( \ ( _, t, _ ) -> t ) ) ts
+  pure ( sequence =<< mbStarts )
+
+--------------------------------------------------------------------------------
+-- Differential validation.
+
+-- | The outcome of cross-checking native propagation against the Z3 oracle on a
+-- single instance.
+data Z3Verdict
+  = Z3Infeasible
+    -- ^ Z3 found no feasible schedule
+  | NativeRejected !Text
+    -- ^ Native propagation threw on Z3's precedence chain: a Z3-feasible schedule
+    -- was rejected (unsoundness in propagation)
+  | NativePruned ![ Int ]
+    -- ^ Native propagation pushed these tasks' Z3 start times outside their
+    -- @[est, lst]@ window (unsoundness in propagation)
+  | Consistent ![ Integer ]
+  deriving stock ( Eq, Show )
+
+-- | Cross-check native propagation against Z3 on a single instance.
+verifyAgainstZ3
+  :: forall task t
+  .  ( Num t, Measurable t, Bounded t, Show t, Show task
+     , Coercible t Int
+     , SchedulableData [ ( Task task t, Text ) ] task t
+     )
+  => [ Propagator task t ]
+  -> [ ( Task task t, Text ) ]
+  -> IO Z3Verdict
+verifyAgainstZ3 propagators namedTasks = do
+  mbStarts <- z3Feasible ( map fst namedTasks )
+  pure $ case mbStarts of
+    Nothing     -> Z3Infeasible
+    Just starts ->
+      let
+        -- Z3's task order, as consecutive precedences (the transitive closure
+        -- fills in the rest).
+        chain :: [ ( Int, Int ) ]
+        chain =
+          let order = map snd ( sortOn fst ( zip starts [ 0 :: Int .. ] ) )
+          in  zip order ( drop 1 order )
+        ti  :: ImmutableTaskInfos task t
+        res :: Either Text ()
+        ( ti, ( res, _ ) ) =
+          runScheduleMonad namedTasks
+            ( for_ chain ( \ ( a, b ) -> addEdge a b ) *> propagationLoop 1000 propagators )
+        -- Tasks whose Z3 start time no longer lies within the tightened window.
+        violators :: [ Int ]
+        violators =
+          [ i
+          | ( i, s ) <- zip [ 0 :: Int .. ] starts
+          , let task = taskAvails ti Boxed.Vector.! i
+                st   = coerce ( fromInteger s :: Int ) :: t
+                estV = getTime ( handedTime ( endpoint ( est task ) ) )
+                lstV = getTime ( handedTime ( endpoint ( lst task ) ) )
+          , null ( intervals ( taskAvailability task ) ) || st < estV || st > lstV
+          ]
+      in case res of
+           Left err -> NativeRejected err
+           Right ()
+             | not ( null violators ) -> NativePruned violators
+             | otherwise              -> Consistent starts
+
+--------------------------------------------------------------------------------
+-- Frustration-minimising reference solver.
 
 -- | Find a frustration-minimising schedule using Z3.
 unaryScheduleZ3
@@ -108,22 +216,6 @@ unaryScheduleZ3 tasks frustrationRanges = do
       catMaybes <$> mapM ( Z3.evalInt model . ( \ ( _, t, _ ) -> t ) ) ts
     pure ( val, optRes )
   pure startTimes
-
-
--- | Decide feasibility of the unary scheduling problem with Z3 (no objective).
-unaryScheduleFeasibleZ3
-  :: forall t staff
-  .  Coercible t Int
-  => [ Task ( Set staff ) t ]
-  -> IO ( Maybe [ Integer ] )
-unaryScheduleFeasibleZ3 tasks = Z3.evalZ3 do
-  ts <- buildUnaryModel tasks
-  -- Check satisfiability and read back the start times (aligned with input order),
-  -- or 'Nothing' if unsat or any variable is unevaluated.
-  ( _res, mbStarts ) <- Z3.withModel \ model ->
-    mapM ( Z3.evalInt model . ( \ ( _, t, _ ) -> t ) ) ts
-  pure ( sequence =<< mbStarts )
-
 
 linearFrustration :: Coercible t Int => [ ( Z3.AST, Z3.AST ) ] -> Interval t -> Z3 Z3.AST
 linearFrustration startTimesAndDurations ival = do

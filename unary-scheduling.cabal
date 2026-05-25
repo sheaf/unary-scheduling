@@ -145,6 +145,21 @@ library
     cpp-options:
       -DVIZ
 
+library z3-oracle
+
+  import: common
+
+  hs-source-dirs:
+    z3-oracle
+
+  exposed-modules:
+    Schedule.Z3
+
+  build-depends:
+      unary-scheduling
+    , z3
+         >= 411       && < 413
+
 executable schedule-spreadsheet
 
   import: common
@@ -155,13 +170,13 @@ executable schedule-spreadsheet
 
   other-modules:
       Schedule.Spreadsheet
-    , Schedule.Z3
 
   main-is:
     Main.hs
 
   build-depends:
       unary-scheduling
+    , z3-oracle
     , prettyprinter
          >= 1.7       && < 1.8
     , attoparsec
@@ -178,8 +193,6 @@ executable schedule-spreadsheet
          >= 1.9.3     && < 1.17
     , xlsx
          >= 1.2.0     && < 1.3
-    , z3
-         >= 411       && < 413
 
   ghc-options:
     -threaded

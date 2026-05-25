@@ -182,7 +182,7 @@ import Schedule.Time
 
 -- schedule-spreadsheet
 import Schedule.Z3
-  ( unaryScheduleFeasibleZ3 )
+  ( z3Feasible )
 
 -------------------------------------------------------------------------------
 
@@ -228,7 +228,7 @@ scheduleSpreadsheet = do
     let
       z3Tasks :: [ Task ( Set Staff ) Column ]
       z3Tasks = map fst schedulingTasks
-    mbStarts <- lift $ unaryScheduleFeasibleZ3 z3Tasks
+    mbStarts <- lift $ z3Feasible z3Tasks
     lift $ case mbStarts of
       Just starts -> do
         hPutStrLn stderr "Z3: SATISFIABLE - a feasible schedule exists."
@@ -285,7 +285,7 @@ scheduleSpreadsheet = do
       let
         z3Tasks :: [ Task ( Set Staff ) Column ]
         z3Tasks = map fst schedulingTasks
-      mbStarts <- lift $ unaryScheduleFeasibleZ3 z3Tasks
+      mbStarts <- lift $ z3Feasible z3Tasks
       case mbStarts of
         Nothing ->
           throwError ( NoSchedulingPossible "Z3 reports the problem is infeasible; nothing to verify." )
