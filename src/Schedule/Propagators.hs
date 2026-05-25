@@ -120,7 +120,8 @@ import Schedule.Constraint
   , tighten, tightenWithPrecedences
   )
 import Schedule.Interval
-  ( Endpoint(..)
+  ( flipClusivity
+  , Endpoint(..)
   , Interval(..)
   , Intervals(..)
   , Measurable(..)
@@ -447,7 +448,7 @@ timetable = do
       taskLST = lst task
       taskECT = ect task
       necessaryInterval :: Interval t
-      necessaryInterval = Interval ( coerce taskLST ) ( coerce taskECT )
+      necessaryInterval = Interval ( flipClusivity ( coerce taskLST ) ) ( flipClusivity ( coerce taskECT ) )
     unless ( isEmpty necessaryInterval ) do
       let
         necessaryIntervals :: Intervals t

@@ -2,7 +2,8 @@
 {-# LANGUAGE UndecidableInstances #-}
 
 module Schedule.Interval
-  ( Clusivity(..), Endpoint(..)
+  ( Clusivity(..), flipClusivity
+  , Endpoint(..)
   , Interval(.., (:<..<), (:<..<=), (:<=..<), (:<=..<=))
   , startTime, endTime
   , intersection
@@ -162,6 +163,9 @@ instance Ord t => TotallyOrderedLattice ( Endpoint ( LatestTime t ) ) where
       , Inclusive <- clu2
       -> e1
     _ -> e2
+
+flipClusivity :: Endpoint a -> Endpoint a
+flipClusivity ( Endpoint t clu ) = Endpoint t $ negation clu
 
 -------------------------------------------------------------------------------
 -- Intervals.
