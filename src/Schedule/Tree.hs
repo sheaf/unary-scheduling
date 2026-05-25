@@ -80,7 +80,7 @@ import Schedule.Ordering
 import Data.Vector.Ranking
   ( Ranking(..) )
 import Schedule.Interval
-  ( Endpoint(..), Interval(..), validInterval )
+  ( Endpoint(..), Interval(..), Measurable (isEmpty) )
 import Schedule.Task
   ( TaskInfos(..)
   , Limit
@@ -244,7 +244,11 @@ visualiseTree tree = TreeView.showTree . fmap show <$> toRoseTree tree
 class Propagatable ( h :: Handedness ) where
   -- | Check whether a resource is overloaded,
   -- i.e. whether the 'Earliest' time exceeds the 'Latest' time.
-  overloaded :: Ord t => Endpoint ( HandedTime h t ) -> Endpoint ( HandedTime ( OtherHandedness h ) t ) -> Bool
+  overloaded
+    :: Measurable t
+    => Endpoint ( HandedTime h t )
+    -> Endpoint ( HandedTime ( OtherHandedness h ) t )
+    -> Bool
 
   -- | Adjusts the index to count from the start (for 'Earliest' handedness) or the end (for 'Latest' handedness).
   handedIndex
@@ -268,7 +272,7 @@ class Propagatable ( h :: Handedness ) where
     => Tree h s a -> a -> TaskInfos bvec uvec task t -> Int -> m a
 
 instance Propagatable Earliest where
-  overloaded start end = not $ validInterval ( Interval start end )
+  overloaded start end = isEmpty ( Interval start end )
   handedIndex _ i = i
   inHandedOrder LessThan = True
   inHandedOrder _        = False
@@ -282,7 +286,7 @@ instance Propagatable Earliest where
     propagateChangeFromLeaf tree val leafIndex
 
 instance Propagatable Latest where
-  overloaded end start = not $ validInterval ( Interval start end )
+  overloaded end start = isEmpty ( Interval start end )
   handedIndex nbTasks i = nbTasks - 1 - i
   inHandedOrder GreaterThan = True
   inHandedOrder _           = False

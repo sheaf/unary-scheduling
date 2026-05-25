@@ -163,7 +163,7 @@ import Schedule.Propagators
   )
 import Schedule.Interval
   ( Interval((:<=..<=)), Intervals(..)
-  , Endpoint(..)
+  , Endpoint(..), Measurable(..)
   , insideLax
   )
 import Schedule.Monad
@@ -400,7 +400,8 @@ newtype Staff = Staff { staffID :: Int }
   deriving newtype ( Eq, Ord, NFData )
 
 newtype Column = Column { getColumn :: Int }
-  deriving newtype ( Eq, Ord, Enum, Bounded, Num, Real, NFData )
+  deriving newtype ( Eq, Ord, Measurable, Enum, Bounded, Num, Real, NFData )
+
 -- Bijective base 26 system.
 instance Show Column where
   show ( Column { getColumn = c } )

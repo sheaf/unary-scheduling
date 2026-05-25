@@ -56,7 +56,7 @@ import Data.Lattice
 import Data.Vector.Ranking
   ( reorderAfterIncrease, reorderAfterDecrease )
 import Schedule.Interval
-  ( Endpoint(..), Intervals(..)
+  ( Endpoint(..), Intervals(..), Measurable(..)
   , cutBefore, cutAfter, remove
   )
 import Schedule.Ordering
@@ -83,22 +83,22 @@ data Constraint t
   }
   deriving stock ( Show, Generic )
 
-pattern NotEarlierThan :: Ord t => Endpoint ( EarliestTime t ) -> Constraint t
+pattern NotEarlierThan :: Measurable t => Endpoint ( EarliestTime t ) -> Constraint t
 pattern NotEarlierThan endpoint <- ( notEarlierThan -> Just endpoint )
   where
-    NotEarlierThan endpoint= mempty { notEarlierThan = Just endpoint }
+    NotEarlierThan endpoint = mempty { notEarlierThan = Just endpoint }
 
-pattern NotLaterThan :: Ord t => Endpoint ( LatestTime t ) -> Constraint t
+pattern NotLaterThan :: Measurable t => Endpoint ( LatestTime t ) -> Constraint t
 pattern NotLaterThan endpoint <- ( notLaterThan -> Just endpoint )
   where
     NotLaterThan endpoint = mempty { notLaterThan = Just endpoint }
 
-pattern Outside :: Ord t => Intervals t -> Constraint t
+pattern Outside :: Measurable t => Intervals t -> Constraint t
 pattern Outside ivals <- ( outside -> Just ivals )
   where
     Outside ivals = mempty { outside = Just ivals }
 
-pattern Inside :: Ord t => Intervals t -> Constraint t
+pattern Inside :: Measurable t => Intervals t -> Constraint t
 pattern Inside ivals <- ( inside -> Just ivals )
   where
     Inside ivals = mempty { inside = Just ivals }
@@ -106,7 +106,7 @@ pattern Inside ivals <- ( inside -> Just ivals )
 pattern NoConstraint :: Constraint t
 pattern NoConstraint = Constraint Nothing Nothing Nothing Nothing
 
-instance Ord t => Semigroup ( Constraint t ) where
+instance Measurable t => Semigroup ( Constraint t ) where
   Constraint e1 l1 o1 i1 <> Constraint e2 l2 o2 i2 = Constraint e l o i
     where
       e = combine (/\) e1 e2
@@ -120,7 +120,7 @@ instance Ord t => Semigroup ( Constraint t ) where
       combine _ Nothing  (Just b) = Just b
       combine f (Just a) (Just b) = Just (f a b)
 
-instance Ord t => Monoid ( Constraint t ) where
+instance Measurable t => Monoid ( Constraint t ) where
   mempty = NoConstraint
 
 data Constraints t
@@ -131,13 +131,13 @@ data Constraints t
   }
   deriving stock ( Show, Generic )
 
-instance Ord t => Semigroup ( Constraints t ) where
+instance Measurable t => Semigroup ( Constraints t ) where
   ( Constraints cts1 logs1 precs1 ) <> ( Constraints cts2 logs2 precs2 ) =
     Constraints
       ( IntMap.unionWith (<>) cts1 cts2 )
       ( logs1 <> logs2 )
       ( IntMap.unionWith (<>) precs1 precs2 )
-instance Ord t => Monoid ( Constraints t ) where
+instance Measurable t => Monoid ( Constraints t ) where
   mempty = Constraints IntMap.empty mempty mempty
 
 --------------------------------------------------------------------------------
@@ -181,7 +181,7 @@ tightenMany cts reason =
 applyConstraints
   :: ( MonadReader ( MutableTaskInfos s task t ) m
      , PrimMonad m, PrimState m ~ s
-     , Num t, Ord t, Bounded t
+     , Num t, Measurable t, Bounded t
      -- debugging
      , Show t, Show task
      )
@@ -194,7 +194,7 @@ applyConstraints ( Constraints { constraints, precedences } ) = do
 
 applyConstraint
   :: ( PrimMonad m, PrimState m ~ s
-     , Num t, Ord t, Bounded t
+     , Num t, Measurable t, Bounded t
      -- debugging
      , Show t, Show task
      )
@@ -217,7 +217,7 @@ class HandedTimeConstraint (h :: Handedness) where
   -- | Constraint associated to a handed time:
   --   - @Earliest t@ : @NotEarlierThan t@
   --   - @Latest t@ : @NotLaterThan t@.
-  handedTimeConstraint :: Ord t => Endpoint (HandedTime h t) -> Constraint t
+  handedTimeConstraint :: Measurable t => Endpoint (HandedTime h t) -> Constraint t
 instance HandedTimeConstraint Earliest where
   handedTimeConstraint endpoint = NotEarlierThan endpoint
 instance HandedTimeConstraint Latest   where
@@ -304,7 +304,7 @@ constrainToOutside ( TaskInfos { .. } ) taskNo ( Intervals ivalsToRemove ) = do
 
 -- | Reduce the domain of availability of a task.
 constrainToInside
-  :: ( Num t, Ord t, Bounded t
+  :: ( Num t, Measurable t, Bounded t
      , PrimMonad m, PrimState m ~ s
      )
   => MutableTaskInfos s task t

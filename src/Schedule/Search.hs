@@ -78,7 +78,7 @@ import Schedule.Constraint
 import Schedule.Contention
   ( contentionScore )
 import Schedule.Interval
-  ( Endpoint(..) )
+  ( Endpoint(..), Measurable )
 import Schedule.Monad
   ( MonadSchedule
   , runScheduleMonad, constrain
@@ -156,7 +156,7 @@ bestCostSummary _                          = "none"
 
 search
   :: forall task t
-  .  ( Num t, Ord t, Real t, Enum t, Bounded t
+  .  ( Num t, Measurable t, Real t, Enum t, Bounded t
      , NFData t, NFData task
      , Show t, Show task
      )
@@ -341,7 +341,7 @@ nextLikeliestPrecedence likelihood allTasks ( OrderingMatrix { dim, orderingMatr
 addEdge
   :: forall m task t s
   .  ( MonadSchedule s task t m
-     , Num t, Ord t, Bounded t
+     , Num t, Measurable t, Bounded t
      )
   => Int
   -> Int

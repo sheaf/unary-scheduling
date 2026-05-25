@@ -4,10 +4,10 @@
 module Schedule.Interval
   ( Clusivity(..), Endpoint(..)
   , Interval(.., (:<..<), (:<..<=), (:<=..<), (:<=..<=))
-  , validInterval
-  , startTime, endTime, duration
+  , startTime, endTime
   , intersection
   , inside, insideLax
+  , Measurable(..)
   , Intervals(..)
   , mkIntervals
   , cutBefore, cutAfter, remove, pruneShorterThan
@@ -46,7 +46,7 @@ import Control.DeepSeq
 import Data.Lattice
   ( Lattice(..), BoundedLattice(..), Heyting(..), TotallyOrderedLattice(..) )
 import Schedule.Time
-  ( Time, Delta
+  ( Time (..), Delta (..)
   , HandedTime(..), EarliestTime, LatestTime
   )
 
@@ -188,24 +188,12 @@ startTime = start >>> endpoint
 endTime :: Interval t -> LatestTime t
 endTime = end >>> endpoint
 
-duration :: Num t => Interval t -> Delta t
-duration ( Interval ( Endpoint ( EarliestTime s ) _ ) ( Endpoint ( LatestTime e ) _ ) ) = s --> e
 
-validInterval :: Ord t => Interval t -> Bool
-validInterval ( Interval ( Endpoint ( EarliestTime s ) s_clu ) ( Endpoint ( LatestTime e ) e_clu ) ) =
-  case compare s e of
-    LT -> True
-    EQ
-      | Inclusive <- s_clu
-      , Inclusive <- e_clu
-      -> True
-    _ -> False
-
-intersection :: Ord t => Interval t -> Interval t -> Maybe ( Interval t )
+intersection :: Measurable t => Interval t -> Interval t -> Maybe ( Interval t )
 intersection ( Interval s1 e1 ) ( Interval s2 e2 ) = do
   let
     ival = Interval ( s1 /\ s2 ) ( e1 /\ e2 )
-  guard ( validInterval ival )
+  guard ( not $ isEmpty ival )
   pure ival
 
 inside :: forall t. Ord t => Time t -> Intervals t -> Bool
@@ -237,6 +225,33 @@ insideLax = coerce insideLax'
             _ -> True
 
 -------------------------------------------------------------------------------
+-- Measures.
+
+class Ord t => Measurable t where
+  -- | The measure of an interval.
+  measure :: Interval t -> Delta t
+  -- | Is an interval empty?
+  isEmpty :: Interval t -> Bool
+
+
+instance Measurable Double where
+  measure ival = max ( Delta 0 ) $ handedTime ( startTime ival ) --> handedTime ( endTime ival )
+  isEmpty ( Interval (Endpoint (EarliestTime s) s_clu) (Endpoint (LatestTime e) e_clu) )
+    =  s > e
+    || ( s == e && ( s_clu == Exclusive || e_clu == Exclusive ) )
+
+instance Measurable Int where
+  measure ( Interval (Endpoint (EarliestTime (Time s)) s_clu) (Endpoint (LatestTime (Time e)) e_clu) ) =
+    let s' = if s_clu == Inclusive then s else s + 1
+        e' = if e_clu == Inclusive then e else e - 1
+    in Delta $ max 0 (e' - s' + 1)
+
+  isEmpty ( Interval (Endpoint (EarliestTime (Time s)) s_clu) (Endpoint (LatestTime (Time e)) e_clu) ) =
+    let s' = if s_clu == Inclusive then s else s + 1
+        e' = if e_clu == Inclusive then e else e - 1
+    in s' > e'
+
+-------------------------------------------------------------------------------
 -- Intervals.
 
 -- | Ordered collection of non-overlapping intervals.
@@ -245,8 +260,8 @@ newtype Intervals t = Intervals { intervals :: Seq ( Interval t ) }
   deriving newtype ( Eq, NFData )
 
 -- | Smart constructor for 'Intervals'.
-mkIntervals :: forall t. Ord t => Seq ( Interval t ) -> Intervals t
-mkIntervals = Intervals . mergeSorted . Seq.sortOn start . Seq.filter validInterval
+mkIntervals :: forall t. Measurable t => Seq ( Interval t ) -> Intervals t
+mkIntervals = Intervals . mergeSorted . Seq.sortOn start . Seq.filter ( not . isEmpty )
   where
     mergeSorted :: Ord t => Seq (Interval t) -> Seq (Interval t)
     mergeSorted ( Interval s1 e1 :<| Interval s2 e2 :<| ivals )
@@ -259,13 +274,13 @@ mkIntervals = Intervals . mergeSorted . Seq.sortOn start . Seq.filter validInter
         touchesOrOverlaps
           ( Endpoint ( LatestTime   e1_t ) e1_clu )
           ( Endpoint ( EarliestTime s2_t ) s2_clu )
-            = case compare e1_t s2_t of
-                GT -> True
-                EQ -> e1_clu == Inclusive && s2_clu == Inclusive
-                LT -> False
+            = not $ isEmpty $
+               Interval
+                 ( Endpoint ( EarliestTime e1_t ) ( negation e1_clu ) )
+                 ( Endpoint ( LatestTime   s2_t ) ( negation s2_clu ) )
     mergeSorted ivals = ivals
 
-instance Ord t => Lattice ( Intervals t ) where
+instance Measurable t => Lattice ( Intervals t ) where
   -- Union: concatenate, then re-sort and merge into canonical form.
   Intervals ivals1 \/ Intervals ivals2 = mkIntervals ( ivals1 <> ivals2 )
   Intervals ivals1 /\ Intervals ivals2 = Intervals ( go ivals1 ivals2 )
@@ -275,21 +290,20 @@ instance Ord t => Lattice ( Intervals t ) where
       go _ Empty = Empty
       go as@( ivalA :<| as' ) bs@( ivalB :<| bs' ) =
         let
-          overlaps =
-            case ivalA `intersection` ivalB of
-              Just ival -> ival :<| Empty
-              Nothing   -> Empty
           rest =
             case compare ( handedTime ( endTime ivalA ) ) ( handedTime ( endTime ivalB ) ) of
               LT -> go as' bs
               GT -> go as  bs'
-              EQ -> go as' bs
-        in overlaps <> rest
+              EQ -> go as' bs'
+        in case ivalA `intersection` ivalB of
+             Just ival -> ival :<| rest
+             Nothing   -> rest
 
 -- | Compute the intersection of two collections of intervals,
 -- combining the values associated to the intervals using the provided combining function.
 intersectIntervalsWith
-  :: forall t a b c. Ord t
+  :: forall t a b c
+  .  Measurable t
   => ( a -> b -> c )
   -> Seq ( Interval t, a ) -> Seq ( Interval t, b ) -> Seq ( Interval t, c )
 intersectIntervalsWith f = go
@@ -299,20 +313,17 @@ intersectIntervalsWith f = go
     go _ Empty = Empty
     go as@( ( ivalA, a ) :<| as' ) bs@( ( ivalB, b ) :<| bs' ) =
       let
-        overlaps =
-          case ivalA `intersection` ivalB of
-            Just ival -> ( ival, f a b ) :<| Empty
-            Nothing   -> Empty
-        rest
-          | handedTime (endTime ivalA) < handedTime (endTime ivalB)
-          = go as' bs
-          | handedTime (endTime ivalA) > handedTime (endTime ivalB)
-          = go as bs'
-          | otherwise
-          = go as' bs
-      in overlaps <> rest
+        rest =
+          case compare ( handedTime ( endTime ivalA ) ) ( handedTime ( endTime ivalB ) ) of
+            LT -> go as' bs
+            GT -> go as  bs'
+            EQ -> go as' bs'
+      in
+        case ivalA `intersection` ivalB of
+          Just ival -> ( ival, f a b ) :<| rest
+          Nothing   -> rest
 
-instance ( Ord t, Bounded t ) => BoundedLattice ( Intervals t ) where
+instance ( Measurable t, Bounded t ) => BoundedLattice ( Intervals t ) where
   bottom = Intervals Empty
   top    = Intervals ( Seq.singleton $ Interval top top )
 
@@ -395,7 +406,7 @@ remove = coerce remove'
 --   - When pruning was necessary, returns ( kept, removed ),
 --     where `kept` are the kept intervals (longer than the given amount),
 --     and `removed` are the intervals that were pruned away.
-pruneShorterThan :: forall t. ( Num t, Ord t ) => Delta t -> Intervals t -> Maybe ( Intervals t, Intervals t )
+pruneShorterThan :: forall t. ( Num t, Measurable t ) => Delta t -> Intervals t -> Maybe ( Intervals t, Intervals t )
 pruneShorterThan = coerce pruneShorterThan'
   where
     pruneShorterThan' :: Delta t -> Seq ( Interval t ) -> Maybe ( Seq ( Interval t ), Seq ( Interval t ) )
@@ -405,5 +416,4 @@ pruneShorterThan = coerce pruneShorterThan'
       where
         ( kept, removed ) = Seq.partition longEnough ivals
         longEnough :: Interval t -> Bool
-        longEnough ( Interval ( Endpoint ( EarliestTime s ) _ ) ( Endpoint ( LatestTime e ) _ ) ) =
-          ( s --> e ) >= delta
+        longEnough ival = measure ival >= delta

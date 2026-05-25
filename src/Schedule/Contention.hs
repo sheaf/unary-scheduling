@@ -66,6 +66,7 @@ import Data.Lattice
 import Schedule.Interval
   ( Clusivity(..), Endpoint(..)
   , Interval(..), startTime, endTime
+  , Measurable(..)
   , Intervals(..)
   , intersectIntervalsWith
   )
@@ -101,7 +102,7 @@ pattern xs :|> x <- ( viewr -> xs :> x )
 -- This is a piecewise-quadratic function, the product
 -- of the tasks' individual piecewise-linear contention functions.
 jointContention
-  :: ( Real t, Ord t, Fractional f )
+  :: ( Real t, Measurable t, Fractional f )
   => Task task t -> Task task t -> Seq ( Interval t, Quadratic f )
 jointContention tk1 tk2
   = intersectIntervalsWith multiplyLinear ( taskContention tk1 ) ( taskContention tk2 )
@@ -110,7 +111,7 @@ jointContention tk1 tk2
 -- their joint contention. The higher it is, the more the two tasks compete for the
 -- resource, so the search benefits from deciding their order sooner.
 contentionScore
-  :: ( Real t, Ord t, Fractional f, Ord f )
+  :: ( Real t, Measurable t, Fractional f, Ord f )
   => Task task t -> Task task t -> f
 contentionScore tk1 tk2 =
   maximum $ 0 :

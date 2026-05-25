@@ -112,6 +112,8 @@ import Data.Vector.Ranking
   ( rankOn )
 import Schedule.Constraint
   ( Constraints )
+import Schedule.Interval
+  ( Measurable )
 import Schedule.Ordering
   ( Order(..), newOrderingMatrix )
 import Schedule.Task
@@ -123,6 +125,7 @@ import Schedule.Tree
   ( Propagatable
       ( overloaded )
   )
+
 
 -------------------------------------------------------------------------------
 -- Schedule monad.
@@ -144,10 +147,10 @@ data TaskUpdates t
   }
   deriving stock ( Show, Generic )
 
-instance Ord t => Semigroup ( TaskUpdates t ) where
+instance Measurable t => Semigroup ( TaskUpdates t ) where
   TaskUpdates cts1 mods1 <> TaskUpdates cts2 mods2 =
     TaskUpdates ( cts1 <> cts2 ) ( mods1 <> mods2 )
-instance Ord t => Monoid ( TaskUpdates t ) where
+instance Measurable t => Monoid ( TaskUpdates t ) where
   mempty = TaskUpdates mempty mempty
 
 type ScheduleMonad s task t =
@@ -169,7 +172,7 @@ type MonadSchedule s task t m =
 
 runScheduleMonad
   :: forall task t taskData a
-  .  ( Num t, Ord t, Bounded t
+  .  ( Num t, Measurable t, Bounded t
      , SchedulableData taskData task t
      )
   => taskData
@@ -181,7 +184,7 @@ runScheduleMonad givenTasks ma = runST do
   finalTaskData <- unsafeFreeze mutableTaskInfos
   pure ( finalTaskData, second taskConstraints res )
 
-constrain :: ( Ord t, MonadState ( TaskUpdates t ) m ) => Constraints t -> m ()
+constrain :: ( Measurable t, MonadState ( TaskUpdates t ) m ) => Constraints t -> m ()
 constrain s = modify' ( over ( field' @"taskConstraints" ) ( <> s ) )
 
 -------------------------------------------------------------------------------
@@ -198,7 +201,7 @@ instance ( Num t, Ord t, Bounded t )
       where
   initialTaskData = thaw
 
-instance ( Num t, Ord t, Bounded t )
+instance ( Num t, Measurable t, Bounded t )
       => SchedulableData [ ( Task task t, Text ) ] task t
       where
   initialTaskData taskList = do

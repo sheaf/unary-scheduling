@@ -121,8 +121,9 @@ import Schedule.Constraint
   )
 import Schedule.Interval
   ( Endpoint(..)
-  , Interval(..), validInterval, duration
+  , Interval(..)
   , Intervals(..)
+  , Measurable(..)
   , pruneShorterThan
   )
 import Schedule.Monad
@@ -180,7 +181,7 @@ prunePropagator, timetablePropagator,
   notLastPropagator, notFirstPropagator,
   edgeLastPropagator, edgeFirstPropagator,
   predecessorPropagator, successorPropagator
- :: ( Num t, Ord t, Bounded t, Show t )
+ :: ( Num t, Measurable t, Bounded t, Show t )
  => Propagator task t
 prunePropagator =
   Propagator
@@ -251,7 +252,7 @@ successorPropagator =
 
 -- | List of all propagators, in a convenient order for running all propagation algorithms.
 basicPropagators
-  :: ( Num t, Ord t, Bounded t, Show t )
+  :: ( Num t, Measurable t, Bounded t, Show t )
   => [ Propagator task t ]
 basicPropagators =
   -- Local propagators (need to be notified of tasks which have been modified).
@@ -279,7 +280,7 @@ basicPropagators =
 -- and, if the tasks proved to be unschedulable, an explanation for that too.
 propagateConstraints
   :: forall task t taskData
-  .  ( Num t, Ord t, Bounded t, Show t, Show task
+  .  ( Num t, Measurable t, Bounded t, Show t, Show task
      , SchedulableData taskData task t
      )
   => taskData
@@ -296,7 +297,7 @@ propagateConstraints taskData maxLoopIterations propagators =
 -- Goes back to the start of the list of propagators each time a new constraint is emitted.
 propagationLoop
   :: forall s task t
-  .  ( Num t, Ord t, Bounded t
+  .  ( Num t, Measurable t, Bounded t
      -- debugging
      , Show t, Show task
      )
@@ -325,7 +326,7 @@ propagationLoop maxLoopIterations propagators = do
           ( go ( i + 1 ) propagators    )
     updateConstraints
       :: BroadcastTarget
-      -> ScheduleMonad s task t () 
+      -> ScheduleMonad s task t ()
       -> ScheduleMonad s task t ()
       -> ScheduleMonad s task t ()
     updateConstraints toNotify noCtsAction newCtsAction = do
@@ -390,7 +391,7 @@ prune
   .  ( MonadReader ( TaskInfos bvec uvec task t ) m
      , MonadState  ( TaskUpdates t ) m
      , PrimMonad m, s ~ PrimState m
-     , Num t, Ord t, Show t
+     , Num t, Measurable t, Show t
      , ReadableVector m ( Task task t ) ( bvec ( Task task t ) )
      )
   => m ()
@@ -425,7 +426,7 @@ timetable
   .  ( MonadReader ( TaskInfos bvec uvec task t ) m
      , MonadState  ( TaskUpdates t ) m
      , PrimMonad m, s ~ PrimState m
-     , Num t, Ord t, Bounded t, Show t
+     , Num t, Measurable t, Bounded t, Show t
      , ReadableVector m ( Task task t ) ( bvec ( Task task t ) )
      )
   => m ()
@@ -447,7 +448,7 @@ timetable = do
       taskECT = ect task
       necessaryInterval :: Interval t
       necessaryInterval = Interval ( coerce taskLST ) ( coerce taskECT )
-    when ( duration necessaryInterval > mempty ) do
+    unless ( isEmpty necessaryInterval ) do
       let
         necessaryIntervals :: Intervals t
         necessaryIntervals = Intervals ( Seq.singleton necessaryInterval )
@@ -479,7 +480,7 @@ precedenceMatrix
   .  ( MonadReader ( TaskInfos bvec uvec task t ) m
      , MonadState  ( TaskUpdates t ) m
      , PrimMonad m, s ~ PrimState m
-     , Num t, Ord t, Bounded t, Show t
+     , Num t, Measurable t, Bounded t, Show t
      , ReadableVector m ( Task task t ) ( bvec ( Task task t ) )
      , ReadableVector m Order           ( uvec Order )
      , ReadableVector m Int             ( uvec Int )
@@ -562,7 +563,7 @@ overloadCheck
   .  ( MonadReader ( TaskInfos bvec uvec task t ) m
      , MonadError Text  m
      , PrimMonad m, s ~ PrimState m
-     , Num t, Ord t, Bounded t, Show t
+     , Num t, Measurable t, Bounded t, Show t
      , ReadableVector m ( Task task t ) ( bvec ( Task task t ) )
      , ReadableVector m Int             ( uvec Int )
      )
@@ -634,7 +635,7 @@ detectablePrecedences
   .  ( MonadReader ( TaskInfos bvec uvec task t ) m
      , MonadState  ( TaskUpdates t ) m
      , PrimMonad m, s ~ PrimState m
-     , Num t, Ord t, Bounded t, Show t
+     , Num t, Measurable t, Bounded t, Show t
      , ReadableVector m ( Task task t ) ( bvec ( Task task t ) )
      , ReadableVector m Int             ( uvec Int )
      , KnownHandedness h oh
@@ -754,7 +755,7 @@ notExtremal
   .  ( MonadReader ( TaskInfos bvec uvec task t ) m
      , MonadState  ( TaskUpdates t ) m
      , PrimMonad m, s ~ PrimState m
-     , Num t, Ord t, Bounded t, Show t
+     , Num t, Measurable t, Bounded t, Show t
      , ReadableVector m ( Task task t ) ( bvec ( Task task t ) )
      , ReadableVector m Int             ( uvec Int )
      , KnownHandedness h oh
@@ -899,7 +900,7 @@ edgeFinding
   .  ( MonadReader ( TaskInfos bvec uvec task t ) m
      , MonadState  ( TaskUpdates t ) m
      , PrimMonad m, s ~ PrimState m
-     , Num t, Ord t, Bounded t, Show t
+     , Num t, Measurable t, Bounded t, Show t
      , ReadableVector m ( Task task t ) ( bvec ( Task task t ) )
      , ReadableVector m Int             ( uvec Int )
      , KnownHandedness h oh
@@ -1029,7 +1030,7 @@ makespan
   .  ( MonadReader ( TaskInfos bvec uvec task t ) m
      , MonadState  ( TaskUpdates t ) m
      , PrimMonad m, s ~ PrimState m
-     , Num t, Ord t, Bounded t, Show t
+     , Num t, Measurable t, Bounded t, Show t
      , ReadableVector m (Task task t) ( bvec ( Task task t ) )
      , ReadableVector m Int           ( uvec Int )
      , Foldable f1
@@ -1078,7 +1079,7 @@ makespan label taskNbs mkspans = do
   for_ mkspans \ ( mkspan, cap ) -> do
     -- Check whether we need to constrain tasks to not start near the beginning of the makespan range,
     -- because the subset must be in progress near the end of the makespan range.
-    when ( validInterval $ Interval subsetECT ( end mkspan ) ) do
+    unless ( isEmpty $ Interval subsetECT ( end mkspan ) ) do
       let
         latestStart :: Endpoint ( LatestTime t )
         latestStart = cap • ( coerce subsetECT /\ end mkspan )
@@ -1086,7 +1087,7 @@ makespan label taskNbs mkspans = do
         outside = Interval ( start mkspan ) latestStart
         outsides :: Intervals t
         outsides = Intervals ( Seq.singleton outside )
-      when ( validInterval outside ) do
+      unless ( isEmpty outside ) do
         for_ taskNbs \ taskNb -> do
           avail <- taskAvailability <$> taskAvails `unsafeIndex` taskNb
           let
@@ -1103,7 +1104,7 @@ makespan label taskNbs mkspans = do
               \have been removed from this task.\n\n"
     -- Check whether we need to constrain tasks to not finish near the end of the makespan range,
     -- because the subset must be in progress near the start of the makespan range.
-    when ( validInterval $ Interval ( start mkspan ) subsetLST ) do
+    unless ( isEmpty $ Interval ( start mkspan ) subsetLST ) do
       let
         earliestEnd :: Endpoint ( EarliestTime t )
         earliestEnd = cap • ( coerce subsetLST /\ start mkspan )
@@ -1111,7 +1112,7 @@ makespan label taskNbs mkspans = do
         outside = Interval earliestEnd ( end mkspan )
         outsides :: Intervals t
         outsides = Intervals ( Seq.singleton outside )
-      when ( validInterval outside ) do
+      unless ( isEmpty outside ) do
         for_ taskNbs \ taskNb -> do
           avail <- taskAvailability <$> taskAvails `unsafeIndex` taskNb
           let

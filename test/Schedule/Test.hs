@@ -30,7 +30,7 @@ import qualified Data.Vector as Boxed.Vector
 
 -- unary-scheduling
 import Schedule.Interval
-  ( Interval(..), Intervals(..), Endpoint(..), inside )
+  ( Interval(..), Intervals(..), Endpoint(..), Measurable(..), inside )
 import Schedule.Propagators
 import Schedule.Task
   ( Task(..), TaskInfos(..), est, lct )
@@ -42,7 +42,7 @@ import Schedule.Time
 
 -- Time of day in minutes.
 newtype Minutes = Minutes { minutes :: Int }
-  deriving newtype ( Eq, Ord, Num )
+  deriving newtype ( Eq, Ord, Measurable, Num )
 instance Bounded Minutes where
   minBound = 0
   maxBound = 24 * 60
