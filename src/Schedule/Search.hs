@@ -23,8 +23,6 @@ import Data.Act
   ( Torsor((-->)) )
 
 -- containers
-import qualified Data.IntMap as IntMap
-  ( fromList )
 import qualified Data.IntSet as IntSet
   ( singleton )
 import Data.Sequence
@@ -76,7 +74,7 @@ import qualified Data.Sequence.Insert as Seq
 import Data.Vector.Generic.Index
   ( unsafeIndex )
 import Schedule.Constraint
-  ( Constraints(..), Constraint(..) )
+  ( Constraint(..), tightenMany )
 import Schedule.Contention
   ( contentionScore )
 import Schedule.Interval
@@ -369,17 +367,13 @@ addEdge start end = do
     propagateNewEdge i j = do
       tk_i <- taskAvails `unsafeIndex` i
       tk_j <- taskAvails `unsafeIndex` j
-      constrain
-        ( Constraints
-          { constraints
-              = IntMap.fromList
-              [ ( i, NotLaterThan   $ lst tk_j )
-              , ( j, NotEarlierThan $ ect tk_i )
-              ]
-          , justifications = ""
-          , precedences = mempty -- precedences are added by the 'addIncidentEdgesTransitively' function
-          }
-        )
+      constrain $
+        tightenMany
+          -- NB: precedences are added by the 'addIncidentEdgesTransitively' function
+          [ ( i, NotLaterThan   $ lst tk_j )
+          , ( j, NotEarlierThan $ ect tk_i )
+          ]
+          ""
 
     errorMessage :: Either Int ( Int, Int ) -> Text
     errorMessage ( Left i ) =

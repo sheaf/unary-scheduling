@@ -44,8 +44,6 @@ import Data.Act
   ( Act((•)) )
 
 -- containers
-import qualified Data.IntMap.Strict as IntMap
-  ( singleton )
 import Data.IntSet
   ( IntSet )
 import qualified Data.IntSet as IntSet
@@ -119,6 +117,7 @@ import Schedule.Constraint
   , HandedTimeConstraint
     ( handedTimeConstraint )
   , Constraints(..), applyConstraints
+  , tighten, tightenWithPrecedences
   )
 import Schedule.Interval
   ( Endpoint(..)
@@ -408,16 +407,10 @@ prune = do
   forEachModifiedTask \ taskNb -> do
     task <- taskAvails `unsafeIndex` taskNb
     for_ ( pruneShorterThan ( taskDuration task ) ( taskAvailability task ) ) \ ( kept, removed ) ->
-      constrain
-        ( Constraints
-          { constraints    = IntMap.singleton taskNb ( Inside kept )
-          , justifications =
-            "The following time slots have been removed from \"" <> taskNames Boxed.Vector.! taskNb <> "\",\n\
-            \as they are too short to allow the task to complete:\n" <>
-            ( Text.pack ( show removed ) ) <> "\n\n"
-          , precedences    = mempty
-          }
-        )
+      constrain $ tighten taskNb ( Inside kept ) $
+        "The following time slots have been removed from \"" <> taskNames Boxed.Vector.! taskNb <> "\",\n\
+        \as they are too short to allow the task to complete:\n" <>
+        ( Text.pack ( show removed ) ) <> "\n\n"
   assign ( field' @"tasksModified" . DMap.dmat ( Coarse "prune" ) ) ( Just mempty )
 
 -- | Check time spans for which a task is necessarily scheduled, and remove them
@@ -465,18 +458,12 @@ timetable = do
             removedIntervals :: Intervals t
             removedIntervals = necessaryIntervals /\ otherAvailability
           unless ( null $ intervals removedIntervals ) do
-            constrain
-              ( Constraints
-                { constraints    = IntMap.singleton otherTaskNb ( Outside necessaryIntervals )
-                , justifications =
-                  "\"" <> taskNames Boxed.Vector.! taskNb <> "\" must be in progress during\n\
-                  \  * " <> Text.pack ( show necessaryInterval ) <> "\n\
-                  \As a result, the intervals \n\
-                  \  * " <> Text.pack ( show removedIntervals ) <> "\n\
-                  \have been removed from \"" <> taskNames Boxed.Vector.! otherTaskNb <> "\"\n\n"
-                , precedences    = mempty
-                }
-              )
+            constrain $ tighten otherTaskNb ( Outside necessaryIntervals ) $
+              "\"" <> taskNames Boxed.Vector.! taskNb <> "\" must be in progress during\n\
+              \  * " <> Text.pack ( show necessaryInterval ) <> "\n\
+              \As a result, the intervals \n\
+              \  * " <> Text.pack ( show removedIntervals ) <> "\n\
+              \have been removed from \"" <> taskNames Boxed.Vector.! otherTaskNb <> "\"\n\n"
 
 -------------------------------------------------------------------------------
 -- Global propagators.
@@ -533,13 +520,7 @@ precedenceMatrix = do
             currentSubsetTaskNames <> "\n\
             \As a result, \"" <> taskNames Boxed.Vector.! taskNb <> "\" must be scheduled " <> afterOrBefore <>
             "  * " <> Text.pack ( show limitTime ) <> "\n\n"
-        constrain
-          ( Constraints
-            { constraints    = IntMap.singleton taskNb constraint
-            , justifications = reason
-            , precedences    = mempty
-            }
-          )
+        constrain $ tighten taskNb constraint reason
       | otherwise
       -- Loop over predecessors in increasing earliest start time / successors in decreasing latest completion time,
       -- to propagate information from the precedence matrix.
@@ -749,13 +730,10 @@ detectablePrecedences = do
                 "As a consequence, this task is constrained to " <> earlierOrLater <> "\n\
                 \  * " <> Text.pack ( show excludeCurrentTaskSubsetInnerTime ) <> "\n\n"
             -- TODO: add precedence to precedence graph to avoid unnecessary duplication of effort.
-            constrain
-              ( Constraints
-                { constraints    = IntMap.singleton taskNb constraint
-                , justifications = reason
-                , precedences    = IntMap.singleton taskNb ( handedPrecedences @h $ IntSet.fromList otherTaskNbs )
-                }
-              )
+            constrain $
+              tightenWithPrecedences taskNb constraint
+                ( handedPrecedences @h $ IntSet.fromList otherTaskNbs )
+                reason
         -- Continue to next iteration of outer loop.
         go ( i + 1 ) j' otherTaskNbs'
 
@@ -854,13 +832,7 @@ notExtremal = do
                 subsetText <>
                 "As a consequence, the task is constrained to " <> earlierOrLater <> "\n\
                 \  * " <> Text.pack ( show associatedOtherInnerTime ) <> "\n\n"
-            constrain
-              ( Constraints
-                { constraints    = IntMap.singleton currentTaskNb constraint
-                , justifications = reason
-                , precedences    = mempty
-                }
-              )
+            constrain $ tighten currentTaskNb constraint reason
 
       -- Next step of outer loop.
       go ( i + 1 ) j' currentSubset'
@@ -1036,13 +1008,10 @@ edgeFinding = do
                 "As a consequence, the task is constrained to " <> laterOrEarlier <> "\n\
                 \  * " <> Text.pack ( show currentSubsetInnerTime ) <> "\n\n"
             -- TODO: add precedence to precedence graph to avoid unnecessary duplication of effort.
-            constrain
-              ( Constraints
-                { constraints    = IntMap.singleton blamedTaskNb constraint
-                , justifications = reason
-                , precedences    = IntMap.singleton blamedTaskNb ( handedPrecedences @h currentTaskSubset )
-                }
-              )
+            constrain $
+              tightenWithPrecedences blamedTaskNb constraint
+                ( handedPrecedences @h currentTaskSubset )
+                reason
           -- Continue to see if more activities can be removed.
           innerLoop j currentTaskSubset nextOtherOuterTime currentSubsetInnerTime subsetExtraInnerTime'
     innerLoop j currentTaskSubset _ _ _
@@ -1124,20 +1093,14 @@ makespan label taskNbs mkspans = do
             removedIntervals :: Intervals t
             removedIntervals = avail /\ outsides
           unless ( null $ intervals removedIntervals ) do
-            constrain
-              ( Constraints
-                { constraints    = IntMap.singleton taskNb ( Outside outsides )
-                , justifications =
-                  "The makespan constraint " <> Text.pack ( show mkspan ) <> ", " <> Text.pack ( show cap ) <> "\n\
-                  \with label " <> label <> ",\n\
-                  \prevents the task \"" <> taskNames Boxed.Vector.! taskNb <> "\"\n\
-                  \from being scheduled before " <> Text.pack ( show latestStart ) <> " within the makespan interval.\n\
-                  \As a result, the intervals \n\
-                  \  * " <> Text.pack ( show removedIntervals ) <> "\n\
-                  \have been removed from this task.\n\n"
-                , precedences    = mempty
-                }
-              )
+            constrain $ tighten taskNb ( Outside outsides ) $
+              "The makespan constraint " <> Text.pack ( show mkspan ) <> ", " <> Text.pack ( show cap ) <> "\n\
+              \with label " <> label <> ",\n\
+              \prevents the task \"" <> taskNames Boxed.Vector.! taskNb <> "\"\n\
+              \from being scheduled before " <> Text.pack ( show latestStart ) <> " within the makespan interval.\n\
+              \As a result, the intervals \n\
+              \  * " <> Text.pack ( show removedIntervals ) <> "\n\
+              \have been removed from this task.\n\n"
     -- Check whether we need to constrain tasks to not finish near the end of the makespan range,
     -- because the subset must be in progress near the start of the makespan range.
     when ( validInterval $ Interval ( start mkspan ) subsetLST ) do
@@ -1155,17 +1118,11 @@ makespan label taskNbs mkspans = do
             removedIntervals :: Intervals t
             removedIntervals = avail /\ outsides
           unless ( null $ intervals removedIntervals ) do
-            constrain
-              ( Constraints
-                { constraints    = IntMap.singleton taskNb ( Outside outsides )
-                , justifications =
-                  "The makespan constraint " <> Text.pack ( show mkspan ) <> ", " <> Text.pack ( show cap ) <> "\n\
-                  \with label " <> label <> ",\n\
-                  \prevents the task \"" <> taskNames Boxed.Vector.! taskNb <> "\"\n\
-                  \from being scheduled after " <> Text.pack ( show earliestEnd ) <> " within the makespan interval.\n\
-                  \As a result, the intervals \n\
-                  \  * " <> Text.pack ( show removedIntervals ) <> "\n\
-                  \have been removed from this task.\n\n"
-                , precedences    = mempty
-                }
-              )
+            constrain $ tighten taskNb ( Outside outsides ) $
+              "The makespan constraint " <> Text.pack ( show mkspan ) <> ", " <> Text.pack ( show cap ) <> "\n\
+              \with label " <> label <> ",\n\
+              \prevents the task \"" <> taskNames Boxed.Vector.! taskNb <> "\"\n\
+              \from being scheduled after " <> Text.pack ( show earliestEnd ) <> " within the makespan interval.\n\
+              \As a result, the intervals \n\
+              \  * " <> Text.pack ( show removedIntervals ) <> "\n\
+              \have been removed from this task.\n\n"

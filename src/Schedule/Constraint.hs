@@ -6,6 +6,8 @@ module Schedule.Constraint
     ( .. , NotEarlierThan, NotLaterThan, Outside, Inside )
   , HandedTimeConstraint(..)
   , Constraints(..)
+  , Reason
+  , tighten, tightenWithPrecedences, tightenMany
   , constrainToBefore, constrainToAfter
   , constrainToInside, constrainToOutside
   , applyConstraint, applyConstraints
@@ -22,7 +24,7 @@ import GHC.Generics
 import Data.IntMap.Strict
   ( IntMap )
 import qualified Data.IntMap.Strict as IntMap
-  ( empty, unionWith, traverseWithKey )
+  ( empty, singleton, fromList, unionWith, traverseWithKey )
 import Data.IntSet
   ( IntSet )
 
@@ -137,6 +139,44 @@ instance Ord t => Semigroup ( Constraints t ) where
       ( IntMap.unionWith (<>) precs1 precs2 )
 instance Ord t => Monoid ( Constraints t ) where
   mempty = Constraints IntMap.empty mempty mempty
+
+--------------------------------------------------------------------------------
+-- Smart constructors for emitting constraints.
+
+-- | A human-readable explanation for an inference.
+--
+-- TODO: turn into a structured clausal reason for lazy clause generation.
+type Reason = Text
+
+-- | Constrain a single task, recording the reason for the inference.
+tighten :: Int -> Constraint t -> Reason -> Constraints t
+tighten taskNb ct reason =
+  Constraints
+    { constraints    = IntMap.singleton taskNb ct
+    , justifications = reason
+    , precedences    = mempty
+    }
+
+-- | Like 'tighten', but also records precedence information
+-- (the task's new predecessors and successors) for the precedence graph.
+tightenWithPrecedences :: Int -> Constraint t -> ( IntSet, IntSet ) -> Reason -> Constraints t
+tightenWithPrecedences taskNb ct precs reason =
+  Constraints
+    { constraints    = IntMap.singleton taskNb ct
+    , justifications = reason
+    , precedences    = IntMap.singleton taskNb precs
+    }
+
+-- | Constrain several tasks at once, with a shared reason and no precedence information.
+tightenMany :: [ ( Int, Constraint t ) ] -> Reason -> Constraints t
+tightenMany cts reason =
+  Constraints
+    { constraints    = IntMap.fromList cts
+    , justifications = reason
+    , precedences    = mempty
+    }
+
+--------------------------------------------------------------------------------
 
 applyConstraints
   :: ( MonadReader ( MutableTaskInfos s task t ) m
