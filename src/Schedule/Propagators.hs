@@ -37,7 +37,7 @@ import Data.Kind
 import Data.Semigroup
   ( Arg(..) )
 import Data.Foldable
-  ( for_ )
+  ( for_, find )
 
 -- acts
 import Data.Act
@@ -47,13 +47,19 @@ import Data.Act
 import Data.IntSet
   ( IntSet )
 import qualified Data.IntSet as IntSet
-  ( fromList, delete )
+  ( fromList, delete, null, empty )
 import qualified Data.Sequence as Seq
   ( singleton )
 
 -- dependent-map
+import qualified Data.Dependent.Map as DMap
+  ( fromList, lookup, insert )
 import qualified Data.Dependent.Map.Lens as DMap
   ( dmat )
+
+-- dependent-sum
+import Data.Dependent.Sum
+  ( DSum((:=>)) )
 
 -- generic-lens
 import Data.GenericLens.Internal
@@ -132,7 +138,7 @@ import Schedule.Monad
   , constrain
   , SchedulableData
   , TaskUpdates(..)
-  , Notifiee(..)
+  , Notifiee(..), Modifications
   , BroadcastTarget(..), broadcastModifications
   )
 import Schedule.Ordering
@@ -164,14 +170,11 @@ import Schedule.Tree
 -- Propagators.
 
 -- | Wrapper for a propagator.
---
--- We keep track of the propagator name at the type level,
--- so that we can notify all *other* (local) propagators of stale tasks
--- that they need to process.
 data Propagator task t where
   Propagator
     :: forall ( n :: Type ) ( task :: Type ) ( t :: Type )
-    .  { mbNotifiee    :: Maybe ( Notifiee n )
+    .  { wakeOn        :: Notifiee n
+         -- ^ Task modifications this propagator cares about.
        , notifyTarget  :: BroadcastTarget
        , runPropagator :: forall s. ScheduleMonad s task t ()
        }
@@ -188,67 +191,67 @@ prunePropagator, timetablePropagator,
  => Propagator task t
 prunePropagator =
   Propagator
-    { mbNotifiee    = Just ( Coarse "prune" )
+    { wakeOn        = Coarse "prune"
     , notifyTarget  = TellEveryoneBut "prune"
     , runPropagator = prune
     }
 timetablePropagator =
   Propagator
-    { mbNotifiee    = Just ( Coarse "timetable" )
+    { wakeOn        = Coarse "timetable"
     , notifyTarget  = TellEveryone
     , runPropagator = timetable
     }
 overloadPropagator =
   Propagator
-    { mbNotifiee    = Nothing
+    { wakeOn        = Coarse "overload"
     , notifyTarget  = TellEveryone
     , runPropagator = overloadCheck
     }
 detectablePrecedencesPropagator =
   Propagator
-    { mbNotifiee    = Nothing
+    { wakeOn        = Coarse "detectablePrecedences"
     , notifyTarget  = TellEveryone
     , runPropagator = detectablePrecedences @Earliest
     }
 detectableSuccedencesPropagator =
   Propagator
-    { mbNotifiee    = Nothing
+    { wakeOn        = Coarse "detectableSuccedences"
     , notifyTarget  = TellEveryone
     , runPropagator = detectablePrecedences @Latest
     }
 notLastPropagator =
   Propagator
-    { mbNotifiee    = Nothing
+    { wakeOn        = Coarse "notLast"
     , notifyTarget  = TellEveryone
     , runPropagator = notExtremal @Earliest
     }
 notFirstPropagator =
   Propagator
-    { mbNotifiee    = Nothing
+    { wakeOn        = Coarse "notFirst"
     , notifyTarget  = TellEveryone
     , runPropagator = notExtremal @Latest
     }
 edgeLastPropagator =
   Propagator
-    { mbNotifiee    = Nothing
+    { wakeOn        = Coarse "edgeLast"
     , notifyTarget  = TellEveryone
     , runPropagator = edgeFinding @Earliest
     }
 edgeFirstPropagator =
   Propagator
-    { mbNotifiee    = Nothing
+    { wakeOn        = Coarse "edgeFirst"
     , notifyTarget  = TellEveryone
     , runPropagator = edgeFinding @Latest
     }
 predecessorPropagator =
   Propagator
-    { mbNotifiee    = Nothing
+    { wakeOn        = Coarse "predecessor"
     , notifyTarget  = TellEveryone
     , runPropagator = precedenceMatrix @Earliest
     }
 successorPropagator =
   Propagator
-    { mbNotifiee    = Nothing
+    { wakeOn        = Coarse "successor"
     , notifyTarget  = TellEveryone
     , runPropagator = precedenceMatrix @Latest
     }
@@ -295,9 +298,7 @@ propagateConstraints taskData maxLoopIterations propagators =
     ( updatedTasks, ( mbGaveUpText, Constraints { justifications } ) ) ->
       ( updatedTasks, justifications, either Just ( const Nothing ) mbGaveUpText )
 
--- | Run the given propagators in a loop until no new constraints are emitted.
---
--- Goes back to the start of the list of propagators each time a new constraint is emitted.
+-- | Run the given propagators to a fixpoint (event-driven).
 propagationLoop
   :: forall s task t
   .  ( Num t, Measurable t, Bounded t
@@ -308,48 +309,95 @@ propagationLoop
   -> Trail s task t
   -> [ Propagator task t ]
   -> ScheduleMonad s task t ()
-propagationLoop maxLoopIterations trail propagators = do
-  -- Apply the currently existing constraints, notifying
-  -- all propagators that need this information.
-  -- Then start the propagation loop.
-  updateConstraints TellEveryone
-    ( go 0 propagators )
-    ( go 0 propagators )
+propagationLoop maxRounds trail propagators = do
+  -- Seed every subscription with all tasks, so each propagator runs at least once.
+  seedAllDirty
+  -- Apply any constraints already posted (e.g. by a search decision) before the
+  -- first propagator runs, so it sees the tightened domains.
+  _ <- applyEmitted TellEveryone
+  drive maxRounds
   where
-    go :: Int -> [ Propagator task t ] -> ScheduleMonad s task t ()
-    go _ []
+
+    -- Mark every propagator's subscription as pending over all tasks.
+    seedAllDirty :: ScheduleMonad s task t ()
+    seedAllDirty = do
+      TaskInfos { taskNames } <- ask
+      let
+        allTasks :: IntSet
+        allTasks = IntSet.fromList [ 0 .. Boxed.Vector.length taskNames - 1 ]
+        seeded :: Modifications
+        seeded = DMap.fromList
+          [ case prop of Propagator { wakeOn } -> wakeOn :=> Identity ( fullValue wakeOn allTasks )
+          | prop <- propagators
+          ]
+      modify' ( set ( field' @"tasksModified" ) seeded )
+
+    -- The first propagator with pending work, in list order (so earlier
+    -- propagators keep their priority).
+    firstReady :: Modifications -> Maybe ( Propagator task t )
+    firstReady mods =
+      find ( \ ( Propagator { wakeOn } ) -> hasPending wakeOn mods ) propagators
+
+    drive :: Int -> ScheduleMonad s task t ()
+    drive rounds
+      | rounds <= 0
       = pure ()
-    go i _
-      | i >= maxLoopIterations
-      -- TODO: the caller has no way to distinguish genuine fixed point
-      -- from exhausted loop iterations, which can increase backtracking
-      -- significantly.
-      = pure ()
-    go i ( Propagator { notifyTarget, runPropagator = runCurrentProp } : followingProps )
+      | otherwise
       = do
-        runCurrentProp
-        updateConstraints notifyTarget
-          ( go   i       followingProps )
-          ( go ( i + 1 ) propagators    )
-    updateConstraints
-      :: BroadcastTarget
-      -> ScheduleMonad s task t ()
-      -> ScheduleMonad s task t ()
-      -> ScheduleMonad s task t ()
-    updateConstraints toNotify noCtsAction newCtsAction = do
+        mods <- view ( field' @"tasksModified" ) <$> get
+        case firstReady mods of
+          -- No subscription has pending work: fixpoint reached.
+          Nothing -> pure ()
+          Just ( Propagator { wakeOn, notifyTarget, runPropagator } ) -> do
+            runPropagator
+            -- Consume this propagator's pending set (local propagators also clear
+            -- their own; clearing again here is harmless and covers the globals).
+            modify' ( over ( field' @"tasksModified" ) ( clearPending wakeOn ) )
+            applied <- applyEmitted notifyTarget
+            -- Only a round that actually applied constraints counts against the
+            -- safety bound, matching the previous loop's iteration counting.
+            drive ( if applied then rounds - 1 else rounds )
+
+    -- Apply any emitted constraints, broadcasting the resulting task changes to
+    -- the subscriptions that should react. Returns whether anything was applied.
+    applyEmitted :: BroadcastTarget -> ScheduleMonad s task t Bool
+    applyEmitted toNotify = do
       cts <- view ( field' @"taskConstraints" ) <$> get
       if null ( constraints cts )
       then
-        noCtsAction
+        pure False
       else do
         modifs <- applyConstraints trail cts
         modify'
           -- Reset constraints: they have been applied.
           $ set  ( field' @"taskConstraints" . field' @"constraints" ) mempty
-          -- Broadcast which tasks have been newly modified to all
-          -- the other propagators which make use of such modification information.
+          -- Broadcast which tasks have been newly modified to the subscriptions
+          -- of the propagators that should wake on them.
           . over ( field' @"tasksModified" ) ( broadcastModifications toNotify modifs )
-        newCtsAction
+        pure True
+
+-- | The \"all tasks pending\" value for a subscription (seeding the initial run).
+fullValue :: Notifiee n -> IntSet -> n
+fullValue ( Coarse _ ) allTasks = allTasks
+fullValue ( Fine   _ ) allTasks = ( allTasks, allTasks )
+
+-- | The empty pending value for a subscription.
+emptyValue :: Notifiee n -> n
+emptyValue ( Coarse _ ) = IntSet.empty
+emptyValue ( Fine   _ ) = ( IntSet.empty, IntSet.empty )
+
+-- | Whether a subscription currently has pending (un-processed) task modifications.
+hasPending :: Notifiee n -> Modifications -> Bool
+hasPending key mods =
+  case DMap.lookup key mods of
+    Nothing           -> False
+    Just ( Identity v ) -> case key of
+      Coarse _ -> not ( IntSet.null v )
+      Fine   _ -> case v of ( l, r ) -> not ( IntSet.null l ) || not ( IntSet.null r )
+
+-- | Clear a subscription's pending set.
+clearPending :: Notifiee n -> Modifications -> Modifications
+clearPending key = DMap.insert key ( Identity ( emptyValue key ) )
 
 -------------------------------------------------------------------------------
 -- Convenience class synonym for polymorphism over scheduling tree handedness.

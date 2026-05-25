@@ -167,7 +167,7 @@ import Schedule.Interval
   , insideLax
   )
 import Schedule.Monad
-  ( BroadcastTarget(..), runScheduleMonad )
+  ( BroadcastTarget(..), Notifiee(..), runScheduleMonad )
 import Schedule.Ordering
   ( visualiseEdges )
 import Schedule.Search
@@ -251,7 +251,7 @@ scheduleSpreadsheet = do
             $ fmap
                 ( \ StaffMemberData { memberName, memberMakespanRanges, memberAssignedTasks } ->
                   Propagator
-                    { mbNotifiee     = Nothing
+                    { wakeOn         = Coarse ( "makespan:" <> memberName )
                     , notifyTarget   = TellEveryone
                     , runPropagator  = makespan memberName memberAssignedTasks memberMakespanRanges
                     }
