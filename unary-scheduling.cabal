@@ -95,9 +95,6 @@ library
   hs-source-dirs:
       src
 
-    -- TODO: split out testing
-    , test
-
   exposed-modules:
       Data.Lattice
     , Data.Sequence.Insert
@@ -114,9 +111,6 @@ library
     , Schedule.Task
     , Schedule.Time
     , Schedule.Tree
-
-    -- TODO: split out testing
-    , Schedule.Test
 
   build-depends:
       acts
@@ -189,3 +183,26 @@ executable schedule-spreadsheet
 
   ghc-options:
     -threaded
+
+test-suite unary-scheduling-test
+
+  import: common
+
+  type:
+    exitcode-stdio-1.0
+
+  hs-source-dirs:
+    test
+
+  main-is:
+    Main.hs
+
+  other-modules:
+    Schedule.Test
+
+  build-depends:
+      unary-scheduling
+    , tasty
+        >= 1.4   && < 1.6
+    , tasty-hunit
+        >= 0.10  && < 0.11
