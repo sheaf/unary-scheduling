@@ -232,7 +232,7 @@ instance HandedTimeConstraint Latest   where
 
 -- | Apply the constraint: task must begin after the specified time.
 constrainToAfter
-  :: ( Num t, Ord t, Bounded t
+  :: ( Num t, Measurable t, Bounded t
      , PrimMonad m, PrimState m ~ s
      )
   => Trail s task t
@@ -256,7 +256,7 @@ constrainToAfter trail tis@( TaskInfos { taskAvails, rankingEST, rankingECT } ) 
 
 -- | Apply the constraint: task must end before the specified time.
 constrainToBefore
-  :: ( Num t, Ord t, Bounded t
+  :: ( Num t, Measurable t, Bounded t
      , PrimMonad m, PrimState m ~ s
      )
   => Trail s task t
@@ -280,7 +280,7 @@ constrainToBefore trail tis@( TaskInfos { taskAvails, rankingLCT, rankingLST } )
 
 -- | Remove intervals from the domain of availability of a task.
 constrainToOutside
-  :: ( Num t, Ord t, Bounded t
+  :: ( Num t, Measurable t, Bounded t
      , PrimMonad m, PrimState m ~ s
      )
   => Trail s task t

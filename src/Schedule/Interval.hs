@@ -237,12 +237,20 @@ class Ord t => Measurable t where
   -- | Is an interval empty?
   isEmpty :: Interval t -> Bool
 
+  -- | Normalise an earliest-start endpoint to a canonical representation.
+  canonicalEarliest :: Endpoint ( EarliestTime t ) -> Endpoint ( EarliestTime t )
+  canonicalEarliest = id
+
+  -- | Like 'canonicalEarliest', for a latest-completion endpoint.
+  canonicalLatest :: Endpoint ( LatestTime t ) -> Endpoint ( LatestTime t )
+  canonicalLatest = id
 
 instance Measurable Double where
   measure ival = max ( Delta 0 ) $ handedTime ( startTime ival ) --> handedTime ( endTime ival )
   isEmpty ( Interval (Endpoint (EarliestTime s) s_clu) (Endpoint (LatestTime e) e_clu) )
     =  s > e
     || ( s == e && ( s_clu == Exclusive || e_clu == Exclusive ) )
+  -- Dense time: each set has a unique representation, so no normalisation needed.
 
 instance Measurable Int where
   measure ( Interval (Endpoint (EarliestTime (Time s)) s_clu) (Endpoint (LatestTime (Time e)) e_clu) ) =
@@ -254,6 +262,14 @@ instance Measurable Int where
     let s' = if s_clu == Inclusive then s else s + 1
         e' = if e_clu == Inclusive then e else e - 1
     in s' > e'
+
+  -- Discrete time: an exclusive bound is the inclusive bound one step in.
+  canonicalEarliest ( Endpoint ( EarliestTime ( Time s ) ) Exclusive ) =
+    Endpoint ( EarliestTime ( Time ( s + 1 ) ) ) Inclusive
+  canonicalEarliest e = e
+  canonicalLatest ( Endpoint ( LatestTime ( Time e ) ) Exclusive ) =
+    Endpoint ( LatestTime ( Time ( e - 1 ) ) ) Inclusive
+  canonicalLatest e = e
 
 -------------------------------------------------------------------------------
 -- Intervals.

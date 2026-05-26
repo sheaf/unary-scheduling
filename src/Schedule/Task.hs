@@ -85,6 +85,8 @@ import Schedule.Interval
   ( Endpoint(..), Interval(..)
   , Intervals
     ( Intervals )
+  , Measurable
+    ( canonicalEarliest, canonicalLatest )
   )
 import Schedule.Ordering
   ( OrderingMatrix )
@@ -106,28 +108,28 @@ data Task task t
   deriving stock    ( Show, Eq, Generic )
   deriving anyclass NFData
 
--- | Earliest start time.
-est :: ( Ord t, Bounded t ) => Task task t -> Endpoint ( EarliestTime t )
-est ( Task { taskAvailability = Intervals ( ival :<| _ ) } ) = start ival
+-- | Earliest start time, in canonical form.
+est :: ( Measurable t, Bounded t ) => Task task t -> Endpoint ( EarliestTime t )
+est ( Task { taskAvailability = Intervals ( ival :<| _ ) } ) = canonicalEarliest ( start ival )
 est _                                                        = bottom
 
--- | Latest completion time.
-lct :: ( Ord t, Bounded t ) => Task task t -> Endpoint ( LatestTime t )
-lct ( Task { taskAvailability = Intervals ( _ :|> ival ) } ) = end ival
+-- | Latest completion time, in canonical form (see 'canonicalLatest').
+lct :: ( Measurable t, Bounded t ) => Task task t -> Endpoint ( LatestTime t )
+lct ( Task { taskAvailability = Intervals ( _ :|> ival ) } ) = canonicalLatest ( end ival )
 lct _                                                        = bottom
 
--- | Latest start time.
-lst :: ( Num t, Ord t, Bounded t ) => Task task t -> Endpoint ( LatestTime t )
+-- | Latest start time (canonical).
+lst :: ( Num t, Measurable t, Bounded t ) => Task task t -> Endpoint ( LatestTime t )
 lst ( task@( Task { taskDuration = delta } ) ) = delta • lct task -- recall: action of delta on 'LatestTime' involves an inversion
 
--- | Earliest completion time.
-ect :: ( Num t, Ord t, Bounded t ) => Task task t -> Endpoint ( EarliestTime t )
+-- | Earliest completion time (canonical).
+ect :: ( Num t, Measurable t, Bounded t ) => Task task t -> Endpoint ( EarliestTime t )
 ect ( task@( Task { taskDuration = delta } ) ) = delta • est task
 
 -- | Quick summary of all the tasks' start and end times.
 summariseTasks
   :: forall task t
-  .  ( Show task, Show t, Ord t, Bounded t )
+  .  ( Show task, Show t, Measurable t, Bounded t )
   => Boxed.Vector Text
   -> Boxed.Vector ( Task task t )
   -> Text
@@ -155,7 +157,7 @@ class PickEndpoint ( h :: Handedness ) ( e :: Limit ) where
   type EndpointRanking h e :: Symbol
 
   pickEndpoint
-    :: ( Num t, Ord t, Bounded t )
+    :: ( Num t, Measurable t, Bounded t )
     => Task task t
     -> Endpoint ( HandedTime h t )
 
