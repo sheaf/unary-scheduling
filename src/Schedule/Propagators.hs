@@ -570,9 +570,11 @@ precedenceMatrix = do
     go :: Int -> Endpoint ( HandedTime h t ) -> Endpoint ( HandedTime h t ) -> [Int] -> Int -> m ()
     go taskNb taskOuterTime limitTime subsetTaskNbs j
       | j >= nbTasks
-      -- Done with the inner loop: report the new earliest start time / latest completion time,
-      -- if it imposes a new constraint.
-      = when ( overloaded limitTime ( coerce taskOuterTime ) ) do
+      -- Done with the inner loop: report the new earliest/latest time, but only
+      -- if it would actually tighten the current outer time (the strict lattice
+      -- meet test; see the analogous guards in 'detectablePrecedences' and
+      -- 'edgeFinding').
+      = when ( ( taskOuterTime /\ limitTime ) /= taskOuterTime ) do
         let
           constraint :: Constraint t
           constraint = handedTimeConstraint limitTime
@@ -727,17 +729,19 @@ detectablePrecedences = do
     --
     go :: Int -> Int -> [Int] -> m ()
     go i j js
-      | max i j >= nbTasks
+      | i >= nbTasks
       = pure ()
       | otherwise
       = do
-        let
         taskNb   <- ( ordered $ view ( _ranking @h @Inner ) allTasks ) `unsafeIndex` ( handedIndex @h nbTasks i )
         currTask <-                                         taskAvails `unsafeIndex` taskNb
         innerLoop taskNb currTask i j js
 
     innerLoop :: Int -> Task task t -> Int -> Int -> [Int] -> m ()
-    innerLoop taskNb currentTask i j otherTaskNbs = do
+    innerLoop taskNb currentTask i j otherTaskNbs
+      | j >= nbTasks
+      = finishOuter taskNb currentTask i j otherTaskNbs
+      | otherwise = do
       otherTaskNb <- ( ordered $ view ( _ranking @oh @Inner ) allTasks ) `unsafeIndex` ( handedIndex @h nbTasks j )
       otherTask   <-                                          taskAvails `unsafeIndex` otherTaskNb
       let
@@ -765,50 +769,55 @@ detectablePrecedences = do
           | otherwise
           = ( j, otherTaskNbs )
 
-      if addNode && j' < nbTasks
+      if addNode
       then
-        innerLoop taskNb currentTask i j' otherTaskNbs'
-      else do
-        -- End of inner loop: gather results.
-        when ( j > 0 ) do
-          clone <- cloneTree tree
-          -- Compute the estimated earliest completion time / latest start time
-          -- from the subset excluding the current task.
-          excludeCurrentTaskSubsetInnerTime
-            <- subsetInnerTime <$> propagateLeafChange clone mempty allTasks taskNb
+        innerLoop   taskNb currentTask i j' otherTaskNbs'
+      else
+        finishOuter taskNb currentTask i j' otherTaskNbs'
+
+    -- End of the inner loop for the current outer task: emit the detected
+    -- precedence (if nontrivial) and go to the next outer loop iteration.
+    finishOuter :: Int -> Task task t -> Int -> Int -> [Int] -> m ()
+    finishOuter taskNb currentTask i j otherTaskNbs = do
+      when ( j > 0 ) do
+        clone <- cloneTree tree
+        -- Compute the estimated earliest completion time / latest start time
+        -- from the subset excluding the current task.
+        excludeCurrentTaskSubsetInnerTime
+          <- subsetInnerTime <$> propagateLeafChange clone mempty allTasks taskNb
+        let
+          currentOuterTime :: Endpoint ( HandedTime h t )
+          currentOuterTime = pickEndpoint @h @Outer currentTask
+        -- Check that this succedence/precedence would induce a nontrivial constraint on the current task availability.
+        when ( ( currentOuterTime /\ excludeCurrentTaskSubsetInnerTime ) /= currentOuterTime ) do
           let
-            currentOuterTime :: Endpoint ( HandedTime h t )
-            currentOuterTime = pickEndpoint @h @Outer currentTask
-          -- Check that this succedence/precedence would induce a nontrivial constraint on the current task availability.
-          when ( not $ overloaded currentOuterTime ( coerce excludeCurrentTaskSubsetInnerTime ) ) do
-            let
-              currentTaskSubset :: Text
-              currentTaskSubset =
-                foldMap
-                  ( \ tk -> "  * \"" <> taskNames Boxed.Vector.! tk <> "\"\n" )
-                  otherTaskNbs
-              constraint :: Constraint t
-              constraint = handedTimeConstraint excludeCurrentTaskSubsetInnerTime
-              succedeOrPrecede, earlierOrLater :: Text
-              ( succedeOrPrecede, earlierOrLater )
-                | NotEarlierThan _ <- constraint
-                = ( "succede", "start after" )
-                | otherwise
-                = ( "precede", "end before" )
-              reason :: Text
-              reason =
-                "Precedence detected:\n" <>
-                "\"" <> taskNames Boxed.Vector.! taskNb <> "\" must " <> succedeOrPrecede <> " all of the following tasks:\n" <>
-                currentTaskSubset <>
-                "As a consequence, this task is constrained to " <> earlierOrLater <> "\n\
-                \  * " <> Text.pack ( show excludeCurrentTaskSubsetInnerTime ) <> "\n\n"
-            -- TODO: add precedence to precedence graph to avoid unnecessary duplication of effort.
-            constrain $
-              tightenWithPrecedences taskNb constraint
-                ( handedPrecedences @h $ IntSet.fromList otherTaskNbs )
-                reason
-        -- Continue to next iteration of outer loop.
-        go ( i + 1 ) j' otherTaskNbs'
+            currentTaskSubset :: Text
+            currentTaskSubset =
+              foldMap
+                ( \ tk -> "  * \"" <> taskNames Boxed.Vector.! tk <> "\"\n" )
+                otherTaskNbs
+            constraint :: Constraint t
+            constraint = handedTimeConstraint excludeCurrentTaskSubsetInnerTime
+            succedeOrPrecede, earlierOrLater :: Text
+            ( succedeOrPrecede, earlierOrLater )
+              | NotEarlierThan _ <- constraint
+              = ( "succede", "start after" )
+              | otherwise
+              = ( "precede", "end before" )
+            reason :: Text
+            reason =
+              "Precedence detected:\n" <>
+              "\"" <> taskNames Boxed.Vector.! taskNb <> "\" must " <> succedeOrPrecede <> " all of the following tasks:\n" <>
+              currentTaskSubset <>
+              "As a consequence, this task is constrained to " <> earlierOrLater <> "\n\
+              \  * " <> Text.pack ( show excludeCurrentTaskSubsetInnerTime ) <> "\n\n"
+          -- TODO: add precedence to precedence graph to avoid unnecessary duplication of effort.
+          constrain $
+            tightenWithPrecedences taskNb constraint
+              ( handedPrecedences @h $ IntSet.fromList otherTaskNbs )
+              reason
+      -- Continue to next iteration of outer loop.
+      go ( i + 1 ) j otherTaskNbs
 
   go 0 0 []
 
@@ -831,6 +840,7 @@ notExtremal
      , ReadableVector m ( Task task t ) ( bvec ( Task task t ) )
      , ReadableVector m Int             ( uvec Int )
      , KnownHandedness h oh
+     , Lattice ( Endpoint ( HandedTime oh t ) )
      )
   => m ()
 notExtremal = do
@@ -885,7 +895,7 @@ notExtremal = do
           -- check that the current task can't be scheduled after / before all the other tasks in the current subset
           ( overloaded excludeCurrentTaskSubsetInnerTime ( pickEndpoint @oh @Inner currentTask )
           -- check that this observation imposes a nontrivial constraint on the current task
-          && not ( overloaded ( coerce associatedOtherInnerTime :: Endpoint ( HandedTime h t ) ) currentOtherOuterTime )
+          && ( currentOtherOuterTime /\ associatedOtherInnerTime ) /= currentOtherOuterTime
           )
           do
             let
@@ -1061,7 +1071,8 @@ edgeFinding = do
           let
             blamedOuterTime :: Endpoint ( HandedTime h t )
             blamedOuterTime = pickEndpoint @h @Outer blamedTask
-          when ( not $ overloaded blamedOuterTime ( coerce currentSubsetInnerTime :: Endpoint ( HandedTime oh t ) ) ) do
+          -- Ensure this would result in a nontrivial constraint.
+          when ( ( blamedOuterTime /\ currentSubsetInnerTime ) /= blamedOuterTime ) do
             let
               constraint :: Constraint t
               constraint = handedTimeConstraint currentSubsetInnerTime
