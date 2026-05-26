@@ -5,6 +5,7 @@
 module Schedule.Propagators
   ( -- * Propagator framework.
     Propagator(..), basicPropagators
+  , coarsen
   , propagateConstraints, propagationLoop
     -- * Local constraint propagators.
   , prune, prunePropagator
@@ -201,57 +202,62 @@ timetablePropagator =
     , notifyTarget  = TellEveryone
     , runPropagator = timetable
     }
+-- The Θ-tree propagators below read only the earliest/latest /endpoints/ of
+-- tasks (via est\/ect\/lst\/lct and durations), never the interior holes of a
+-- task's availability. So they wake on endpoint changes only ('Fine'), and sleep
+-- through interior-only changes (e.g. a 'timetable'\/'prune' hole removal that
+-- leaves est and lct untouched).
 overloadPropagator =
   Propagator
-    { wakeOn        = Coarse "overload"
+    { wakeOn        = Fine "overload"
     , notifyTarget  = TellEveryone
     , runPropagator = overloadCheck
     }
 detectablePrecedencesPropagator =
   Propagator
-    { wakeOn        = Coarse "detectablePrecedences"
+    { wakeOn        = Fine "detectablePrecedences"
     , notifyTarget  = TellEveryone
     , runPropagator = detectablePrecedences @Earliest
     }
 detectableSuccedencesPropagator =
   Propagator
-    { wakeOn        = Coarse "detectableSuccedences"
+    { wakeOn        = Fine "detectableSuccedences"
     , notifyTarget  = TellEveryone
     , runPropagator = detectablePrecedences @Latest
     }
 notLastPropagator =
   Propagator
-    { wakeOn        = Coarse "notLast"
+    { wakeOn        = Fine "notLast"
     , notifyTarget  = TellEveryone
     , runPropagator = notExtremal @Earliest
     }
 notFirstPropagator =
   Propagator
-    { wakeOn        = Coarse "notFirst"
+    { wakeOn        = Fine "notFirst"
     , notifyTarget  = TellEveryone
     , runPropagator = notExtremal @Latest
     }
 edgeLastPropagator =
   Propagator
-    { wakeOn        = Coarse "edgeLast"
+    { wakeOn        = Fine "edgeLast"
     , notifyTarget  = TellEveryone
     , runPropagator = edgeFinding @Earliest
     }
 edgeFirstPropagator =
   Propagator
-    { wakeOn        = Coarse "edgeFirst"
+    { wakeOn        = Fine "edgeFirst"
     , notifyTarget  = TellEveryone
     , runPropagator = edgeFinding @Latest
     }
 predecessorPropagator =
   Propagator
-    { wakeOn        = Coarse "predecessor"
+    { wakeOn        = Coarse "predecessor" -- depends on ordering matrix
     , notifyTarget  = TellEveryone
     , runPropagator = precedenceMatrix @Earliest
     }
 successorPropagator =
   Propagator
-    { wakeOn        = Coarse "successor"
+    { wakeOn        = Coarse "successor" -- depends on ordering matrix
     , notifyTarget  = TellEveryone
     , runPropagator = precedenceMatrix @Latest
     }
@@ -275,6 +281,17 @@ basicPropagators =
   , predecessorPropagator
   , successorPropagator
   ]
+
+-- | The name of a subscription, regardless of its granularity.
+notifieeName :: Notifiee n -> Text
+notifieeName ( Coarse name ) = name
+notifieeName ( Fine   name ) = name
+
+-- | Coarsen a propagator's wake condition: it will then wake on /any/ task
+-- modification, not just endpoint changes.
+coarsen :: Propagator task t -> Propagator task t
+coarsen ( Propagator { wakeOn, notifyTarget, runPropagator } ) =
+  Propagator { wakeOn = Coarse ( notifieeName wakeOn ), notifyTarget, runPropagator }
 
 -- | Propagates constraints for the scheduling of a given collection of (named) tasks,
 -- using the provided propagators.
