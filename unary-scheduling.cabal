@@ -47,6 +47,7 @@ common common
     DeriveGeneric
     DerivingStrategies
     DerivingVia
+    DuplicateRecordFields
     FlexibleContexts
     FlexibleInstances
     FunctionalDependencies
@@ -54,6 +55,7 @@ common common
     GeneralizedNewtypeDeriving
     InstanceSigs
     LambdaCase
+    LexicalNegation
     MagicHash
     NamedFieldPuns
     NamedWildCards
@@ -64,11 +66,15 @@ common common
     QuantifiedConstraints
     RankNTypes
     RecordWildCards
+    RoleAnnotations
     StandaloneDeriving
+    StandaloneKindSignatures
     TypeApplications
     TypeAbstractions
     TypeFamilyDependencies
     TypeOperators
+    UnboxedSums
+    UnboxedTuples
 
   ghc-options:
     -O2
@@ -102,6 +108,11 @@ library
     , Data.Vector.Generic.Index
     , Data.Vector.PhaseTransition
     , Data.Vector.Ranking
+    , SAT
+    , SAT.Base
+    , SAT.Clause
+    , SAT.Restart
+    , SAT.Solver
     , Schedule.Constraint
     , Schedule.Contention
     , Schedule.Interval
@@ -133,6 +144,8 @@ library
          >= 0.8.3.0  && < 1.2
     , groups
          >= 0.4.0.0  && < 0.6
+    , memory-arena
+        ^>= 0.1.0.0
     , primitive
          >= 0.7.0.0  && < 0.10
     , some
@@ -236,7 +249,8 @@ test-suite unary-scheduling-z3-test
     Main.hs
 
   other-modules:
-    Schedule.Z3.Test
+      SAT.Test
+    , Schedule.Z3.Test
 
   build-depends:
       unary-scheduling
@@ -247,3 +261,5 @@ test-suite unary-scheduling-z3-test
         >= 1.4   && < 1.5
     , hedgehog
         >= 1.2   && < 1.6
+    , z3
+         >= 411  && < 413

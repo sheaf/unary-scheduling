@@ -68,7 +68,6 @@ import qualified Data.Vector.Generic as Generic
 import qualified Data.Vector.Generic as Generic.Vector
 import qualified Data.Vector.Generic.Mutable as Generic
   ( MVector )
-import qualified Data.Vector.Generic.Mutable as Generic.MVector
 import qualified Data.Vector.Unboxed as Vector
   ( Unbox )
 import qualified Data.Vector.Unboxed as Unboxed
@@ -320,33 +319,9 @@ addIncidentEdgesTransitively writeCell propagateNewEdge errorMessage mat@( Order
         propagateNewEdge v i
 
 -------------------------------------------------------------------------------
--- Writing out 'Unbox' instance for 'Order' by hand to avoid any Template Haskell...
 
 newtype instance Unboxed.MVector s Order = MVOrder ( Unboxed.MVector s ( Bit, Bit ) )
 newtype instance Unboxed.Vector    Order = VOrder  ( Unboxed.Vector    ( Bit, Bit ) )
-
-instance Generic.MVector Unboxed.MVector Order where
-  basicLength ( MVOrder mv ) = Generic.MVector.basicLength mv
-  basicUnsafeSlice i l ( MVOrder mv ) = MVOrder ( Generic.MVector.basicUnsafeSlice i l mv )
-  basicOverlaps ( MVOrder mv ) ( MVOrder mw ) = Generic.MVector.basicOverlaps mv mw
-  basicUnsafeNew l = MVOrder <$> Generic.MVector.basicUnsafeNew l
-  basicInitialize ( MVOrder mv ) = Generic.MVector.basicInitialize mv
-  basicUnsafeReplicate i x = MVOrder <$> Generic.MVector.basicUnsafeReplicate i ( coerce x )
-  basicUnsafeRead ( MVOrder mv ) i = coerce <$> Generic.MVector.basicUnsafeRead mv i
-  basicUnsafeWrite ( MVOrder mv ) i x = Generic.MVector.basicUnsafeWrite mv i ( coerce x )
-  basicClear ( MVOrder mv ) = Generic.MVector.basicClear mv
-  basicSet ( MVOrder mv ) x = Generic.MVector.basicSet mv ( coerce x )
-  basicUnsafeCopy ( MVOrder mv ) ( MVOrder mw ) = Generic.MVector.basicUnsafeCopy mv mw
-  basicUnsafeMove ( MVOrder mv ) ( MVOrder mw ) = Generic.MVector.basicUnsafeMove mv mw
-  basicUnsafeGrow ( MVOrder mv ) n = MVOrder <$> Generic.MVector.basicUnsafeGrow mv n
-
-instance Generic.Vector Unboxed.Vector Order where
-  basicUnsafeFreeze ( MVOrder mv ) = VOrder <$> Generic.Vector.basicUnsafeFreeze mv
-  basicUnsafeThaw ( VOrder v ) = MVOrder <$> Generic.Vector.basicUnsafeThaw v
-  basicLength ( VOrder v ) = Generic.Vector.basicLength v
-  basicUnsafeSlice i l ( VOrder v ) = VOrder ( Generic.Vector.basicUnsafeSlice i l v )
-  basicUnsafeIndexM ( VOrder v ) i = coerce <$> Generic.Vector.basicUnsafeIndexM v i
-  basicUnsafeCopy ( MVOrder mv ) ( VOrder v ) = Generic.Vector.basicUnsafeCopy mv v
-  elemseq ( VOrder v ) x y = Generic.Vector.elemseq v ( coerce x ) y
-
-instance Vector.Unbox Order
+deriving newtype instance Generic.MVector Unboxed.MVector Order
+deriving newtype instance Generic.Vector Unboxed.Vector Order
+deriving newtype instance Vector.Unbox Order
