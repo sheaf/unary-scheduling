@@ -113,6 +113,7 @@ library
     , SAT.Clause
     , SAT.Restart
     , SAT.Solver
+    , SAT.VarOrder
     , Schedule.Constraint
     , Schedule.Contention
     , Schedule.Interval
@@ -284,6 +285,8 @@ benchmark unary-scheduling-sat-bench
       unary-scheduling
     , random
          >= 1.2   && < 1.4
+    , tasty
+        >= 1.4    && < 1.6
     , tasty-bench
          >= 0.3   && < 0.5
 

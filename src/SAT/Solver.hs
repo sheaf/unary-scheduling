@@ -11,16 +11,37 @@
 --   * on a conflict, run 1-UIP conflict analysis to produce an asserting
 --     learnt clause, backjump, and resume.
 --
--- A Luby schedule throttles restarts. There is no learnt-clause deletion at
--- this stage.
+-- A Luby schedule throttles restarts.
 --
--- References:
+-- = Known limitations
+--
+--
+--   * /No learnt-clause minimisation./ 'analyse' returns the 1-UIP clause
+--     as produced by resolution, without recursive or local self-subsumption
+--     (Sörensson \& Biere 2009).
+--
+--   * /No learnt-clause deletion or DB reduction./ The learnt-clause set
+--     grows monotonically.
+--
+--   * /No LBD (Literal Block Distance) score, no per-clause activity./
+--
+--   * /No hyper-binary resolution, no on-the-fly subsumption./ Input
+--     clauses are normalised only per-clause (duplicates, tautology,
+--     level-0 satisfaction); no cross-clause preprocessing happens.
+--
+--   * /Coarse conflict budget./ 'optConflictBudget' is a single global
+--     count with no per-restart accounting and no time-based fallback.
+--
+-- = References
 --
 --   * Eén, Sörensson (2003), /An Extensible SAT-solver/ (MiniSat).
 --   * Marques-Silva, Sakallah (1996), /GRASP/.
 --   * Moskewicz et al. (2001), /Chaff/.
 --   * Pipatsrisawat, Darwiche (2007), /A Lightweight Component Caching Scheme/
 --     (phase saving).
+--   * Sörensson, Biere (2009), /Minimizing Learned Clauses/.
+--   * Audemard, Simon (2009), /Predicting Learnt Clauses Quality in Modern
+--     SAT Solvers/ (LBD).
 module SAT.Solver
   ( -- * Solver
     Solver
@@ -115,6 +136,10 @@ import qualified SAT.Clause as Clause
   )
 import qualified SAT.Restart as Restart
   ( luby )
+import SAT.VarOrder
+  ( VarOrder, newVarOrder )
+import qualified SAT.VarOrder as VarOrder
+  ( insertVar, bumpActivity, decayActivities, extractMaxBy, reinsertVar )
 
 -------------------------------------------------------------------------------
 -- Decision levels.
@@ -256,8 +281,11 @@ data Solver s = Solver
     --
     -- Defaults to 'Positive' for variables that have never been assigned.
     phase     :: !( Growable Unboxed.MVector s Polarity )
-  , -- | VSIDS activity score per variable.
-    activity  :: !( Growable Unboxed.MVector s Double )
+  , -- | Activity-ordered priority queue over variables (also owns the
+    -- VSIDS activity scores, current bump increment, and decay factor).
+    --
+    -- Replaces the linear-scan decision heuristic with an O(log /n/) pop.
+    varOrder  :: !( VarOrder s )
   , -- | Transient per-variable marker used by 1-UIP analysis.
     --
     -- Always @False@ outside of an 'analyse' call.
@@ -286,10 +314,6 @@ data Solver s = Solver
   , -- | References of all learnt clauses (kept separate from input
     -- clauses so a future deletion policy can target only learnt material).
     learnts   :: !( Growable Primitive.MVector s ClauseRef )
-  , -- | Current VSIDS bump increment; grows over time as decay accumulates.
-    varInc    :: !( MutVar s Double )
-  , -- | Activity decay factor (@< 1@).
-    varDecay  :: !Double
   , -- | Total conflicts encountered.
     confCount :: !( MutVar s Int )
   , -- | Total decisions taken.
@@ -324,7 +348,7 @@ newSolver = do
   lvl   <- Growable.new 16
   rsn   <- Growable.new 16
   phs   <- Growable.new 16
-  act   <- Growable.new 16
+  vo    <- newVarOrder 0.95
   sen   <- Growable.new 16
   senL  <- Growable.new 32
   wts   <- Growable.new 32
@@ -332,7 +356,6 @@ newSolver = do
   tlm   <- Growable.new 4
   lns   <- Growable.new 16
   qh    <- newMutVar 0
-  vi    <- newMutVar 1
   cc    <- newMutVar 0
   dc    <- newMutVar 0
   ok    <- newMutVar True
@@ -352,7 +375,7 @@ newSolver = do
     , level              = lvl
     , reason             = rsn
     , phase              = phs
-    , activity           = act
+    , varOrder           = vo
     , seen               = sen
     , seenLit            = senL
     , watches            = wts
@@ -361,8 +384,6 @@ newSolver = do
     , qhead              = qh
     , clauseStore        = cstore
     , learnts            = lns
-    , varInc             = vi
-    , varDecay           = 0.95
     , confCount          = cc
     , decCount           = dc
     , okFlag             = ok
@@ -381,25 +402,25 @@ numVariables s = Growable.length ( assigns s )
 
 -- | Allocate a fresh variable. All per-variable and per-literal tables grow
 -- to accommodate it; the new variable is initially unassigned with zero
--- activity and no saved phase.
+-- activity and no saved phase. It is registered at the bottom of the
+-- activity heap.
 newVar :: PrimMonad m => Solver ( PrimState m ) -> m Var
 newVar s = do
-  n <- numVariables s
-  Growable.push ( assigns s )  LUndef
-  Growable.push ( level s )    UnassignedLevel
-  Growable.push ( reason s )    Clause.RDecision
-  Growable.push ( phase s )    Positive
-  Growable.push ( activity s ) 0
-  Growable.push ( seen s )     ( Bit False )
+  v <- VarOrder.insertVar ( varOrder s )
+  Growable.push ( assigns s ) LUndef
+  Growable.push ( level s )   UnassignedLevel
+  Growable.push ( reason s )  Clause.RDecision
+  Growable.push ( phase s )   Positive
+  Growable.push ( seen s )    ( Bit False )
   -- Two seenLit slots per variable (one per polarity).
-  Growable.push ( seenLit s )  ( Bit False )
-  Growable.push ( seenLit s )  ( Bit False )
+  Growable.push ( seenLit s ) ( Bit False )
+  Growable.push ( seenLit s ) ( Bit False )
   -- Two fresh empty watch lists per variable (one for each polarity).
   posWs <- Growable.new initialWatchListCapacity
   negWs <- Growable.new initialWatchListCapacity
   Growable.push ( watches s ) posWs
   Growable.push ( watches s ) negWs
-  pure ( Var n )
+  pure v
   where
     initialWatchListCapacity :: Int
     initialWatchListCapacity = 4
@@ -465,37 +486,6 @@ recordClause s learnt ls = do
            ( clauseStore s ) ls
   c <- Clause.clauseAt ( clauseStore s ) ref
   pure ( ref, c )
-
--------------------------------------------------------------------------------
--- Activity (VSIDS).
-
-bumpActivity
-  :: PrimMonad m
-  => Solver ( PrimState m ) -> Var -> m ()
-bumpActivity s v = do
-  inc <- readMutVar ( varInc s )
-  let i = varIndex v
-  Growable.modify ( activity s ) ( + inc ) i
-  a <- Growable.read ( activity s ) i
-  -- Rescale before any single activity threatens to overflow.
-  when ( a > 1e100 ) ( rescaleActivities s )
-
-rescaleActivities
-  :: PrimMonad m
-  => Solver ( PrimState m ) -> m ()
-rescaleActivities s = do
-  n <- numVariables s
-  let go !i
-        | i >= n    = pure ()
-        | otherwise = Growable.modify ( activity s ) ( * 1e-100 ) i *> go ( i + 1 )
-  go 0
-  modifyMutVar' ( varInc s ) ( * 1e-100 )
-
-decayActivities
-  :: PrimMonad m
-  => Solver ( PrimState m ) -> m ()
-decayActivities s =
-  modifyMutVar' ( varInc s ) ( / varDecay s )
 
 -------------------------------------------------------------------------------
 -- Assignment.
@@ -893,7 +883,7 @@ analyse s conflict0 = do
         if lvl <= GroundLevel
         then pure ()
         else do
-          bumpActivity s ( Var vi )
+          VarOrder.bumpActivity ( varOrder s ) ( Var vi )
           markSeen vi
           if lvl >= curLevel
           then modifyMutVar' ( analyzePathC s ) ( + 1 )
@@ -950,7 +940,9 @@ analyse s conflict0 = do
   let learnt = case mbSecond of
         Nothing    -> [ asserting ]
         Just secnd -> asserting : secnd : restLits
-  -- TODO: perform 1-UIP clause minimisation?
+  -- TODO: 1-UIP clause minimisation (recursive / local self-subsumption,
+  -- Sörensson & Biere 2009). Without this, learnt clauses are typically
+  -- twice as long as they need to be.
   pure ( learnt, bjLevel )
 
 -- | Walk backwards along the trail at the current level, popping seen
@@ -1059,14 +1051,20 @@ cancelUntil s tgtLevel@( DecisionLevel tgt ) = do
         | i < limI  = pure ()
         | otherwise = do
             lit <- Growable.read ( trail s ) i
-            let vi = varIndex ( litVar lit )
+            let v  = litVar lit
+                vi = varIndex v
             -- The lit on the trail was the asserted-true literal, so its
             -- polarity is exactly the polarity we want to save for the
             -- next decision touching this variable.
             Growable.write ( phase s )   vi ( litPolarity lit )
             Growable.write ( assigns s ) vi LUndef
             Growable.write ( level s )   vi UnassignedLevel
-            Growable.write  ( reason s )  vi Clause.RDecision
+            Growable.write ( reason s )  vi Clause.RDecision
+            -- The variable is unassigned again, so it must be in the heap
+            -- to be eligible for future decisions; 'reinsertVar' is a
+            -- no-op if it was already there (i.e. it was propagated, not
+            -- popped).
+            VarOrder.reinsertVar ( varOrder s ) v
             undo ( i - 1 )
     undo ( sz - 1 )
     Growable.truncate ( trail s )    limI
@@ -1079,36 +1077,22 @@ cancelUntil s tgtLevel@( DecisionLevel tgt ) = do
 -- | Pick the unassigned variable with the highest VSIDS activity, returning
 -- the literal with the saved phase (defaulting to positive when no phase
 -- has been saved). Returns 'Nothing' once every variable is assigned.
+--
+-- O(log /n/) per call in the amortised case.
 decide
   :: forall m
   .  PrimMonad m
   => Solver ( PrimState m ) -> m ( Maybe Lit )
 decide s = do
-  n <- numVariables s
-  let
-    -- @Just (i, a)@ once we have seen at least one unassigned variable; the
-    -- 'Maybe' wrapping is what removes the need for a @-infinity@ sentinel.
-    scan :: Int -> Maybe ( Int, Double ) -> m ( Maybe Int )
-    scan !i acc
-      | i >= n = pure ( fmap fst acc )
-      | otherwise = do
-          asg <- Growable.read ( assigns s ) i
-          if asg /= LUndef
-          then scan ( i + 1 ) acc
-          else do
-            a <- Growable.read ( activity s ) i
-            let acc' = case acc of
-                  Nothing     -> Just ( i, a )
-                  Just ( _, b )
-                    | a > b   -> Just ( i, a )
-                    | otherwise -> acc
-            scan ( i + 1 ) acc'
-  mb <- scan 0 Nothing
-  case mb of
+  mbV <- VarOrder.extractMaxBy ( varOrder s ) isUnassigned
+  case mbV of
     Nothing -> pure Nothing
-    Just vi -> do
-      pol <- Growable.read ( phase s ) vi
-      pure ( Just ( mkLit ( Var vi ) pol ) )
+    Just v  -> do
+      pol <- Growable.read ( phase s ) ( varIndex v )
+      pure ( Just ( mkLit v pol ) )
+  where
+    isUnassigned :: Var -> m Bool
+    isUnassigned v = ( LUndef == ) <$> valueOf s v
 
 -------------------------------------------------------------------------------
 -- Search driver.
@@ -1173,7 +1157,7 @@ solveWith opts s = do
                 ( learnt, bj ) <- analyse s c
                 cancelUntil s bj
                 installLearnt learnt
-                decayActivities s
+                VarOrder.decayActivities ( varOrder s )
                 budget <- checkBudget
                 if budget == Just Unknown
                 then pure ( Solved Unknown )
@@ -1238,6 +1222,10 @@ assignmentValue ( Var v ) ( Assignment m ) =
 -- Most relevant after 'solve' has returned 'Sat' to get the full assignment,
 -- but calling it in any other state is well defined and returns the
 -- partial assignment at that point.
+--
+-- TODO: this walks every variable; it would be cheaper to walk the trail
+-- (whose length is the number of /assigned/ variables) when the caller
+-- only cares about assigned values. (Negligible for one-shot use.)
 getModel
   :: forall m
   .  PrimMonad m

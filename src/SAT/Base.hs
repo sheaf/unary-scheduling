@@ -64,7 +64,7 @@ import qualified Data.Vector.Unboxed.Mutable as Unboxed
 -- | A propositional variable, identified by its 0-based index.
 newtype Var = Var Int
   deriving stock   ( Eq, Ord, Show, Generic )
-  deriving newtype NFData
+  deriving newtype ( NFData, Prim )
 
 varIndex :: Var -> Int
 varIndex ( Var v ) = v

@@ -27,9 +27,13 @@ import Control.DeepSeq
 import System.Random
   ( StdGen, mkStdGen, randomR )
 
+-- tasty
+import Test.Tasty
+  ( localOption )
+
 -- tasty-bench
 import Test.Tasty.Bench
-  ( Benchmark, bgroup, bench, env, whnf )
+  ( Benchmark, RelStDev(..), bgroup, bench, env, whnf )
 
 -- unary-scheduling
 import SAT
@@ -141,6 +145,8 @@ random3SAT nVars nClauses seed =
 -- | The full benchmark suite.
 benchmarks :: [ Benchmark ]
 benchmarks =
+  -- tolerate higher variance to avoid tests taking too long
+  map ( localOption ( RelStDev 0.2 ) )
   [ bgroup "pigeonhole (UNSAT)"
       [ phpBench n | n <- [ 4, 5, 6 ] ]
   , bgroup "random 3-SAT near the phase transition (m/n ≈ 4.26)"
