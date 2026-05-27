@@ -263,3 +263,29 @@ test-suite unary-scheduling-z3-test
         >= 1.2   && < 1.6
     , z3
          >= 411  && < 413
+
+benchmark unary-scheduling-sat-bench
+
+  import: common
+
+  type:
+    exitcode-stdio-1.0
+
+  hs-source-dirs:
+    bench
+
+  main-is:
+    Main.hs
+
+  other-modules:
+    SAT.Bench
+
+  build-depends:
+      unary-scheduling
+    , random
+         >= 1.2   && < 1.4
+    , tasty-bench
+         >= 0.3   && < 0.5
+
+  ghc-options:
+    -O2
