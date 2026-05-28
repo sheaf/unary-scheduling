@@ -231,17 +231,24 @@ insideLax = coerce insideLax'
 -------------------------------------------------------------------------------
 -- Measures.
 
+-- | Domain-aware operations on time intervals, allowing propagators to work
+-- uniformly over both continuous and discrete time domains.
+--
+-- Intervals are always represented in canonical half-open form @[start, end)@.
 class Ord t => Measurable t where
-  -- | The measure of an interval.
+  -- | The measure of an interval, i.e. the duration of the underlying
+  -- half-open continuous segment.
   measure :: Interval t -> Delta t
   -- | Is an interval empty?
   isEmpty :: Interval t -> Bool
 
-  -- | Normalise an earliest-start endpoint to a canonical representation.
+  -- | Normalise an earliest-start endpoint to the canonical 'Inclusive'
+  -- lower-bound form.
   canonicalEarliest :: Endpoint ( EarliestTime t ) -> Endpoint ( EarliestTime t )
   canonicalEarliest = id
 
-  -- | Like 'canonicalEarliest', for a latest-completion endpoint.
+  -- | Normalise a latest-completion endpoint to the canonical 'Exclusive'
+  -- upper-bound form.
   canonicalLatest :: Endpoint ( LatestTime t ) -> Endpoint ( LatestTime t )
   canonicalLatest = id
 
@@ -250,7 +257,8 @@ instance Measurable Double where
   isEmpty ( Interval (Endpoint (EarliestTime s) s_clu) (Endpoint (LatestTime e) e_clu) )
     =  s > e
     || ( s == e && ( s_clu == Exclusive || e_clu == Exclusive ) )
-  -- Dense time: each set has a unique representation, so no normalisation needed.
+  -- Continuous time: zero-measure boundaries, so neither endpoint needs
+  -- normalisation.
 
 instance Measurable Int where
   measure ( Interval (Endpoint (EarliestTime (Time s)) s_clu) (Endpoint (LatestTime (Time e)) e_clu) ) =
@@ -263,12 +271,12 @@ instance Measurable Int where
         e' = if e_clu == Inclusive then e else e - 1
     in s' > e'
 
-  -- Discrete time: an exclusive bound is the inclusive bound one step in.
+  -- Canonical form is @[start, end)@.
   canonicalEarliest ( Endpoint ( EarliestTime ( Time s ) ) Exclusive ) =
     Endpoint ( EarliestTime ( Time ( s + 1 ) ) ) Inclusive
   canonicalEarliest e = e
-  canonicalLatest ( Endpoint ( LatestTime ( Time e ) ) Exclusive ) =
-    Endpoint ( LatestTime ( Time ( e - 1 ) ) ) Inclusive
+  canonicalLatest ( Endpoint ( LatestTime ( Time e ) ) Inclusive ) =
+    Endpoint ( LatestTime ( Time ( e + 1 ) ) ) Exclusive
   canonicalLatest e = e
 
 -------------------------------------------------------------------------------

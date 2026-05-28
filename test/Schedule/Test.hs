@@ -59,7 +59,7 @@ type TimeOfDayTask = Task () Minutes
 timeOfDayTask :: Minutes -> [ ( Minutes, Minutes ) ] -> TimeOfDayTask
 timeOfDayTask delta ivals =
   Task
-    { taskAvailability = Intervals ( Seq.fromList $ map ( \ ( s, e ) -> Time s :<=..<= Time e ) ivals )
+    { taskAvailability = Intervals ( Seq.fromList $ map ( \ ( s, e ) -> Time s :<=..< Time e ) ivals )
     , taskDuration     = Delta delta
     , taskInfo         = ()
     }

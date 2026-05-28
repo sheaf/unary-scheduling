@@ -69,12 +69,16 @@ import Schedule.Time
 --------------------------------------------------------------------------------
 -- Encoding.
 
--- | Convert an interval's endpoints to the inclusive integer range @[s', e']@
--- that Z3 reasons about.
+-- | Normalise an interval to half-open integer bounds @[s, e)@.
+--
+-- A task starting at slot @t@ with duration @d@ occupies slots
+-- @[t, t + d)@; the per-task Z3 constraint is therefore
+-- @s ≤ t ∧ t + d ≤ e@, with both inequalities applied to the
+-- half-open bounds returned here.
 intervalIntBounds :: Coercible t Int => Interval t -> ( Int, Int )
 intervalIntBounds ( Interval ( Endpoint ( EarliestTime ( Time s ) ) clu_s ) ( Endpoint ( LatestTime ( Time e ) ) clu_e ) ) =
   ( case clu_s of { Exclusive -> coerce s + 1; _ -> coerce s }
-  , case clu_e of { Exclusive -> coerce e - 1; _ -> coerce e }
+  , case clu_e of { Inclusive -> coerce e + 1; _ -> coerce e }
   )
 
 -- | Build a unary-scheduling model: one integer start-time variable per task,

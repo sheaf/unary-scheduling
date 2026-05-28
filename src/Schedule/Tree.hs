@@ -80,7 +80,7 @@ import Schedule.Ordering
 import Data.Vector.Ranking
   ( Ranking(..) )
 import Schedule.Interval
-  ( Endpoint(..), Interval(..), Measurable (isEmpty) )
+  ( Endpoint(..), Measurable )
 import Schedule.Task
   ( TaskInfos(..)
   , Limit
@@ -88,7 +88,7 @@ import Schedule.Task
   , PickEndpoint(_ranking)
   )
 import Schedule.Time
-  ( Delta, Handedness(..), HandedTime(..), OtherHandedness )
+  ( Delta, Handedness(..), HandedTime(..), OtherHandedness, handedTime )
 
 ---------------------------------------------------------------------------------------------------
 
@@ -272,7 +272,8 @@ class Propagatable ( h :: Handedness ) where
     => Tree h s a -> a -> TaskInfos bvec uvec task t -> Int -> m a
 
 instance Propagatable Earliest where
-  overloaded start end = isEmpty ( Interval start end )
+  overloaded start end =
+    handedTime ( endpoint start ) > handedTime ( endpoint end )
   handedIndex _ i = i
   inHandedOrder LessThan = True
   inHandedOrder _        = False
@@ -286,7 +287,8 @@ instance Propagatable Earliest where
     propagateChangeFromLeaf tree val leafIndex
 
 instance Propagatable Latest where
-  overloaded end start = isEmpty ( Interval start end )
+  overloaded end start =
+    handedTime ( endpoint start ) > handedTime ( endpoint end )
   handedIndex nbTasks i = nbTasks - 1 - i
   inHandedOrder GreaterThan = True
   inHandedOrder _           = False
