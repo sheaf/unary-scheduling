@@ -300,6 +300,7 @@ benchmark unary-scheduling-sat-bench
 
   build-depends:
       unary-scheduling
+    , z3-oracle
     , random
          >= 1.2   && < 1.4
     , tasty
@@ -309,3 +310,4 @@ benchmark unary-scheduling-sat-bench
 
   ghc-options:
     -O2
+    -threaded

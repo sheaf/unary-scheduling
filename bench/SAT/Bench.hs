@@ -31,7 +31,7 @@ import System.Random
 
 -- tasty
 import Test.Tasty
-  ( localOption )
+  ( localOption, mkTimeout )
 
 -- tasty-bench
 import Test.Tasty.Bench
@@ -48,6 +48,8 @@ import SAT
   , solveWith, defaultOptions
   , getModel, assignmentValue
   )
+import Schedule.Ordering
+  ( upperTriangular )
 
 -------------------------------------------------------------------------------
 -- A small CNF representation local to the benchmarks.
@@ -207,6 +209,52 @@ graphColouringCNF nVerts nEdges seed =
          else ( i, j ) : genEdges ( m - 1 ) g2
 
 -------------------------------------------------------------------------------
+-- Precedence-transitivity CNFs
+
+-- | Variable index for the unordered pair @(i, j)@ with @i < j@.
+precVarIx :: Int -> Int -> Int -> Int
+precVarIx dim i j = upperTriangular dim i j
+
+-- | The acyclicity-over-triples CNF for @n@ tasks: @2 · C(n, 3)@ clauses
+-- of length 3, over @C(n, 2)@ variables.
+precedenceTransitivityCNF :: Int -> CNF
+precedenceTransitivityCNF n = CNF numVars clauses
+  where
+    numVars = n * ( n - 1 ) `div` 2
+    v i j   = precVarIx n i j
+    clauses = concat
+      [ [ -- forbids i→j ∧ j→k ∧ k→i
+          [ ( v i j, Negative ), ( v j k, Negative ), ( v i k, Positive ) ]
+        , -- forbids j→i ∧ k→j ∧ i→k
+          [ ( v i j, Positive ), ( v j k, Positive ), ( v i k, Negative ) ]
+        ]
+      | i <- [ 0 .. n - 1 ]
+      , j <- [ i + 1 .. n - 1 ]
+      , k <- [ j + 1 .. n - 1 ]
+      ]
+
+-- | Add @nForced@ random unit clauses (a random partial ordering) on top
+-- of 'precedenceTransitivityCNF'. The result is SAT iff the forced units
+-- are jointly acyclic; the SAT core has to propagate the transitive closure
+-- of the units across the acyclicity clauses.
+precedenceWithForcedCNF :: Int -> Int -> Int -> CNF
+precedenceWithForcedCNF n nForced seed =
+  CNF numVars ( transitivity ++ units )
+  where
+    CNF numVars transitivity = precedenceTransitivityCNF n
+    units                    = take nForced ( genUnits ( mkStdGen seed ) )
+    -- All ordered (i, j) pairs with i ≠ j; each contributes one possible
+    -- forced unit (positive if i < j, negative otherwise).
+    genUnits :: StdGen -> [ Clause ]
+    genUnits g0 =
+      let ( i, g1 ) = randomR ( 0, n - 1 ) g0
+          ( j, g2 ) = randomR ( 0, n - 1 ) g1
+      in case compare i j of
+           EQ -> genUnits g2
+           LT -> [ ( precVarIx n i j, Positive ) ] : genUnits g2
+           GT -> [ ( precVarIx n j i, Negative ) ] : genUnits g2
+
+-------------------------------------------------------------------------------
 -- Incremental solve: solve, block the model, solve again.
 
 -- | Post the CNF, solve it; on 'Sat', add a blocking clause derived from
@@ -252,7 +300,7 @@ solveTwice ( CNF nVars cls ) = runST \ @s -> do
 benchmarks :: [ Benchmark ]
 benchmarks =
   -- tolerate higher variance to avoid tests taking too long
-  map ( localOption ( RelStDev 0.2 ) )
+  map ( localOption ( RelStDev 0.1 ) . localOption ( mkTimeout 5_000_000 ) )
   [ bgroup "baseline (solver-setup-dominated)"
       [ bench "empty CNF"
           $ whnf solveCNF ( CNF 0 [] )
@@ -280,6 +328,15 @@ benchmarks =
       | ( n, m ) <- [ ( 15, 45 ), ( 25, 70 ) ]
       , seed     <- [ 1, 42 ]
       ]
+  , bgroup "precedence transitivity"
+      [ precTrans n
+      | n <- [ 6, 8, 12, 16 ]
+      ]
+  , bgroup "precedence transitivity + random forced units"
+      [ precForced n nForced seed
+      | ( n, nForced ) <- [ ( 8, 6 ), ( 12, 10 ), ( 16, 14 ), ( 20, 18 ) ]
+      , seed           <- [ 1, 42 ]
+      ]
   ]
   where
     pigeon n =
@@ -303,3 +360,11 @@ benchmarks =
         bench
           ( "N=" ++ show n ++ " M=" ++ show m ++ " seed=" ++ show seed )
           ( whnf solveTwice cnf )
+    precTrans n =
+      env ( pure $ precedenceTransitivityCNF n ) \ cnf ->
+        bench ( "n=" ++ show n ) ( whnf solveCNF cnf )
+    precForced n nForced seed =
+      env ( pure $ precedenceWithForcedCNF n nForced seed ) \ cnf ->
+        bench
+          ( "n=" ++ show n ++ " forced=" ++ show nForced ++ " seed=" ++ show seed )
+          ( whnf solveCNF cnf )
