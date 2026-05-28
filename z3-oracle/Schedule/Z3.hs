@@ -37,13 +37,17 @@ import Control.Monad.Reader
 import Data.Set
   ( Set )
 
+-- containers
+import qualified Data.IntSet as IntSet
+  ( fromList )
+
 -- text
 import Data.Text
   ( Text )
 
 -- vector
 import qualified Data.Vector as Boxed.Vector
-  ( (!) )
+  ( (!), length )
 
 -- z3
 import Z3.Monad
@@ -57,10 +61,10 @@ import Schedule.Monad
   ( runScheduleMonad, SchedulableData )
 import Schedule.Ordering
   ( Order(Unknown), readOrdering )
-import Schedule.Propagators
-  ( Propagator, propagationLoop )
-import Schedule.Search
+import Schedule.Precedence
   ( addEdge )
+import Schedule.Propagators
+  ( Propagator, propagationLoop, seedAllOf )
 import Schedule.Task
   ( Task(..), TaskInfos(..), ImmutableTaskInfos, est, lst )
 import Schedule.Time
@@ -178,11 +182,12 @@ verifyAgainstZ3 propagators namedTasks = do
           runScheduleMonad namedTasks \ trail -> do
             -- Only post precedences that aren't already determined, as the
             -- ordering matrix implementation doesn't deal with redundant edges.
-            TaskInfos { orderings } <- ask
+            TaskInfos { orderings, taskNames } <- ask
             for_ chain \ ( a, b ) -> do
               o <- readOrdering orderings a b
               when ( o == Unknown ) ( addEdge trail a b )
-            propagationLoop 1000 trail propagators
+            let allTasks = IntSet.fromList [ 0 .. Boxed.Vector.length taskNames - 1 ]
+            propagationLoop 1000 trail propagators ( seedAllOf propagators allTasks )
         -- Tasks whose Z3 start time no longer lies within the tightened window.
         violators :: [ Int ]
         violators =

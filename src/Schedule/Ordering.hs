@@ -7,6 +7,7 @@ module Schedule.Ordering
   , OrderingMatrix(..), upperTriangular
   , newOrderingMatrix
   , addIncidentEdges, addIncidentEdgesTransitively
+  , EdgeOrigin(..), CycleInfo(..)
   , readOrdering
 #ifdef VIZ
   , visualiseEdges
@@ -39,6 +40,8 @@ import Data.Bit
 -- containers
 import Data.IntSet
   ( IntSet )
+import qualified Data.IntSet as IntSet
+  ( member, toList )
 
 -- deepseq
 import Control.DeepSeq
@@ -125,8 +128,9 @@ reverseOrder ( Order ( Bit a, Bit b ) ) = Order ( Bit b, Bit a )
 
 -- | Adjacency matrix of a transitively closed directed acyclic graph.
 --
--- As self-edges are irrelevant, we only store the above-diagonal entries, each entry containing two bits of data,
--- corresponding to the presence or absence of edges in both directions.
+-- As self-edges are irrelevant, we only store the above-diagonal entries,
+-- each entry containing two bits of data, corresponding to the presence or
+-- absence of edges in both directions.
 data OrderingMatrix vec = OrderingMatrix
   { dim            :: !Int
   , orderingMatrix :: !( vec Order )
@@ -157,7 +161,8 @@ visualiseEdges ( OrderingMatrix { dim, orderingMatrix } )
       Equal       -> Alga.edge i j `Alga.overlay` Alga.edge j i `Alga.overlay` rest
 #endif
 
--- | Initialise a matrix holding ordering information (similar to an adjacency matrix for a directed graph).
+-- | Initialise a matrix holding ordering information (similar to an
+-- adjacency matrix for a directed graph).
 --
 -- Number of entries corresponds to the number of above-diagonal cells.
 newOrderingMatrix
@@ -232,22 +237,46 @@ addIncidentEdges writeCell mat v befores afters = do
   forOf_ IntSet.members befores ( modify'Ordering writeCell mat ( GreaterThan \/ ) v )
   forOf_ IntSet.members afters  ( modify'Ordering writeCell mat ( LessThan    \/ ) v )
 
--- | King–Sagert insertion algorithm: add edges incident to a given vertex, and compute the transitive closure.
+-- | Whether a new edge was directly asserted (one of the seed edges of the
+-- King–Sagert call) or computed by transitive closure.
+data EdgeOrigin
+  = -- | One of the directly-added edges incident to the central vertex.
+    SeedEdge
+  | -- | A transitively-derived edge. The carried 'Int' is the witness
+    -- vertex @u@ such that the edge follows from @i → u@ and @u → j@.
+    DerivedEdge !Int
+  deriving stock ( Eq, Show )
+
+-- | A cycle detected during the transitive-closure update.
+--
+-- All cycles pass through the central vertex @v@ of the call.
+data CycleInfo
+  = -- | Vertex @i@ became both a predecessor and a successor of @v@: the
+    -- cycle is @i → v → i@.
+    SelfCycle !Int
+  | -- | Vertices @i@ and @j@ became bidirectionally connected via @v@:
+    -- the cycle threads @i → v → j → v → i@.
+    DoubleCycle !Int !Int
+  deriving stock ( Eq, Show )
+
+-- | King–Sagert insertion algorithm: add edges incident to a given vertex,
+-- and compute the transitive closure.
 addIncidentEdgesTransitively
   :: forall m e s
   .  ( MonadError e m
      , PrimMonad m, s ~ PrimState m
      )
-  => ( Int -> Order -> m () )  -- ^ Physical cell write.
-  -> ( Int -> Int -> m () )    -- ^ Propagate information relative to a new precedence.
-  -> ( Either Int ( Int, Int ) -> e ) -- ^ Error message function.
+  => ( Int -> Order -> m () )             -- ^ Physical cell write.
+  -> ( EdgeOrigin -> Int -> Int -> m () ) -- ^ Propagate a new edge @i → j@.
+  -> ( CycleInfo -> e )                   -- ^ Error to raise when a cycle is detected.
   -> OrderingMatrix ( Unboxed.MVector s )
-  -> Int    -- ^ Fixed incidence vertex.
-  -> IntSet -- ^ New predecessors to the given vertex.
-  -> IntSet -- ^ New successors to the given vertex.
+  -> Int    -- ^ Fixed incidence vertex @v@.
+  -> IntSet -- ^ New predecessors of @v@.
+  -> IntSet -- ^ New successors of @v@.
   -> m ()
-addIncidentEdgesTransitively writeCell propagateNewEdge errorMessage mat@( OrderingMatrix { dim } ) v befores afters = do
-  -- Tally the new connections around vertex 'v': predecessors/successors of 'v' by way of new edges.
+addIncidentEdgesTransitively writeCell onNewEdge cycleError mat@( OrderingMatrix { dim } ) v befores afters = do
+  -- Step 1: tally the new connections around vertex 'v' (predecessors and
+  -- successors reachable through a single new edge incident to 'v').
   new <- Unboxed.Vector.fromList <$>
     for [ 0 .. dim - 1 ] \ i ->
       if i == v
@@ -262,61 +291,74 @@ addIncidentEdgesTransitively writeCell propagateNewEdge errorMessage mat@( Order
           res :: Order
           res = Order ( Bit bef, Bit aft )
         when ( res == Equal ) do
-          coerce @( m () ) $ throwError ( errorMessage ( Left i ) )
+          coerce @( m () ) $ throwError ( cycleError ( SelfCycle i ) )
         pure res
 
-  -- Add the transitive edges away from 'v':
-  -- 'i' precedes 'j' exactly when 'i' is a predecessor of 'v' and 'j' is a successor of
-  -- 'v' (and symmetrically), where "predecessor/successor of 'v'" means a relation to
-  -- 'v' that either already held or is newly introduced (recorded in 'new').
-  for_ [ ( i, j ) | i <- [ 0 .. dim - 1 ], i /= v, j <- [ i + 1 .. dim - 1 ], j /= v ] \ ( i, j ) -> do
-    let
-      n_i, n_j :: Order
-      n_i = new Unboxed.Vector.! i
-      n_j = new Unboxed.Vector.! j
-      -- The new relations of 'i' and 'j' to 'v'.
-      Order ( Bit bef_i, Bit aft_i ) = n_i
-      Order ( Bit bef_j, Bit aft_j ) = n_j
-    unless ( n_i == Unknown && n_j == Unknown ) do
-      c_ij <- readOrdering mat i j
-      -- The relations of 'i' and 'j' to 'v' that already held.
-      Order ( Bit i_lt_v, Bit i_gt_v ) <- readOrdering mat i v
-      Order ( Bit v_lt_j, Bit v_gt_j ) <- readOrdering mat v j
-      let
-        iPredV, iSuccV, jPredV, jSuccV :: Bool
-        iPredV = bef_i || i_lt_v   -- 'i' is a predecessor of 'v'
-        iSuccV = aft_i || i_gt_v   -- 'i' is a successor   of 'v'
-        jPredV = bef_j || v_gt_j   -- 'j' is a predecessor of 'v'
-        jSuccV = aft_j || v_lt_j   -- 'j' is a successor   of 'v'
-        p_ij :: Order
-        p_ij = Order ( Bit ( iPredV && jSuccV ), Bit ( jPredV && iSuccV ) )
-      unless ( p_ij == Unknown ) do
-        let
-          Order ( Bit c_lt, Bit c_gt ) = c_ij
-          res :: Order
-          res = c_ij \/ p_ij
-        writeOrdering writeCell mat res i j
-        if res == Equal
-        then throwError $ errorMessage ( Right (i, j) )
-        else do
-          -- Propagate only edges that are genuinely new (not already present in 'c_ij').
-          when ( iPredV && jSuccV && not c_lt ) do
-            propagateNewEdge i j
-          when ( jPredV && iSuccV && not c_gt ) do
-            propagateNewEdge j i
-
-  -- Add the connections around 'v'.
+  -- Step 2: add the around-'v' edges to the matrix.
   for_ [ i | i <- [ 0 .. dim - 1 ], i /= v ] \ i -> do
     let
       n :: Order
       n = new Unboxed.Vector.! i
+      Order ( Bit bef_i, Bit aft_i ) = n
     unless ( n == Unknown ) do
       c <- readOrdering mat i v
-      writeOrdering writeCell mat ( c \/ n ) i v
-      when ( unBit . fst . getOrder $ n ) do
-        propagateNewEdge i v
-      when ( unBit . snd . getOrder $ n ) do
-        propagateNewEdge v i
+      let
+        Order ( Bit c_lt, Bit c_gt ) = c
+        !c'                          = c \/ n
+      writeOrdering writeCell mat c' i v
+      -- A through-'v' cycle: 'i' was already a successor of 'v' and is
+      -- now becoming a predecessor (or vice versa).
+      when ( c' == Equal ) $
+        throwError ( cycleError ( SelfCycle i ) )
+      -- Fire 'onNewEdge' for each genuinely-new direction.
+      when ( bef_i && not c_lt ) do
+        origin <- aroundEdgeOrigin i befores ( \ u -> readOrdering mat i u )
+        onNewEdge origin i v
+      when ( aft_i && not c_gt ) do
+        origin <- aroundEdgeOrigin i afters  ( \ w -> readOrdering mat w i )
+        onNewEdge origin v i
+
+  -- Step 3: derive transitive edges.
+  for_ [ ( i, j ) | i <- [ 0 .. dim - 1 ], i /= v, j <- [ i + 1 .. dim - 1 ], j /= v ] \ ( i, j ) -> do
+    c_ij <- readOrdering mat i j
+    Order ( Bit i_lt_v, Bit i_gt_v ) <- readOrdering mat i v
+    Order ( Bit v_lt_j, Bit v_gt_j ) <- readOrdering mat v j
+    let
+      p_ij :: Order
+      p_ij = Order ( Bit ( i_lt_v && v_lt_j ), Bit ( v_gt_j && i_gt_v ) )
+    unless ( p_ij == Unknown ) do
+      let
+        Order ( Bit c_lt, Bit c_gt ) = c_ij
+        res :: Order
+        res = c_ij \/ p_ij
+      writeOrdering writeCell mat res i j
+      if res == Equal
+      then throwError $ cycleError ( DoubleCycle i j )
+      else do
+        -- Propagate only edges that are genuinely new (not already in 'c_ij').
+        when ( i_lt_v && v_lt_j && not c_lt ) do
+          onNewEdge ( DerivedEdge v ) i j
+        when ( v_gt_j && i_gt_v && not c_gt ) do
+          onNewEdge ( DerivedEdge v ) j i
+
+  where
+    -- Determine the 'EdgeOrigin' of a phase-2 around-'v' edge with endpoint
+    -- @i@: it is 'SeedEdge' iff @i@ is in the input set, and otherwise a
+    -- 'DerivedEdge' witnessed by some @u@ in the set with @check u@
+    -- returning 'LessThan' (or 'Equal') in its first bit.
+    aroundEdgeOrigin :: Int -> IntSet -> ( Int -> m Order ) -> m EdgeOrigin
+    aroundEdgeOrigin i inputs check
+      | IntSet.member i inputs = pure SeedEdge
+      | otherwise              = DerivedEdge <$> findWitness ( IntSet.toList inputs )
+      where
+        findWitness :: [ Int ] -> m Int
+        findWitness [] = error
+          "Schedule.Ordering.addIncidentEdgesTransitively: missing witness for derived around-v edge"
+        findWitness ( u : us ) = do
+          o <- check u
+          if unBit ( fst ( getOrder o ) )
+          then pure u
+          else findWitness us
 
 -------------------------------------------------------------------------------
 

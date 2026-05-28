@@ -22,10 +22,6 @@ import Data.Functor
   ( ($>) )
 import Data.List
   ( sortOn )
-import Data.Ord
-  ( Down(..) )
-import Data.Semigroup
-  ( Arg(..) )
 import Data.Traversable
   ( for )
 import GHC.IO.Encoding
@@ -61,6 +57,8 @@ import qualified Data.ByteString.Lazy as LazyByteString
 -- containers
 import qualified Data.Map.Strict as Map
   ( lookup, mapWithKey, fromList, unionWith )
+import qualified Data.IntSet as IntSet
+  ( fromList )
 import Data.Set
   ( Set )
 import qualified Data.Set as Set
@@ -158,7 +156,7 @@ import qualified Codec.Xlsx as Xlsx
 import Data.Lattice
   ( Meet(..) )
 import Schedule.Propagators
-  ( propagateConstraints, propagationLoop, Propagator(..), basicPropagators
+  ( propagateConstraints, propagationLoop, seedAllOf, Propagator(..), basicPropagators
   , makespan
   )
 import Schedule.Interval
@@ -166,12 +164,14 @@ import Schedule.Interval
   , Endpoint(..), Measurable(..)
   , insideLax
   )
+import Schedule.LCG.Search
+  ( SearchResult(..), SearchStats(..), defaultSearchOptions, lcgSearch )
 import Schedule.Monad
   ( BroadcastTarget(..), Notifiee(..), runScheduleMonad )
 import Schedule.Ordering
   ( visualiseEdges )
-import Schedule.Search
-  ( SearchState(..), search, addEdge, BranchHeuristic(..) )
+import Schedule.Precedence
+  ( addEdge )
 import Schedule.Task
   ( Task(..), TaskInfos(..)
   , ImmutableTaskInfos
@@ -215,7 +215,7 @@ scheduleSpreadsheet = do
 
   -- Parse spreadsheet data.
   {-allSpreadsheetData@-}
-  SchedulingData { schedulingTasks, schedulingStaff, schedulingRanges, totalSchedulingCost }
+  SchedulingData { schedulingTasks, schedulingStaff, schedulingRanges }
     <- liftEither $ parseSpreadsheet useMakespanConstraints spreadsheet
 
   {-
@@ -299,7 +299,11 @@ scheduleSpreadsheet = do
             res :: Either Text ()
             ( ti, ( res, _ ) ) =
               runScheduleMonad schedulingTasks
-                ( \ trail -> for_ chain ( \ ( a, b ) -> addEdge trail a b ) *> propagationLoop 1000 trail propagators )
+                ( \ trail -> do
+                    for_ chain ( \ ( a, b ) -> addEdge trail a b )
+                    let allTasks = IntSet.fromList [ 0 .. length schedulingTasks - 1 ]
+                    propagationLoop 1000 trail propagators
+                      ( seedAllOf propagators allTasks ) )
             -- Tasks for which the Z3 start no longer lies within the tightened window.
             violators :: [ Text ]
             violators =
@@ -329,23 +333,22 @@ scheduleSpreadsheet = do
     else if useSearch
     then do
       let
-        searchRes :: SearchState ( Set Staff ) Column
-        searchRes = search totalSchedulingCost branchHeuristic 10 propagators afterPropTasks
+        searchRes :: SearchResult ( Set Staff ) Column
+        searchRes = lcgSearch defaultSearchOptions propagators afterPropTasks
       lift do
         timeNow <- deepseq searchRes Time.getPOSIXTime
         Text.appendFile "search_statistics.txt"
           ( timeBox currentTimeZone timeNow <>
-          "Found " <> Text.pack ( show ( totalSolutionsFound searchRes ) ) <> " solutions after "
-          <> Text.pack ( show ( totalDecisionsTaken searchRes ) ) <> " decisions\n"
-          <> "Max decision-stack depth: " <> Text.pack ( show ( maxOpenDepth searchRes ) ) <> "\n"
-          <> "Total backtracks: "         <> Text.pack ( show ( totalBacktracks searchRes ) ) <> "\n\n"
+          "Conflicts:   " <> Text.pack ( show ( numConflicts ( stats searchRes ) ) ) <> "\n" <>
+          "Decisions:   " <> Text.pack ( show ( numDecisions ( stats searchRes ) ) ) <> "\n" <>
+          "Learnts:     " <> Text.pack ( show ( numLearnts   ( stats searchRes ) ) ) <> "\n" <>
+          "Theory prop: " <> Text.pack ( show ( numTheoryPropagations ( stats searchRes ) ) ) <> "\n\n"
           )
-      case solutions searchRes of
-        ( _ :|> Arg ( Down cost ) bestSol ) -> do
+      case solution searchRes of
+        Right bestSol -> do
           lift $ Text.writeFile "dotfile.txt" ( visualiseEdges . orderings $ bestSol )
-          lift $ Text.writeFile "cost.txt" ( Text.pack ( show cost ) )
           pure bestSol
-        _ -> throwError ( NoSchedulingPossible "Search has found no results" )
+        Left err -> throwError ( NoSchedulingPossible err )
     else pure afterPropTasks
 
   -- Write output spreadsheet with updated availability information.
@@ -912,7 +915,6 @@ data Args
   , useMakespanConstraints :: !Bool
   , useZ3                  :: !Bool
   , useVerifyZ3            :: !Bool
-  , branchHeuristic        :: !BranchHeuristic
   }
   deriving stock Show
 
@@ -988,7 +990,7 @@ parseArgs = do
 
     parserInfo :: OptParse.ParserInfo Args
     parserInfo = OptParse.ParserInfo
-      { OptParse.infoParser      = OptParse.helper <*> ( Args <$> inputArg <*> outputArg <*> logArg <*> searchArg <*> makespanArg <*> z3Arg <*> verifyZ3Arg <*> heuristicArg )
+      { OptParse.infoParser      = OptParse.helper <*> ( Args <$> inputArg <*> outputArg <*> logArg <*> searchArg <*> makespanArg <*> z3Arg <*> verifyZ3Arg )
       , OptParse.infoFullDesc    = True
       , OptParse.infoProgDesc    = OptParse.Chunk ( Just desc )
       , OptParse.infoHeader      = OptParse.Chunk ( Just header )
@@ -1055,11 +1057,4 @@ parseArgs = do
       OptParse.switch
         (  OptParse.long "verify-z3"
         <> OptParse.help "Solve with Z3 and check that we accept its solution"
-        )
-
-    heuristicArg :: OptParse.Parser BranchHeuristic
-    heuristicArg =
-      OptParse.flag Contention WindowCut
-        (  OptParse.long "window-cut-heuristic"
-        <> OptParse.help "Branch on the least-disruptive precedence (default: highest resource contention)"
         )

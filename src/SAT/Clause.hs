@@ -26,6 +26,8 @@ module SAT.Clause
   , ClauseRef(..)
     -- * Reasons
   , Reason(..)
+  , LazyRef(..)
+  , LazyReason(..)
   )
   where
 
@@ -200,6 +202,31 @@ data Reason
   -- reference. At the moment of propagation, this clause had all other
   -- literals false.
   | RClause !ClauseRef
+  -- | Literal that was theory-propagated, with a deferred clausal reason.
+  --
+  -- The 'LazyRef' indexes into the solver's lazy-reason table. When 1-UIP
+  -- analysis encounters this reason, it forces the corresponding
+  -- 'LazyReason' closure to obtain the supporting clause.
+  | RLazy !LazyRef
+
+-- | A reference into the solver's lazy-reason table.
+newtype LazyRef = LazyRef { unLazyRef :: Int }
+  deriving stock   Show
+  deriving newtype ( Eq, Ord, Prim )
+
+-- | A deferred clause-producing action, attached to a theory-propagated
+-- literal as a 'RLazy' reason.
+--
+-- The closure must be self-contained at the moment it is created: any
+-- scheduler state it depends on should be captured into the closure so that
+-- forcing it later — after further mutation or backjumping — still yields
+-- the correct supporting clause.
+--
+-- The returned list contains the literals of the supporting clause; the
+-- propagated literal may be included since 1-UIP analysis filters out
+-- the resolution variable.
+newtype LazyReason s = LazyReason
+  { forceLazyReason :: forall m. ( PrimMonad m, PrimState m ~ s ) => m [ Lit ] }
 
 -- | Fit a 'Reason' into an 'Int'.
 instance Prim Reason where
@@ -219,16 +246,22 @@ instance Prim Reason where
   writeOffAddr# addr# i# r s0 = writeOffAddr# addr# i# ( encodeReason r ) s0
 
 -- | Internal packing for the 'Prim' 'Reason' instance.
+--
+-- Five constructors need three tag bits; the remaining 61 bits hold the
+-- payload ('Lit' index, 'ClauseRef', or 'LazyRef').
 encodeReason :: Reason -> Int
 encodeReason RFact                         = 0
 encodeReason RDecision                     = 1
-encodeReason ( RBinary lit )               = 2 .|. ( litIndex lit `shiftL` 2 )
-encodeReason ( RClause ( ClauseRef ref ) ) = 3 .|. ( ref `shiftL` 2 )
+encodeReason ( RBinary lit )               = 2 .|. ( litIndex lit `shiftL` 3 )
+encodeReason ( RClause ( ClauseRef ref ) ) = 3 .|. ( ref `shiftL` 3 )
+encodeReason ( RLazy   ( LazyRef   ref ) ) = 4 .|. ( ref `shiftL` 3 )
 
 -- | Inverse of 'encodeReason'.
 decodeReason :: Int -> Reason
-decodeReason w = case w .&. 3 of
+decodeReason w = case w .&. 7 of
   0 -> RFact
   1 -> RDecision
-  2 -> RBinary ( litFromIndex ( w `shiftR` 2 ) )
-  _ -> RClause ( ClauseRef    ( w `shiftR` 2 ) )
+  2 -> RBinary ( litFromIndex ( w `shiftR` 3 ) )
+  3 -> RClause ( ClauseRef    ( w `shiftR` 3 ) )
+  4 -> RLazy   ( LazyRef      ( w `shiftR` 3 ) )
+  _ -> error "SAT.Clause.decodeReason: invalid reason tag"

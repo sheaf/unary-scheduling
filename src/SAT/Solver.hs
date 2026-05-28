@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP                  #-}
 {-# LANGUAGE ScopedTypeVariables  #-}
 {-# LANGUAGE UndecidableInstances #-}
 
@@ -65,6 +66,34 @@ module SAT.Solver
   , numConflicts
   , numDecisions
   , numLearnts
+
+    -- * Lower-level driver primitives
+    --
+    -- These primitives expose the inner step interface of the search loop,
+    -- intended for theory-driven (DPLL(T)) consumers that need to interleave
+    -- propagation and decisions with their own theory.
+  , DecisionLevel(GroundLevel, ..)
+  , TrailPos(..)
+  , Conflict(..)
+  , currentLevel
+  , levelOfAssignedVar
+  , dumpSolverState
+  , trailSize
+  , trailAt
+  , litValue
+  , decide
+  , propagate
+  , analyse
+  , cancelUntil
+  , pushNewLevel
+  , enqueueUndef
+  , tryEnqueue
+  , installLearnt
+  , recordLazyReason
+  , recordTheoryClause
+  , ClauseRef(..)
+  , isOk
+  , markFalse
   )
   where
 
@@ -73,6 +102,8 @@ import Control.Monad
   ( when )
 import Data.Foldable
   ( for_ )
+import Data.List
+  ( intercalate )
 
 -- bitvec
 import Data.Bit
@@ -131,8 +162,9 @@ import SAT.Clause
   , ClauseStore, newClauseStore
   )
 import qualified SAT.Clause as Clause
-  ( Reason(..)
+  ( Reason(..), LazyReason(..), LazyRef(..)
   , clauseAt, recordClause, recordLearntClause
+  , forceLazyReason
   )
 import qualified SAT.Restart as Restart
   ( luby )
@@ -314,6 +346,10 @@ data Solver s = Solver
   , -- | References of all learnt clauses (kept separate from input
     -- clauses so a future deletion policy can target only learnt material).
     learnts   :: !( Growable Primitive.MVector s ClauseRef )
+  , -- | Lazy-reason closures attached to theory-propagated literals via
+    -- 'Clause.RLazy'. Indexed by 'Clause.LazyRef'. Forced by 'walkUIP' when
+    -- 1-UIP analysis crosses a theory-propagated literal.
+    lazyReasons :: !( Growable Boxed.MVector s ( Clause.LazyReason s ) )
   , -- | Total conflicts encountered.
     confCount :: !( MutVar s Int )
   , -- | Total decisions taken.
@@ -370,6 +406,7 @@ newSolver = do
   -- large enough that typical problems do not run out before we implement
   -- learnt-clause deletion + compaction).
   cstore <- newClauseStore defaultStoreCapacityLits
+  lzs    <- Growable.new 4
   pure Solver
     { assigns            = asg
     , level              = lvl
@@ -384,6 +421,7 @@ newSolver = do
     , qhead              = qh
     , clauseStore        = cstore
     , learnts            = lns
+    , lazyReasons        = lzs
     , confCount          = cc
     , decCount           = dc
     , okFlag             = ok
@@ -453,8 +491,57 @@ levelOfAssignedVar
 levelOfAssignedVar s v = do
   lvl <- Growable.read ( level s ) ( varIndex v )
   case lvl of
-    UnassignedLevel -> error $ "levelOfAssignedVar: unassigned variable " ++ show v
+    UnassignedLevel -> do
+      dump <- dumpSolverState s
+      error $ "SAT.Solver.levelOfAssignedVar: unassigned variable "
+           ++ show v ++ "\n" ++ dump
     _ -> return lvl
+
+-- | Render a snapshot of the trail (lits, levels, reasons) and the
+-- current decision-level stack, for inclusion in panic messages.
+dumpSolverState
+  :: forall m
+  .  PrimMonad m
+  => Solver ( PrimState m ) -> m String
+dumpSolverState s = do
+  TrailPos sz       <- trailSize s
+  DecisionLevel cur <- currentLevel s
+  nLim              <- Growable.length ( trailLim s )
+  let
+    readLim :: Int -> m Int
+    readLim k = do TrailPos p <- Growable.read ( trailLim s ) k; pure p
+    showLits :: Int -> m [ String ]
+    showLits k
+      | k >= sz   = pure []
+      | otherwise = do
+          l   <- Growable.read ( trail s ) k
+          lvl <- Growable.read ( level s ) ( varIndex ( litVar l ) )
+          val <- Growable.read ( assigns s ) ( varIndex ( litVar l ) )
+          rsn <- Growable.read ( reason s ) ( varIndex ( litVar l ) )
+          rest <- showLits ( k + 1 )
+          pure ( ( "  [" ++ show k ++ "] " ++ show l
+                 ++ "  lvl=" ++ ( case lvl of UnassignedLevel -> "UNASSIGNED"; DecisionLevel d -> show d )
+                 ++ "  assign=" ++ show val
+                 ++ "  reason=" ++ showReason rsn ) : rest )
+    limLine :: Int -> m [ String ]
+    limLine k
+      | k >= nLim = pure []
+      | otherwise = do
+          p <- readLim k
+          rest <- limLine ( k + 1 )
+          pure ( ( show ( k + 1 ) ++ "->" ++ show p ) : rest )
+  trailLines <- showLits 0
+  lims       <- limLine 0
+  pure $ "  trailSize=" ++ show sz ++ " currentLevel=" ++ show cur
+      ++ "  trailLim=[" ++ intercalate "," lims ++ "]\n"
+      ++ "  trail:\n" ++ unlines trailLines
+
+showReason :: Clause.Reason -> String
+showReason Clause.RFact         = "RFact"
+showReason Clause.RDecision     = "RDecision"
+showReason ( Clause.RBinary l ) = "RBinary " ++ show l
+showReason ( Clause.RClause r ) = "RClause " ++ show r
+showReason ( Clause.RLazy l )   = "RLazy " ++ show l
 
 trailSize :: PrimMonad m => Solver ( PrimState m ) -> m TrailPos
 trailSize s = TrailPos <$> Growable.length ( trail s )
@@ -990,6 +1077,15 @@ walkUIP s visit visitLit ( TrailPos start ) = go start
                   c' <- clauseAt s cref
                   visit vi c'
                   go ( idx - 1 )
+                Clause.RLazy lref -> do
+                  -- Theory-propagated literal: force the deferred reason
+                  -- closure to recover the supporting clause's literals.
+                  ls <- forceLazy s lref
+                  visitLits vi ls
+                  go ( idx - 1 )
+
+    visitLits :: Int -> [ Lit ] -> m ()
+    visitLits skipVi = mapM_ ( visitLit skipVi )
 
 -- | Pick the highest-level literal from the analyse-side scratch buffers;
 -- it becomes the learnt clause's second watch and its level the backjump
@@ -1156,7 +1252,7 @@ solveWith opts s = do
               else do
                 ( learnt, bj ) <- analyse s c
                 cancelUntil s bj
-                installLearnt learnt
+                installLearnt s learnt
                 VarOrder.decayActivities ( varOrder s )
                 budget <- checkBudget
                 if budget == Just Unknown
@@ -1170,22 +1266,9 @@ solveWith opts s = do
                 Nothing -> pure ( Solved Sat )
                 Just lit -> do
                   modifyMutVar' ( decCount s ) ( + 1 )
-                  pushNewLevel
+                  pushNewLevel s
                   enqueueUndef s lit Clause.RDecision
                   step confs
-
-        installLearnt :: [ Lit ] -> m ()
-        installLearnt = \case
-          [] -> markFalse s
-          [ l ] -> enqueueUndef s l Clause.RFact
-          [ l, m ] -> do
-            attachBinary s l m
-            enqueueUndef s l ( Clause.RBinary m )
-          ls@( l : _ ) -> do
-            ( cref, c ) <- recordClause s True ls
-            Growable.push ( learnts s ) cref
-            attachLong s cref c
-            enqueueUndef s l ( Clause.RClause cref )
 
         checkBudget :: m ( Maybe Verdict )
         checkBudget
@@ -1194,10 +1277,98 @@ solveWith opts s = do
               n <- readMutVar ( confCount s )
               pure $ if n >= optConflictBudget opts then Just Unknown else Nothing
 
-        pushNewLevel :: m ()
-        pushNewLevel = do
-          n <- trailSize s
-          Growable.push ( trailLim s ) n
+-------------------------------------------------------------------------------
+-- Driver primitives.
+--
+-- The functions below carve up the inner step of 'solveWith' into discrete
+-- pieces, exposed for DPLL(T) consumers that interleave theory work with
+-- the SAT search.
+
+-- | Open a fresh decision level by marking the current trail size as the
+-- start of the new level. The next 'enqueueUndef' call will be the head
+-- of the new level (typically a decision).
+pushNewLevel
+  :: PrimMonad m
+  => Solver ( PrimState m ) -> m ()
+pushNewLevel s = do
+  n <- trailSize s
+  Growable.push ( trailLim s ) n
+
+-- | Install a learnt clause and unit-assert its asserting literal.
+--
+-- The clause must be non-empty and unit at the current decision level
+-- (i.e. its asserting literal is currently unassigned and every other
+-- literal is currently false at strictly lower levels).
+--
+-- Returns silently for the unit and ground-level cases; in particular,
+-- passing the empty clause marks the solver as permanently UNSAT.
+installLearnt
+  :: PrimMonad m
+  => Solver ( PrimState m ) -> [ Lit ] -> m ()
+installLearnt s = \case
+  [] -> markFalse s
+  [ l ] -> enqueueUndef s l Clause.RFact
+  [ l, m ] -> do
+    attachBinary s l m
+    enqueueUndef s l ( Clause.RBinary m )
+  ls@( l : _ ) -> do
+    ( cref, c ) <- recordClause s True ls
+    Growable.push ( learnts s ) cref
+    attachLong s cref c
+    enqueueUndef s l ( Clause.RClause cref )
+
+-- | Whether the solver is still consistent (i.e. has not detected a
+-- ground-level inconsistency).
+isOk :: PrimMonad m => Solver ( PrimState m ) -> m Bool
+isOk = readMutVar . okFlag
+
+-- | Read the literal at a trail position. Precondition: the position is
+-- in @[0, trailSize)@.
+trailAt
+  :: PrimMonad m
+  => Solver ( PrimState m ) -> TrailPos -> m Lit
+trailAt s ( TrailPos i ) = Growable.read ( trail s ) i
+
+-- | Stash a lazy-reason closure in the solver and return its handle.
+--
+-- The closure can later be attached to a theory-propagated literal as a
+-- 'Clause.RLazy' reason. It is forced only if 1-UIP analysis crosses the
+-- literal.
+recordLazyReason
+  :: PrimMonad m
+  => Solver ( PrimState m ) -> Clause.LazyReason ( PrimState m ) -> m Clause.LazyRef
+recordLazyReason s lazy = do
+  i <- Growable.length ( lazyReasons s )
+  Growable.push ( lazyReasons s ) lazy
+  pure ( Clause.LazyRef i )
+
+-- | Force a previously-recorded 'Clause.LazyReason' to obtain its supporting
+-- clause's literals.
+forceLazy
+  :: PrimMonad m
+  => Solver ( PrimState m ) -> Clause.LazyRef -> m [ Lit ]
+forceLazy s ( Clause.LazyRef i ) = do
+#ifdef DEBUG
+  n <- Growable.length ( lazyReasons s )
+  when ( i < 0 || i >= n ) $
+    error $ "SAT.Solver.forceLazy: out-of-range LazyRef=" ++ show i
+         ++ " lazyReasons.length=" ++ show n
+#endif
+  lazy <- Growable.read ( lazyReasons s ) i
+  Clause.forceLazyReason lazy
+
+-- | Record a long (size @≥ 3@) theory-supplied clause in the clause store
+-- without attaching watchers.
+--
+-- Intended for materialising a theory conflict so that 'analyse' can read
+-- it via 'clauseAt'. Theory conflict clauses are consumed once by 1-UIP
+-- and never need to participate in BCP, so they do not need to be in any
+-- watch list. (The /learnt/ clause that 1-UIP produces from analysis is
+-- attached normally via 'installLearnt'.)
+recordTheoryClause
+  :: PrimMonad m
+  => Solver ( PrimState m ) -> [ Lit ] -> m ClauseRef
+recordTheoryClause s ls = fst <$> recordClause s False ls
 
 -------------------------------------------------------------------------------
 -- Assignments.

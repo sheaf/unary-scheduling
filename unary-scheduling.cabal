@@ -59,6 +59,7 @@ common common
     MagicHash
     NamedFieldPuns
     NamedWildCards
+    NumericUnderscores
     OverloadedStrings
     PartialTypeSignatures
     PatternSynonyms
@@ -95,6 +96,14 @@ flag viz
   manual:
     False
 
+flag debug
+  description:
+    Enable runtime assertions and bounds-checking inside this library.
+  default:
+    False
+  manual:
+    True
+
 library
 
   import: common
@@ -117,10 +126,13 @@ library
     , Schedule.Constraint
     , Schedule.Contention
     , Schedule.Interval
+    , Schedule.LCG.Atoms
+    , Schedule.LCG.Search
+    , Schedule.LCG.Theory
     , Schedule.Monad
     , Schedule.Ordering
+    , Schedule.Precedence
     , Schedule.Propagators
-    , Schedule.Search
     , Schedule.Task
     , Schedule.Time
     , Schedule.Trail
@@ -160,6 +172,10 @@ library
           ^>= 0.5
     cpp-options:
       -DVIZ
+
+  if flag(debug)
+    cpp-options:
+      -DDEBUG
 
 library z3-oracle
 
@@ -279,7 +295,8 @@ benchmark unary-scheduling-sat-bench
     Main.hs
 
   other-modules:
-    SAT.Bench
+      SAT.Bench
+    , Schedule.Bench
 
   build-depends:
       unary-scheduling

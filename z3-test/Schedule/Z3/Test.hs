@@ -39,6 +39,8 @@ import Test.Tasty.Hedgehog
 -- unary-scheduling
 import Schedule.Interval
   ( Clusivity(..), Endpoint(..), Interval(..), Intervals(..), Measurable(..), mkIntervals )
+import Schedule.LCG.Search
+  ( SearchResult(..), defaultSearchOptions, lcgSearch )
 import Schedule.Propagators
   ( Propagator, basicPropagators, coarsen, propagateConstraints
   , prunePropagator, timetablePropagator, overloadPropagator
@@ -53,7 +55,7 @@ import Schedule.Time
 
 -- z3-oracle
 import Schedule.Z3
-  ( Z3Verdict(..), verifyAgainstZ3, intervalIntBounds )
+  ( Z3Verdict(..), verifyAgainstZ3, intervalIntBounds, z3Feasible )
 
 --------------------------------------------------------------------------------
 -- A small, bounded time type so generated instances stay cheap for Z3.
@@ -160,6 +162,25 @@ confluentOn props = withTests 1000 $ property do
   when ( null ea && null eb ) do
     canonicalAvails a === canonicalAvails b
 
+-- | The LCG search's verdict (feasible / infeasible) must agree with Z3's
+-- on every instance.
+prop_lcg_matches_z3 :: Property
+prop_lcg_matches_z3 = withTests 1000 $ property do
+  namedTasks <- forAll genInstance
+  mbStarts   <- evalIO ( z3Feasible ( map fst namedTasks ) )
+  let res = lcgSearch defaultSearchOptions basicPropagators namedTasks
+  case ( solution res, mbStarts ) of
+    ( Right _, Just _ )    -> success
+    ( Left _,  Nothing )   -> success
+    ( Right _, Nothing )   -> do
+      annotate "LCG returned a solution but Z3 reports infeasibility."
+      failure
+    ( Left err, Just sts ) -> do
+      annotate "LCG returned infeasible but Z3 found a schedule:"
+      annotateShow sts
+      annotate ( Text.unpack err )
+      failure
+
 -- Various subsets of propagators tested separately.
 coreProps, withDetectableProps, withEdgeProps, withoutMatrixProps
   :: [ Propagator () TestTime ]
@@ -199,4 +220,8 @@ tests = testGroup "Differential tests"
       , testPropertyNamed "all but the precedence matrix"            "confluent_no_matrix"   ( confluentOn withoutMatrixProps )
       , testPropertyNamed "all propagators (full set)"               "confluent_full"        ( confluentOn basicPropagators )
       ]
+  , testPropertyNamed
+      "LCG search verdict matches Z3"
+      "prop_lcg_matches_z3"
+      prop_lcg_matches_z3
   ]

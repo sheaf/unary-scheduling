@@ -33,10 +33,6 @@ import Data.Type.Equality
 import GHC.Generics
   ( Generic )
 
--- bitvec
-import Data.Bit
-  ( Bit(..) )
-
 -- constraints-extras
 import Data.Constraint.Extras.TH
   ( deriveArgDict )
@@ -99,7 +95,7 @@ import Control.Monad.Trans.State.Strict
 import qualified Data.Vector as Boxed
   ( Vector )
 import qualified Data.Vector as Boxed.Vector
-  ( length, fromList, (!), unzip, unsafeThaw )
+  ( length, fromList, unzip, unsafeThaw )
 
 -- unary-scheduling
 import Data.Vector.PhaseTransition
@@ -115,7 +111,7 @@ import Schedule.Constraint
 import Schedule.Interval
   ( Measurable )
 import Schedule.Ordering
-  ( Order(..), newOrderingMatrix )
+  ( Order(Unknown), newOrderingMatrix )
 import Schedule.Task
   ( Task(..), TaskInfos(..)
   , MutableTaskInfos, ImmutableTaskInfos
@@ -123,10 +119,6 @@ import Schedule.Task
   )
 import Schedule.Trail
   ( Trail, newTrail )
-import Schedule.Tree
-  ( Propagatable
-      ( overloaded )
-  )
 
 
 -------------------------------------------------------------------------------
@@ -220,20 +212,14 @@ instance ( Num t, Measurable t, Bounded t )
       ( immutableTasks, taskNames ) = Boxed.Vector.unzip $ Boxed.Vector.fromList taskList
       n :: Int
       n = Boxed.Vector.length taskNames
-
-      order :: Int -> Int -> Order
-      order i j =
-        let
-          tk_i, tk_j :: Task task t
-          tk_i = immutableTasks Boxed.Vector.! i
-          tk_j = immutableTasks Boxed.Vector.! j
-        in Order ( Bit ( overloaded ( est tk_j ) ( lst tk_i ) ), Bit ( overloaded ( est tk_i ) ( lst tk_j ) ) )
     taskAvails <- Boxed.Vector.unsafeThaw immutableTasks
     rankingEST <- rankOn est numberedTasks
     rankingLCT <- rankOn lct numberedTasks
     rankingLST <- rankOn lst numberedTasks
     rankingECT <- rankOn ect numberedTasks
-    orderings  <- newOrderingMatrix n order
+    -- The ordering matrix starts empty; window-implied precedences are
+    -- rediscovered on the first propagation, which keeps the matrix in sync.
+    orderings  <- newOrderingMatrix n ( \ _ _ -> Unknown )
     pure ( TaskInfos { .. } )
 
 -------------------------------------------------------------------------------
@@ -257,7 +243,7 @@ broadcastModifications tgt newModifs =
   DMap.mapWithKey \case
     Coarse name
       | TellEveryoneBut name /= tgt
-      -- Update even with ( False, False ) keys ( i.e. neither left or right adjusted),
+      -- Update even with ( False, False ) keys (i.e. neither left or right adjusted),
       -- as the task can still have been modified without its endpoints changing.
       -> coerce $ IntSet.union ( IntMap.keysSet newModifs )
     Fine name

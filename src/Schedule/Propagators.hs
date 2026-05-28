@@ -7,6 +7,8 @@ module Schedule.Propagators
     Propagator(..), basicPropagators
   , coarsen
   , propagateConstraints, propagationLoop
+    -- * Constructing the initial 'Modifications' seed for 'propagationLoop'.
+  , seedAllOf, seedMatrixWatchers
     -- * Local constraint propagators.
   , prune, prunePropagator
   , timetable, timetablePropagator
@@ -311,9 +313,38 @@ propagateConstraints
   -> [ Propagator task t ]
   -> ( ImmutableTaskInfos task t, Text, Maybe Text )
 propagateConstraints taskData maxLoopIterations propagators =
-  case runScheduleMonad taskData ( \ trail -> propagationLoop maxLoopIterations trail propagators ) of
+  case runScheduleMonad taskData run of
     ( updatedTasks, ( mbGaveUpText, Constraints { justifications } ) ) ->
       ( updatedTasks, justifications, either Just ( const Nothing ) mbGaveUpText )
+  where
+    run :: forall s. Trail s task t -> ScheduleMonad s task t ()
+    run trail = do
+      TaskInfos { taskNames } <- ask
+      let allTasks = IntSet.fromList [ 0 .. Boxed.Vector.length taskNames - 1 ]
+      propagationLoop maxLoopIterations trail propagators
+        ( seedAllOf propagators allTasks )
+
+-- | Seed for 'propagationLoop' that puts the given dirty task set into
+-- /every/ propagator subscription.
+seedAllOf
+  :: [ Propagator task t ]
+  -> IntSet
+  -> Modifications
+seedAllOf propagators dirty = DMap.fromList
+  [ case prop of Propagator { wakeOn } -> wakeOn :=> Identity ( fullValue wakeOn dirty )
+  | prop <- propagators
+  ]
+
+-- | Seed for 'propagationLoop' that wakes /only/ the matrix-watching
+-- propagators ('predecessorPropagator', 'successorPropagator') over the
+-- given task set. Other propagators wake automatically via
+-- 'broadcastModifications' if these emit bound-tightening constraints
+-- inside the loop.
+seedMatrixWatchers :: IntSet -> Modifications
+seedMatrixWatchers dirty = DMap.fromList
+  [ Coarse "predecessor" :=> Identity dirty
+  , Coarse "successor"   :=> Identity dirty
+  ]
 
 -- | Run the given propagators to a fixpoint (event-driven).
 propagationLoop
@@ -325,29 +356,15 @@ propagationLoop
   => Int
   -> Trail s task t
   -> [ Propagator task t ]
+  -> Modifications          -- ^ initial 'Modifications' used to kick off subscribed propagators
   -> ScheduleMonad s task t ()
-propagationLoop maxRounds trail propagators = do
-  -- Seed every subscription with all tasks, so each propagator runs at least once.
-  seedAllDirty
+propagationLoop maxRounds trail propagators seed = do
+  modify' ( set ( field' @"tasksModified" ) seed )
   -- Apply any constraints already posted (e.g. by a search decision) before the
   -- first propagator runs, so it sees the tightened domains.
   _ <- applyEmitted TellEveryone
   drive maxRounds
   where
-
-    -- Mark every propagator's subscription as pending over all tasks.
-    seedAllDirty :: ScheduleMonad s task t ()
-    seedAllDirty = do
-      TaskInfos { taskNames } <- ask
-      let
-        allTasks :: IntSet
-        allTasks = IntSet.fromList [ 0 .. Boxed.Vector.length taskNames - 1 ]
-        seeded :: Modifications
-        seeded = DMap.fromList
-          [ case prop of Propagator { wakeOn } -> wakeOn :=> Identity ( fullValue wakeOn allTasks )
-          | prop <- propagators
-          ]
-      modify' ( set ( field' @"tasksModified" ) seeded )
 
     -- The first propagator with pending work, in list order (so earlier
     -- propagators keep their priority).
