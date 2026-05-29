@@ -33,7 +33,7 @@ import Test.Tasty.Bench
 import Schedule.Bench.Instances
   ( BenchTime(..), Instance
   , runLCG, runPropOnly
-  , randomInstanceAtUtilisation, randomWindowedInstance
+  , randomWindowedInstance
   , overloadedInstance, twoSegmentInstance
   , tightCliqueInstance, chainedWindowInstance, chainedOverloadedInstance
   )
@@ -69,47 +69,34 @@ benchmarks :: [ Benchmark ]
 benchmarks =
   -- tolerate higher variance to avoid tests taking too long
   map ( localOption ( RelStDev 0.1 ) . localOption ( mkTimeout 5_000_000 ) )
-  [ bgroup "tight feasible (~95% utilisation)"
-      [ triple ( "n=" ++ show n ++ " maxDur=" ++ show d )
-               ( randomInstanceAtUtilisation 0.95 n d 42 )
-      | ( n, d ) <- [ ( 4, 3 ), ( 6, 3 ), ( 8, 3 ), ( 12, 3 ), ( 16, 3 ) ]
-      ]
-  , bgroup "moderately constrained feasible (~60% utilisation)"
-      [ triple ( "n=" ++ show n ++ " maxDur=" ++ show d )
-               ( randomInstanceAtUtilisation 0.6 n d 42 )
-      | ( n, d ) <- [ ( 4, 3 ), ( 6, 3 ), ( 8, 3 ), ( 12, 3 ), ( 16, 3 ) ]
-      ]
-  , bgroup "under-constrained feasible (~20% utilisation; overhead baseline)"
-      [ triple ( "n=" ++ show n ++ " maxDur=" ++ show d )
-               ( randomInstanceAtUtilisation 0.2 n d 42 )
-      | ( n, d ) <- [ ( 4, 3 ), ( 6, 3 ), ( 8, 3 ), ( 12, 3 ), ( 16, 3 ) ]
-      ]
-  , bgroup "staggered windows, ~70% utilisation (propagation + search)"
+
+  -- One benchmark group per distinct workload class.
+  [ bgroup "staggered windows ~70% (heterogeneous; propagation + search)"
       [ triple ( "n=" ++ show n ++ " maxDur=" ++ show d )
                ( randomWindowedInstance 0.7 4 n d 42 )
       | ( n, d ) <- [ ( 4, 3 ), ( 6, 3 ), ( 8, 3 ), ( 12, 3 ), ( 16, 3 ) ]
       ]
-  , bgroup "infeasible (demand twice the horizon)"
+  , bgroup "disjunctive clique (shared window; propagators idle, pure search)"
       [ triple ( "n=" ++ show n ++ " d=" ++ show d )
-               ( overloadedInstance n d )
-      | ( n, d ) <- [ ( 4, 3 ), ( 6, 3 ), ( 8, 3 ), ( 12, 3 ), ( 16, 3 ) ]
+               ( tightCliqueInstance n d )
+      | ( n, d ) <- [ ( 4, 2 ), ( 6, 2 ), ( 8, 2 ), ( 12, 2 ), ( 16, 2 ) ]
+      ]
+  , bgroup "chained window (rolling pigeonhole; each task k in [k, k+w])"
+      [ triple ( "n=" ++ show n ++ " w=" ++ show w )
+               ( chainedWindowInstance n w 1 )
+      | ( n, w ) <- [ ( 4, 2 ), ( 6, 2 ), ( 8, 2 ), ( 12, 2 ) ]
       ]
   , bgroup "two-segment availability"
       [ triple ( "n=" ++ show n ++ " win=" ++ show h ++ " d=" ++ show d )
                ( twoSegmentInstance n h 2 d )
       | ( n, h, d ) <- [ ( 4, 8, 2 ), ( 6, 12, 2 ), ( 8, 16, 2 ) ]
       ]
-  , bgroup "tight clique (n duration-d tasks, horizon n·d)"
+  , bgroup "infeasible: resource overload (demand twice the horizon)"
       [ triple ( "n=" ++ show n ++ " d=" ++ show d )
-               ( tightCliqueInstance n d )
-      | ( n, d ) <- [ ( 4, 2 ), ( 6, 2 ), ( 8, 2 ), ( 12, 2 ) ]
+               ( overloadedInstance n d )
+      | ( n, d ) <- [ ( 4, 3 ), ( 6, 3 ), ( 8, 3 ), ( 12, 3 ), ( 16, 3 ) ]
       ]
-  , bgroup "chained window (each task k in [k, k+w])"
-      [ triple ( "n=" ++ show n ++ " w=" ++ show w )
-               ( chainedWindowInstance n w 1 )
-      | ( n, w ) <- [ ( 4, 2 ), ( 6, 2 ), ( 8, 2 ), ( 12, 2 ) ]
-      ]
-  , bgroup "chained-window + extra task (structured infeasibility)"
+  , bgroup "infeasible: structured (chained window + extra task)"
       [ triple ( "n=" ++ show n ++ " w=" ++ show w )
                ( chainedOverloadedInstance n w 1 )
       | ( n, w ) <- [ ( 4, 2 ), ( 6, 2 ), ( 8, 2 ) ]
