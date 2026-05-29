@@ -374,6 +374,8 @@ propagationLoop maxRounds trail propagators seed = do
 
     drive :: Int -> ScheduleMonad s task t ()
     drive rounds
+      -- TODO: hitting the round cap returns silently, as if a fixpoint were
+      -- reached. Instead we should signal a distinct "GiveUp" value.
       | rounds <= 0
       = pure ()
       | otherwise
@@ -402,6 +404,15 @@ propagationLoop maxRounds trail propagators seed = do
         pure False
       else do
         modifs <- applyConstraints trail cts
+        -- NB: this resets 'constraints' but deliberately NOT 'precedences':
+        -- the LCG layer ('Schedule.LCG.Theory.runPropagators') reads the
+        -- accumulated precedence map at the end of the loop to learn which
+        -- precedences to channel onto the SAT trail. The cost of re-applying
+        -- it via 'addIncidentEdges' each round is now near-free — the
+        -- 'modify'Ordering' equality guard skips (and so does not re-trail)
+        -- the idempotent re-adds. TODO: once channeling is the sole matrix
+        -- owner ("one matrix owner"), 'applyConstraints' need not touch the
+        -- matrix here at all.
         modify'
           -- Reset constraints: they have been applied.
           $ set  ( field' @"taskConstraints" . field' @"constraints" ) mempty

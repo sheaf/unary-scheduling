@@ -40,7 +40,7 @@ import GHC.Generics
 
 -- primitive
 import Data.Primitive.MutVar
-  ( MutVar, newMutVar, readMutVar, modifyMutVar' )
+  ( readMutVar )
 
 -- text
 import Data.Text
@@ -73,6 +73,8 @@ data SearchOptions = SearchOptions
   { -- | Maximum propagator-loop iterations per theory step.
     optPropRounds :: !Int
   , -- | SAT-solver options.
+    --
+    -- TODO: currently IGNORED by 'lcgSearch'.
     optSolver     :: !SAT.SolverOptions
   }
 
@@ -136,24 +138,30 @@ lcgSearch opts props givenTasks = runST do
   tis    <- initialTaskData @taskData @task @t givenTasks
   theory <- newTheory tis props ( optPropRounds opts )
 
-  -- Counters.
-  theoryPropCount <- newMutVar 0
-
   -- Drive the DPLL(T) loop. Its first iteration runs the propagators on
   -- the starting state, seeding any unconditional inferences before the
   -- SAT core takes its first decision.
-  finalVerdict <- driveLoop ( solver theory ) theory theoryPropCount
+  finalVerdict <- driveLoop ( solver theory ) theory
 
   -- Build the result.
   mbSolution <- case finalVerdict of
-    SAT.Sat     -> Right <$> freeze tis
+    SAT.Sat     ->
+      -- TODO: this is not a verified concrete schedule.
+      -- Feasibility relies on completeness of the propagators (e.g. a fully-decided
+      -- acyclic tournament with no overload always admits a schedule).
+      --
+      -- We should extract a greedy earliest-start schedule and check it is
+      -- indeed a valid schedule.
+      Right <$> freeze tis
     SAT.Unsat   -> pure ( Left "unary-scheduling: instance is infeasible" )
-    SAT.Unknown -> pure ( Left "unary-scheduling: search budget exhausted" )
+    SAT.Unknown ->
+      -- TODO: driveLoop never reports 'Unknown' at the moment.
+      pure ( Left "unary-scheduling: search budget exhausted" )
 
   cc <- SAT.numConflicts ( solver theory )
   dc <- SAT.numDecisions ( solver theory )
   lc <- SAT.numLearnts   ( solver theory )
-  tp <- readMutVar theoryPropCount
+  tp <- readMutVar ( theoryPropCount theory )
   let !stats0 = SearchStats
         { numConflicts          = cc
         , numDecisions          = dc
@@ -170,9 +178,18 @@ driveLoop
      )
   => SAT.Solver s
   -> Theory s task t
-  -> MutVar s Int   -- ^ theory-propagation counter
   -> ST s SAT.Verdict
-driveLoop solver theory tpCount = step
+driveLoop solver theory = step
+  -- NB: Conflict bookkeeping (counters, VSIDS decay) and the
+  -- analyse/backjump/install sequence are shared with 'SAT.solveWith' via
+  -- 'SAT.resolveConflict' and 'SAT.decide', but there is still some drift
+  -- in implementations because we are missing a restart schedule and conflict
+  -- budget, so 'SAT.Unknown' is never produced and 'optSolver' is ignored
+  -- entirely.
+  --
+  -- TODO: solve this in a way that doesn't introduce two different codepaths
+  -- that can keep drifting out-of-sync.
+
   where
     step :: ST s SAT.Verdict
     step = do
@@ -185,9 +202,8 @@ driveLoop solver theory tpCount = step
         case mbConf of
           Just c  -> handleConflict c
           Nothing -> do
-            -- 2. Theory propagation
+            -- 2. Theory propagation.
             szBefore <- SAT.trailSize solver
-            modifyMutVar' tpCount ( + 1 )
             mbTConf <- theoryPropagate theory
             case mbTConf of
               Just c  -> handleConflict c
@@ -225,8 +241,5 @@ driveLoop solver theory tpCount = step
         SAT.markFalse solver
         pure SAT.Unsat
       else do
-        ( learnt, bj ) <- SAT.analyse solver c
-        SAT.cancelUntil solver bj
-        popToLevel theory bj
-        SAT.installLearnt solver learnt
+        SAT.resolveConflict solver c ( popToLevel theory )
         step

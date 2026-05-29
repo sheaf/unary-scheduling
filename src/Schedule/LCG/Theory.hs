@@ -139,6 +139,10 @@ data Theory s task t = Theory
     -- 'Nothing' marks the very first call: every propagator subscription
     -- is seeded with the full task set ('seedAllOf').
     dirtySeed      :: !( MutVar s ( Maybe IntSet ) )
+  , -- | Cumulative count of theory propagations: literals the theory has
+    -- promoted onto the SAT trail (both derived transitive edges and
+    -- propagator-emitted precedences). For instrumentation.
+    theoryPropCount :: !( MutVar s Int )
   }
 
 -- | Allocate a fresh 'Theory' for the given scheduler state and
@@ -163,16 +167,18 @@ newTheory tis props rounds = do
   th    <- newMutVar 0
   lms   <- Growable.new 16
   ds    <- newMutVar Nothing
+  tpc   <- newMutVar 0
   pure Theory
-    { solver        = s
-    , atoms         = ps
-    , tasks         = tis
-    , schedTrail    = trail
-    , propagators   = props
-    , maxPropRounds = rounds
-    , theoryHead    = th
-    , levelMarks    = lms
-    , dirtySeed     = ds
+    { solver          = s
+    , atoms           = ps
+    , tasks           = tis
+    , schedTrail      = trail
+    , propagators     = props
+    , maxPropRounds   = rounds
+    , theoryHead      = th
+    , levelMarks      = lms
+    , dirtySeed       = ds
+    , theoryPropCount = tpc
     }
 
 -------------------------------------------------------------------------------
@@ -332,6 +338,12 @@ checkMatrixTrailInvariant t ctx = iterPairs 0 1
 #endif
 
 -- | Channel a single SAT precedence assignment into the ordering matrix.
+--
+-- TODO: in the LCG path the ordering matrix has two writers — propagator
+-- precedences are written non-transitively by 'applyConstraints' during the
+-- propagation loop, then the same precedence is re-written transitively here
+-- once its SAT literal is drained. The first write is redundant; the matrix
+-- should have a single owner (ideally channeling).
 channelLit
   :: forall s task t
   .  ( Num t, Measurable t, Bounded t )
@@ -441,6 +453,9 @@ runPropagators t = do
   writeMutVar ( dirtySeed t ) ( Just IntSet.empty )
   ( eRes, finalUpdates ) <- runSchedule ( tasks t )
     ( propagationLoop ( maxPropRounds t ) ( schedTrail t ) ( propagators t ) seed )
+  -- TODO: 'propagationLoop' doesn't properly report 'GiveUp', which means we
+  -- currently conflate "fixpoint, consistent" with "gave up early".
+  -- That's a glaring, incompleteness/soundness hazard.
   case eRes of
     Left _err ->
       -- A propagator threw (e.g. overload, cycle, etc).
@@ -524,8 +539,21 @@ assertTheoryLit t lit reason = do
   case val of
     LTrue  -> pure Nothing
     LUndef -> do
-      lref <- SAT.recordLazyReason ( solver t ) reason
-      SAT.enqueueUndef ( solver t ) lit ( RLazy lref )
+      lvl <- SAT.currentLevel ( solver t )
+      if lvl == SAT.GroundLevel
+      then
+        -- A ground-level theory propagation is an unconditional fact.
+        -- 1-UIP analysis never resolves against ground-level literals, so it
+        -- needs no reason clause.
+        SAT.enqueueUndef ( solver t ) lit RFact
+      else do
+        -- TODO: the lazy-reason table is never reclaimed on backjump, so
+        -- closures from undone propagations linger, each retaining the
+        -- captured 'Theory'/trail bound. Reclaim it in lockstep with the
+        -- trail (cf. 'levelMarks').
+        lref <- SAT.recordLazyReason ( solver t ) reason
+        SAT.enqueueUndef ( solver t ) lit ( RLazy lref )
+      modifyMutVar' ( theoryPropCount t ) ( + 1 )
       pure Nothing
     LFalse ->
       -- The theory inferred 'lit' but SAT has already assigned it false.
@@ -616,6 +644,9 @@ literalsAsConflict
   -> ST s ( Maybe SAT.Conflict )
 literalsAsConflict s = \ case
   []       -> SAT.markFalse s *> pure Nothing
+  -- TODO: a unit conflict is encoded as 'ConflictBinary x x' (a fake 2-lit
+  -- clause); this only works because 'analyse' dedups via the 'seen' marker.
+  -- A dedicated unit-conflict representation would be less of a trap.
   [ x ]    -> pure ( Just ( SAT.ConflictBinary x x ) )
   [ a, b ] -> pure ( Just ( SAT.ConflictBinary a b ) )
   longer   -> Just . SAT.ConflictClause <$> SAT.recordTheoryClause s longer

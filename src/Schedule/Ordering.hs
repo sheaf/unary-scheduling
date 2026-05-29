@@ -222,7 +222,10 @@ modify'Ordering writeCell mat f i j = do
   o <- readOrdering mat i j
   let
     !o' = f o
-  writeOrdering writeCell mat o' i j
+  -- Only write when the cell actually changes, to avoid bloating the trail
+  -- with no-ops.
+  when ( o' /= o ) $
+    writeOrdering writeCell mat o' i j
 
 -- | Add edges incident to a given vertex (without computing a transitive closure).
 addIncidentEdges
@@ -277,6 +280,9 @@ addIncidentEdgesTransitively
 addIncidentEdgesTransitively writeCell onNewEdge cycleError mat@( OrderingMatrix { dim } ) v befores afters = do
   -- Step 1: tally the new connections around vertex 'v' (predecessors and
   -- successors reachable through a single new edge incident to 'v').
+
+  -- TODO: allocates a fresh length-'dim' vector on every call (i.e. per
+  -- channeled edge). A reusable scratch buffer would avoid the churn.
   new <- Unboxed.Vector.fromList <$>
     for [ 0 .. dim - 1 ] \ i ->
       if i == v

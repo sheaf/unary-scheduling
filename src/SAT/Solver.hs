@@ -89,6 +89,7 @@ module SAT.Solver
   , enqueueUndef
   , tryEnqueue
   , installLearnt
+  , resolveConflict
   , recordLazyReason
   , recordTheoryClause
   , ClauseRef(..)
@@ -1184,6 +1185,7 @@ decide s = do
   case mbV of
     Nothing -> pure Nothing
     Just v  -> do
+      modifyMutVar' ( decCount s ) ( + 1 )
       pol <- Growable.read ( phase s ) ( varIndex v )
       pure ( Just ( mkLit v pol ) )
   where
@@ -1245,15 +1247,13 @@ solveWith opts s = do
           mbConf <- propagate s
           case mbConf of
             Just c -> do
-              modifyMutVar' ( confCount s ) ( + 1 )
               lvl <- currentLevel s
               if lvl == GroundLevel
               then markFalse s *> pure ( Solved Unsat )
               else do
-                ( learnt, bj ) <- analyse s c
-                cancelUntil s bj
-                installLearnt s learnt
-                VarOrder.decayActivities ( varOrder s )
+                -- Count, analyse, backjump, install, decay.
+                -- No theory backjump hook needed for the plain SAT loop.
+                resolveConflict s c ( \ _bj -> pure () )
                 budget <- checkBudget
                 if budget == Just Unknown
                 then pure ( Solved Unknown )
@@ -1265,7 +1265,6 @@ solveWith opts s = do
               case mbLit of
                 Nothing -> pure ( Solved Sat )
                 Just lit -> do
-                  modifyMutVar' ( decCount s ) ( + 1 )
                   pushNewLevel s
                   enqueueUndef s lit Clause.RDecision
                   step confs
@@ -1316,6 +1315,29 @@ installLearnt s = \case
     Growable.push ( learnts s ) cref
     attachLong s cref c
     enqueueUndef s l ( Clause.RClause cref )
+
+-- | Resolve a non-ground conflict.
+--
+-- Precondition: the conflict is at a decision level strictly above
+-- 'GroundLevel'; a ground-level conflict is terminal UNSAT and must be
+-- handled by the caller via 'markFalse'.
+--
+-- Consequently, 'numConflicts' counts only resolved above-ground conflicts.
+resolveConflict
+  :: PrimMonad m
+  => Solver ( PrimState m )
+  -> Conflict
+  -> ( DecisionLevel -> m () )
+       -- ^ post-backjump hook, run after 'cancelUntil' and before
+       -- 'installLearnt'; given the backjump level
+  -> m ()
+resolveConflict s c onBackjump = do
+  modifyMutVar' ( confCount s ) ( + 1 )
+  ( learnt, bj ) <- analyse s c
+  cancelUntil s bj
+  onBackjump bj
+  installLearnt s learnt
+  VarOrder.decayActivities ( varOrder s )
 
 -- | Whether the solver is still consistent (i.e. has not detected a
 -- ground-level inconsistency).
@@ -1369,6 +1391,7 @@ recordTheoryClause
   :: PrimMonad m
   => Solver ( PrimState m ) -> [ Lit ] -> m ClauseRef
 recordTheoryClause s ls = fst <$> recordClause s False ls
+  -- TODO: these clauses are stored permanently, never reclaimed.
 
 -------------------------------------------------------------------------------
 -- Assignments.
