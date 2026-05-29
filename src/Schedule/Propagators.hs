@@ -144,6 +144,8 @@ import Schedule.Monad
   , Notifiee(..), Modifications
   , BroadcastTarget(..), broadcastModifications
   )
+import Schedule.Monitor
+  ( Monitor(..), Monitoring(..), MonitorMode(..) )
 import Schedule.Ordering
   ( Order, readOrdering )
 import Schedule.Task
@@ -321,7 +323,8 @@ propagateConstraints taskData maxLoopIterations propagators =
     run trail = do
       TaskInfos { taskNames } <- ask
       let allTasks = IntSet.fromList [ 0 .. Boxed.Vector.length taskNames - 1 ]
-      propagationLoop maxLoopIterations trail propagators
+      -- The non-LCG fixpoint path is never instrumented.
+      propagationLoop NoMonitoring maxLoopIterations trail propagators
         ( seedAllOf propagators allTasks )
 
 -- | Seed for 'propagationLoop' that puts the given dirty task set into
@@ -346,19 +349,24 @@ seedMatrixWatchers dirty = DMap.fromList
   , Coarse "successor"   :=> Identity dirty
   ]
 
+{-# INLINABLE propagationLoop #-}
+{-# SPECIALISE propagationLoop @MonitoringOff NoMonitoring #-}
+
 -- | Run the given propagators to a fixpoint (event-driven).
 propagationLoop
-  :: forall s task t
+  :: forall mode s task t
   .  ( Num t, Measurable t, Bounded t
      -- debugging
      , Show t, Show task
+     , MonitorMode mode
      )
-  => Int
+  => Monitor mode s
+  -> Int
   -> Trail s task t
   -> [ Propagator task t ]
   -> Modifications          -- ^ initial 'Modifications' used to kick off subscribed propagators
   -> ScheduleMonad s task t ()
-propagationLoop maxRounds trail propagators seed = do
+propagationLoop mon maxRounds trail propagators seed = do
   modify' ( set ( field' @"tasksModified" ) seed )
   -- Apply any constraints already posted (e.g. by a search decision) before the
   -- first propagator runs, so it sees the tightened domains.
@@ -390,8 +398,10 @@ propagationLoop maxRounds trail propagators seed = do
             -- their own; clearing again here is harmless and covers the globals).
             modify' ( over ( field' @"tasksModified" ) ( clearPending wakeOn ) )
             applied <- applyEmitted notifyTarget
+            tickPropagator mon ( notifieeName wakeOn ) applied
             -- Only a round that actually applied constraints counts against the
             -- safety bound, matching the previous loop's iteration counting.
+            when applied ( tickRound mon )
             drive ( if applied then rounds - 1 else rounds )
 
     -- Apply any emitted constraints, broadcasting the resulting task changes to

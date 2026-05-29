@@ -130,6 +130,7 @@ library
     , Schedule.LCG.Search
     , Schedule.LCG.Theory
     , Schedule.Monad
+    , Schedule.Monitor
     , Schedule.Ordering
     , Schedule.Precedence
     , Schedule.Propagators
@@ -296,7 +297,9 @@ benchmark unary-scheduling-sat-bench
 
   other-modules:
       SAT.Bench
+    , SAT.Bench.Instances
     , Schedule.Bench
+    , Schedule.Bench.Instances
 
   build-depends:
       unary-scheduling
@@ -311,3 +314,44 @@ benchmark unary-scheduling-sat-bench
   ghc-options:
     -O2
     -threaded
+
+flag inspect-dumps
+  description:
+    Add GHC Core/STG dump flags to the lcg-inspect executable.
+  default:
+    False
+  manual:
+    True
+
+executable lcg-inspect
+
+  import: common
+
+  hs-source-dirs:
+      bench-inspect
+    , bench
+
+  main-is:
+    Main.hs
+
+  other-modules:
+      SAT.Bench.Instances
+    , Schedule.Bench.Instances
+
+  build-depends:
+      unary-scheduling
+    , random
+         >= 1.2   && < 1.4
+
+  ghc-options:
+    -O2
+
+  if flag(inspect-dumps)
+    ghc-options:
+      -ddump-simpl
+      -ddump-stg-final
+      -ddump-to-file
+      -dsuppress-all
+      -dsuppress-uniques
+      -dsuppress-coercions
+      -dsuppress-type-applications

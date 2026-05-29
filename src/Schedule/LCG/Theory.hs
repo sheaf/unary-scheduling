@@ -92,6 +92,8 @@ import Schedule.LCG.Atoms
   )
 import Schedule.Monad
   ( ScheduleMonad, TaskUpdates(..) )
+import Schedule.Monitor
+  ( Monitoring(..), MonitorMode(..), Monitor )
 import Schedule.Ordering
   ( EdgeOrigin(..), CycleInfo
   , addIncidentEdgesTransitively
@@ -112,7 +114,10 @@ import Schedule.Interval
 -- Theory state.
 
 -- | The DPLL(T) theory state for unary scheduling.
-data Theory s task t = Theory
+--
+-- The @mode@ parameter selects the instrumentation level ('Schedule.Monitor');
+-- at @mode ~ 'Schedule.Monitor.MonitoringOff'@ the monitor and all its hooks are erased.
+data Theory mode s task t = Theory
   { -- | The CDCL core driving search.
     solver         :: !( SAT.Solver s )
   , -- | The bijection between task pairs and SAT variables.
@@ -143,15 +148,22 @@ data Theory s task t = Theory
     -- promoted onto the SAT trail (both derived transitive edges and
     -- propagator-emitted precedences). For instrumentation.
     theoryPropCount :: !( MutVar s Int )
+  , -- | Optional instrumentation. Erased entirely when @mode ~ 'MonitoringOff'@.
+    monitor         :: !( Monitor mode s )
   }
+
+{-# INLINABLE newTheory #-}
+{-# SPECIALISE newTheory @MonitoringOff #-}
 
 -- | Allocate a fresh 'Theory' for the given scheduler state and
 -- propagators.
 newTheory
-  :: MutableTaskInfos s task t
+  :: forall mode s task t
+  .  MonitorMode mode
+  => MutableTaskInfos s task t
   -> [ Propagator task t ]
   -> Int                          -- ^ propagator-round cap per theory step
-  -> ST s ( Theory s task t )
+  -> ST s ( Theory mode s task t )
 newTheory tis props rounds = do
   s     <- SAT.newSolver
   let nT  = Boxed.Vector.length ( taskNames tis )
@@ -168,6 +180,7 @@ newTheory tis props rounds = do
   lms   <- Growable.new 16
   ds    <- newMutVar Nothing
   tpc   <- newMutVar 0
+  mon   <- newMonitor @mode
   pure Theory
     { solver          = s
     , atoms           = ps
@@ -179,6 +192,7 @@ newTheory tis props rounds = do
     , levelMarks      = lms
     , dirtySeed       = ds
     , theoryPropCount = tpc
+    , monitor         = mon
     }
 
 -------------------------------------------------------------------------------
@@ -191,7 +205,7 @@ newTheory tis props rounds = do
 -- schedule-trail mark captured at the start of level @k + 1@ (i.e. just
 -- before the level-@(k+1)@ decision is asserted), so undoing back to that
 -- mark restores the trail to the state right after level @k@'s effects.
-pushLevel :: Theory s task t -> ST s ()
+pushLevel :: Theory mode s task t -> ST s ()
 pushLevel t = do
   m <- currentMark ( schedTrail t )
   Growable.push ( levelMarks t ) m
@@ -202,7 +216,7 @@ pushLevel t = do
 -- Precondition: @lvl@ is strictly less than the current SAT level
 -- (i.e. we are actually backjumping). This matches how
 -- 'SAT.Solver.cancelUntil' itself indexes 'SAT.Solver.trailLim'.
-popToLevel :: Theory s task t -> SAT.DecisionLevel -> ST s ()
+popToLevel :: Theory mode s task t -> SAT.DecisionLevel -> ST s ()
 popToLevel t ( SAT.DecisionLevel lvl ) = do
 #ifdef DEBUG
   n <- Growable.length ( levelMarks t )
@@ -223,7 +237,7 @@ popToLevel t ( SAT.DecisionLevel lvl ) = do
 -- | Number of precedence literals currently on the SAT trail.
 --
 -- Used only for debugging/instrumentation.
-numPrecedenceDecisions :: Theory s task t -> ST s Int
+numPrecedenceDecisions :: Theory mode s task t -> ST s Int
 numPrecedenceDecisions t = do
   SAT.TrailPos sz <- SAT.trailSize ( solver t )
   let
@@ -239,6 +253,9 @@ numPrecedenceDecisions t = do
 -------------------------------------------------------------------------------
 -- One round of theory propagation.
 
+{-# INLINABLE theoryPropagate #-}
+{-# SPECIALISE theoryPropagate @MonitoringOff #-}
+
 -- | Channel new SAT trail literals into the scheduler's ordering matrix,
 -- run the unary-scheduling propagators to a fixpoint, and promote the
 -- emitted precedence inferences back to the SAT trail.
@@ -246,11 +263,12 @@ numPrecedenceDecisions t = do
 -- Returns 'Nothing' on success (any newly enqueued literals will be
 -- visible to the next 'SAT.propagate' call) and 'Just c' on conflict.
 theoryPropagate
-  :: forall s task t
+  :: forall mode s task t
   .  ( Num t, Measurable t, Bounded t
      , Show t, Show task
+     , MonitorMode mode
      )
-  => Theory s task t
+  => Theory mode s task t
   -> ST s ( Maybe SAT.Conflict )
 theoryPropagate t = do
   channelOutcome <- channelPending t
@@ -261,15 +279,20 @@ theoryPropagate t = do
 -------------------------------------------------------------------------------
 -- (1) Channel SAT trail literals into the ordering matrix.
 
+{-# INLINABLE channelPending #-}
+{-# SPECIALISE channelPending @MonitoringOff #-}
+
 -- | Drain @[theoryHead, trailSize)@ into the matrix. Each channeled lit
 -- may push more theory propagations onto the SAT trail (transitive-closure
 -- derivations), which the loop then consumes in turn.
 --
 -- Returns the first conflict encountered (if any).
 channelPending
-  :: forall s task t
-  .  ( Num t, Measurable t, Bounded t )
-  => Theory s task t
+  :: forall mode s task t
+  .  ( Num t, Measurable t, Bounded t
+     , MonitorMode mode
+     )
+  => Theory mode s task t
   -> ST s ( Maybe SAT.Conflict )
 channelPending t = do
 #ifdef DEBUG
@@ -303,8 +326,8 @@ channelPending t = do
 -- ordering matrix must correspond to an assigned precedence literal on the
 -- SAT trail.
 checkMatrixTrailInvariant
-  :: forall s task t
-  .  Theory s task t
+  :: forall mode s task t
+  .  Theory mode s task t
   -> String
   -> ST s ()
 checkMatrixTrailInvariant t ctx = iterPairs 0 1
@@ -337,6 +360,9 @@ checkMatrixTrailInvariant t ctx = iterPairs 0 1
           iterPairs i ( j + 1 )
 #endif
 
+{-# INLINABLE channelLit #-}
+{-# SPECIALISE channelLit @MonitoringOff #-}
+
 -- | Channel a single SAT precedence assignment into the ordering matrix.
 --
 -- TODO: in the LCG path the ordering matrix has two writers — propagator
@@ -345,13 +371,16 @@ checkMatrixTrailInvariant t ctx = iterPairs 0 1
 -- once its SAT literal is drained. The first write is redundant; the matrix
 -- should have a single owner (ideally channeling).
 channelLit
-  :: forall s task t
-  .  ( Num t, Measurable t, Bounded t )
-  => Theory s task t
+  :: forall mode s task t
+  .  ( Num t, Measurable t, Bounded t
+     , MonitorMode mode
+     )
+  => Theory mode s task t
   -> Int -> Int
   -> ST s ( Maybe SAT.Conflict )
 channelLit t predTask succTask = do
   let tis = tasks t
+  tickChannelCall ( monitor t )
 #ifdef DEBUG
   let ps = atoms t
       d = numTasks ps
@@ -387,6 +416,7 @@ channelLit t predTask succTask = do
       case origin of
         SeedEdge -> pure ()
         DerivedEdge u -> do
+          lift ( tickDerivedEdges ( monitor t ) 1 )
           -- Derived edge @a → b@ via the witness vertex @u@.
           -- The reason clause has exactly three literals:
           --   ¬p(a → u) ∨ ¬p(u → b) ∨ p(a → b)
@@ -410,7 +440,7 @@ channelLit t predTask succTask = do
 -- the relevant tasks. While 'dirtySeed' is still 'Nothing' (before the
 -- first 'runPropagators' call) we leave it alone: that first call will
 -- seed every propagator subscription with the full task set anyway.
-markDirtyPair :: Theory s task t -> Int -> Int -> ST s ()
+markDirtyPair :: Theory mode s task t -> Int -> Int -> ST s ()
 markDirtyPair t a b =
   modifyMutVar' ( dirtySeed t ) $ \ case
     Nothing    -> Nothing
@@ -427,15 +457,19 @@ data ChannelOutcome
 -------------------------------------------------------------------------------
 -- (2) Run the unary-scheduling propagators.
 
+{-# INLINABLE runPropagators #-}
+{-# SPECIALISE runPropagators @MonitoringOff #-}
+
 -- | Run 'propagationLoop' over the theory's state, then walk the emitted
 -- precedence inferences and promote each to a theory-propagated SAT
 -- literal.
 runPropagators
-  :: forall s task t
+  :: forall mode s task t
   .  ( Num t, Measurable t, Bounded t
      , Show t, Show task
+     , MonitorMode mode
      )
-  => Theory s task t
+  => Theory mode s task t
   -> ST s ( Maybe SAT.Conflict )
 runPropagators t = do
 #ifdef DEBUG
@@ -452,7 +486,7 @@ runPropagators t = do
         Just dirty -> seedMatrixWatchers dirty
   writeMutVar ( dirtySeed t ) ( Just IntSet.empty )
   ( eRes, finalUpdates ) <- runSchedule ( tasks t )
-    ( propagationLoop ( maxPropRounds t ) ( schedTrail t ) ( propagators t ) seed )
+    ( propagationLoop ( monitor t ) ( maxPropRounds t ) ( schedTrail t ) ( propagators t ) seed )
   -- TODO: 'propagationLoop' doesn't properly report 'GiveUp', which means we
   -- currently conflate "fixpoint, consistent" with "gave up early".
   -- That's a glaring, incompleteness/soundness hazard.
@@ -487,8 +521,8 @@ runSchedule tis action =
 -- | Walk the propagator-emitted precedence inferences and assert each as
 -- a theory propagation on the SAT trail.
 assertEmittedPrecedences
-  :: forall s task t
-  .  Theory s task t
+  :: forall mode s task t
+  .  Theory mode s task t
   -> IntMap ( IntSet, IntSet )
   -> ST s ( Maybe SAT.Conflict )
 assertEmittedPrecedences t precsMap = goPairs ( unpackPairs precsMap )
@@ -529,8 +563,8 @@ assertEmittedPrecedences t precsMap = goPairs ( unpackPairs precsMap )
 -- Returns 'Nothing' on success (or when the literal was already true) and
 -- 'Just c' on contradiction with the current assignment.
 assertTheoryLit
-  :: forall s task t
-  .  Theory s task t
+  :: forall mode s task t
+  .  Theory mode s task t
   -> Lit
   -> LazyReason s
   -> ST s ( Maybe SAT.Conflict )
@@ -581,9 +615,9 @@ assertTheoryLit t lit reason = do
 -- now; passing a smaller bound (captured at an earlier moment) reproduces
 -- the trail snapshot as it stood then, ignoring any later additions.
 snapshotBody
-  :: forall s task t m
+  :: forall mode s task t m
   .  ( PrimMonad m, PrimState m ~ s )
-  => Theory s task t
+  => Theory mode s task t
   -> SAT.TrailPos     -- ^ exclusive upper bound on the trail walk
   -> Maybe Lit        -- ^ optional appended literal
   -> m [ Lit ]
@@ -612,8 +646,8 @@ snapshotBody t ( SAT.TrailPos bound ) mbAppend = loop 0 []
 -- literal on the trail appears in it. Per-propagator antecedent subsets
 -- would shrink it.
 snapshotReason
-  :: forall s task t
-  .  Theory s task t
+  :: forall mode s task t
+  .  Theory mode s task t
   -> Lit          -- ^ propagated literal, appended to the clause body
   -> ST s ( LazyReason s )
 snapshotReason t propLit = do
@@ -622,6 +656,9 @@ snapshotReason t propLit = do
   bound <- SAT.trailSize ( solver t )
   pure ( LazyReason ( snapshotBody t bound ( Just propLit ) ) )
 
+{-# INLINABLE snapshotConflict #-}
+{-# SPECIALISE snapshotConflict @MonitoringOff #-}
+
 -- | Capture a snapshot of the current trail (optionally appending
 -- @propLit@) and materialise it eagerly as a 'SAT.Conflict' via
 -- 'literalsAsConflict'.
@@ -629,13 +666,17 @@ snapshotReason t propLit = do
 -- Used at conflict-discovery time, where the clause is consumed
 -- immediately by 1-UIP analysis (there is no laziness to gain).
 snapshotConflict
-  :: forall s task t
-  .  Theory s task t
+  :: forall mode s task t
+  .  MonitorMode mode
+  => Theory mode s task t
   -> Maybe Lit
   -> ST s ( Maybe SAT.Conflict )
 snapshotConflict t mbPropLit = do
   bound <- SAT.trailSize ( solver t )
-  snapshotBody t bound mbPropLit >>= literalsAsConflict ( solver t )
+  body  <- snapshotBody t bound mbPropLit
+  tickTheoryConflict ( monitor t )
+  recordReasonLen ( monitor t ) ( length body )
+  literalsAsConflict ( solver t ) body
 
 -- | Materialise a list of literals as a SAT 'Conflict' value.
 literalsAsConflict

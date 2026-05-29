@@ -168,6 +168,8 @@ import Schedule.LCG.Search
   ( SearchResult(..), SearchStats(..), defaultSearchOptions, lcgSearch )
 import Schedule.Monad
   ( BroadcastTarget(..), Notifiee(..), runScheduleMonad )
+import Schedule.Monitor
+  ( Monitoring(..), Monitor(..) )
 import Schedule.Ordering
   ( visualiseEdges )
 import Schedule.Precedence
@@ -302,7 +304,7 @@ scheduleSpreadsheet = do
                 ( \ trail -> do
                     for_ chain ( \ ( a, b ) -> addEdge trail a b )
                     let allTasks = IntSet.fromList [ 0 .. length schedulingTasks - 1 ]
-                    propagationLoop 1000 trail propagators
+                    propagationLoop NoMonitoring 1000 trail propagators
                       ( seedAllOf propagators allTasks ) )
             -- Tasks for which the Z3 start no longer lies within the tightened window.
             violators :: [ Text ]
@@ -334,7 +336,7 @@ scheduleSpreadsheet = do
     then do
       let
         searchRes :: SearchResult ( Set Staff ) Column
-        searchRes = lcgSearch defaultSearchOptions propagators afterPropTasks
+        searchRes = lcgSearch @MonitoringOff defaultSearchOptions propagators afterPropTasks
       lift do
         timeNow <- deepseq searchRes Time.getPOSIXTime
         Text.appendFile "search_statistics.txt"

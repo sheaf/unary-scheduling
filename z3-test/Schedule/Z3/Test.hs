@@ -41,6 +41,8 @@ import Schedule.Interval
   ( Clusivity(..), Endpoint(..), Interval(..), Intervals(..), Measurable(..), mkIntervals )
 import Schedule.LCG.Search
   ( SearchResult(..), defaultSearchOptions, lcgSearch )
+import Schedule.Monitor
+  ( Monitoring(..) )
 import Schedule.Propagators
   ( Propagator, basicPropagators, coarsen, propagateConstraints
   , prunePropagator, timetablePropagator, overloadPropagator
@@ -168,7 +170,7 @@ prop_lcg_matches_z3 :: Property
 prop_lcg_matches_z3 = withTests 1000 $ property do
   namedTasks <- forAll genInstance
   mbStarts   <- evalIO ( z3Feasible ( map fst namedTasks ) )
-  let res = lcgSearch defaultSearchOptions basicPropagators namedTasks
+  let res = lcgSearch @MonitoringOff defaultSearchOptions basicPropagators namedTasks
   case ( solution res, mbStarts ) of
     ( Right _, Just _ )    -> success
     ( Left _,  Nothing )   -> success

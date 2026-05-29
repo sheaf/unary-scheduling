@@ -59,6 +59,8 @@ import Schedule.Interval
   ( Clusivity(..), Endpoint(..), Interval(..), Intervals(..), Measurable )
 import Schedule.Monad
   ( runScheduleMonad, SchedulableData )
+import Schedule.Monitor
+  ( Monitor(..) )
 import Schedule.Ordering
   ( Order(Unknown), readOrdering )
 import Schedule.Precedence
@@ -187,7 +189,7 @@ verifyAgainstZ3 propagators namedTasks = do
               o <- readOrdering orderings a b
               when ( o == Unknown ) ( addEdge trail a b )
             let allTasks = IntSet.fromList [ 0 .. Boxed.Vector.length taskNames - 1 ]
-            propagationLoop 1000 trail propagators ( seedAllOf propagators allTasks )
+            propagationLoop NoMonitoring 1000 trail propagators ( seedAllOf propagators allTasks )
         -- Tasks whose Z3 start time no longer lies within the tightened window.
         violators :: [ Int ]
         violators =

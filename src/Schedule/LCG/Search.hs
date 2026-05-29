@@ -1,3 +1,4 @@
+{-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE OverloadedStrings   #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeAbstractions    #-}
@@ -60,6 +61,8 @@ import Schedule.Monad
   ( SchedulableData
       ( initialTaskData )
   )
+import Schedule.Monitor
+  ( Monitoring(..), MonitorMode(..), MonitorReport )
 import Schedule.Propagators
   ( Propagator )
 import Schedule.Task
@@ -97,6 +100,9 @@ data SearchResult task t = SearchResult
     solution :: !( Either Text ( ImmutableTaskInfos task t ) )
   , -- | Cumulative search statistics.
     stats    :: !SearchStats
+  , -- | Instrumentation report. Empty ('Schedule.Monitor.emptyReport') unless
+    -- the search was run at @mode ~ 'Schedule.Monitor.MonitoringOn'@.
+    monitorReport :: !MonitorReport
   }
   deriving stock    ( Generic )
   deriving anyclass NFData
@@ -118,16 +124,20 @@ data SearchStats = SearchStats
 -------------------------------------------------------------------------------
 -- Search driver.
 
+{-# INLINABLE lcgSearch #-}
+{-# SPECIALISE lcgSearch @MonitoringOff #-}
+
 -- | Run the DPLL(T) search over the given task data with the given
 -- propagators.
 --
 -- Returns a 'SearchResult' containing either a feasible schedule or an
 -- unsatisfiability witness, together with cumulative statistics.
 lcgSearch
-  :: forall taskData task t
+  :: forall mode taskData task t
   .  ( Num t, Measurable t, Bounded t
      , Show t, Show task
      , SchedulableData taskData task t
+     , MonitorMode mode
      )
   => SearchOptions
   -> [ Propagator task t ]
@@ -136,7 +146,7 @@ lcgSearch
 lcgSearch opts props givenTasks = runST do
   -- Allocate scheduler state and theory in one go.
   tis    <- initialTaskData @taskData @task @t givenTasks
-  theory <- newTheory tis props ( optPropRounds opts )
+  theory <- newTheory @mode tis props ( optPropRounds opts )
 
   -- Drive the DPLL(T) loop. Its first iteration runs the propagators on
   -- the starting state, seeding any unconditional inferences before the
@@ -168,16 +178,25 @@ lcgSearch opts props givenTasks = runST do
         , numLearnts            = lc
         , numTheoryPropagations = tp
         }
-  pure SearchResult { solution = mbSolution, stats = stats0 }
+  report <- readReport ( monitor theory )
+  pure SearchResult
+    { solution      = mbSolution
+    , stats         = stats0
+    , monitorReport = report
+    }
+
+{-# INLINABLE driveLoop #-}
+{-# SPECIALISE driveLoop @MonitoringOff #-}
 
 -- | The DPLL(T) loop proper.
 driveLoop
-  :: forall s task t
+  :: forall mode s task t
   .  ( Num t, Measurable t, Bounded t
      , Show t, Show task
+     , MonitorMode mode
      )
   => SAT.Solver s
-  -> Theory s task t
+  -> Theory mode s task t
   -> ST s SAT.Verdict
 driveLoop solver theory = step
   -- NB: Conflict bookkeeping (counters, VSIDS decay) and the
