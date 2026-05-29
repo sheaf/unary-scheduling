@@ -15,6 +15,8 @@ module Schedule.Constraint
   where
 
 -- base
+import Control.Monad
+  ( when )
 import Data.Maybe
   ( fromMaybe )
 import GHC.Generics
@@ -33,6 +35,8 @@ import Control.Lens
   ( itraverse_ )
 
 -- mtl
+import Control.Monad.Except
+  ( MonadError ( throwError ) )
 import Control.Monad.Reader
   ( MonadReader ( ask ) )
 
@@ -43,6 +47,8 @@ import Control.Monad.Primitive
 -- text
 import Data.Text
   ( Text )
+import qualified Data.Text as Text
+  ( pack )
 
 -- vector
 import qualified Data.Vector.Mutable as Boxed.MVector
@@ -185,6 +191,7 @@ tightenMany cts reason =
 
 applyConstraints
   :: ( MonadReader ( MutableTaskInfos s task t ) m
+     , MonadError Text m
      , PrimMonad m, PrimState m ~ s
      , Num t, Measurable t, Bounded t
      -- debugging
@@ -199,7 +206,8 @@ applyConstraints trail ( Constraints { constraints, precedences } ) = do
   IntMap.traverseWithKey ( applyConstraint trail taskInfos ) constraints
 
 applyConstraint
-  :: ( PrimMonad m, PrimState m ~ s
+  :: ( MonadError Text m
+     , PrimMonad m, PrimState m ~ s
      , Num t, Measurable t, Bounded t
      -- debugging
      , Show t, Show task
@@ -210,12 +218,20 @@ applyConstraint
   -> Constraint t
   -> m ( Bool, Bool )
 applyConstraint _ _ _ NoConstraint = pure ( False, False )
-applyConstraint trail taskInfos i ( Constraint { .. } ) = do
+applyConstraint trail taskInfos@( TaskInfos { taskAvails } ) i ( Constraint { .. } ) = do
   -- apply 'constrain to inside' first (useful in case restriction is not checked)
   ( l1, r1 ) <- fromMaybe ( False, False ) <$> traverse ( constrainToInside  trail taskInfos i ) inside
   l2         <- fromMaybe False            <$> traverse ( constrainToAfter   trail taskInfos i ) notEarlierThan
   r2         <- fromMaybe False            <$> traverse ( constrainToBefore  trail taskInfos i ) notLaterThan
   ( l3, r3 ) <- fromMaybe ( False, False ) <$> traverse ( constrainToOutside trail taskInfos i ) outside
+  -- If tightening reduces a task's availability to the empty set, report the
+  -- infeasibility immediately instead of letting other propagators spin on
+  -- empty domains.
+  Task { taskAvailability } <- Boxed.MVector.unsafeRead taskAvails i
+  when ( null ( intervals taskAvailability ) ) $
+    throwError $
+      "Task #" <> Text.pack ( show i ) <>
+      " can no longer be scheduled: its availability has been reduced to the empty set.\n"
   pure ( l1 || l2 || l3, r1 || r2 || r3 )
 
 -------------------------------------------------------------------------------
