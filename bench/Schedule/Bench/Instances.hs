@@ -13,7 +13,9 @@ module Schedule.Bench.Instances
   , PropOutcome(..), runPropOnly
     -- * Instance families
   , fullTask
+  , windowedTask
   , randomInstanceAtUtilisation
+  , randomWindowedInstance
   , overloadedInstance
   , twoSegmentInstance
   , tightCliqueInstance
@@ -23,10 +25,16 @@ module Schedule.Bench.Instances
   where
 
 -- base
+import Data.List
+  ( sortOn )
 import GHC.Generics
   ( Generic )
 
 -- containers
+import Data.IntMap.Strict
+  ( IntMap )
+import qualified Data.IntMap.Strict as IntMap
+  ( fromList, elems, (!) )
 import qualified Data.Sequence as Seq
   ( fromList )
 
@@ -36,7 +44,7 @@ import Control.DeepSeq
 
 -- random
 import System.Random
-  ( StdGen, mkStdGen, randomR, randomRs )
+  ( StdGen, mkStdGen, randomR, randomRs, split )
 
 -- text
 import Data.Text
@@ -106,16 +114,21 @@ runPropOnly inst =
 -------------------------------------------------------------------------------
 -- Instance generators.
 
--- | Make a simple task with one availability interval @[0, horizon]@ and
--- the given duration.
-fullTask :: Int -> Int -> Text -> ( BenchTask, Text )
-fullTask horizon dur name =
+-- | A task with a single availability window @[release, deadline]@ and the
+-- given duration.
+windowedTask
+  :: Int   -- ^ release time (window start)
+  -> Int   -- ^ deadline (window end)
+  -> Int   -- ^ duration
+  -> Text  -- ^ name
+  -> ( BenchTask, Text )
+windowedTask release deadline dur name =
   ( Task
       { taskAvailability = mkIntervals
           ( Seq.fromList
             [ Interval
-              ( Endpoint ( EarliestTime ( Time ( BenchTime 0 ) ) ) Inclusive )
-              ( Endpoint ( LatestTime   ( Time ( BenchTime horizon ) ) ) Inclusive )
+              ( Endpoint ( EarliestTime ( Time ( BenchTime release ) ) ) Inclusive )
+              ( Endpoint ( LatestTime   ( Time ( BenchTime deadline ) ) ) Inclusive )
             ]
           )
       , taskDuration     = Delta ( BenchTime dur )
@@ -123,6 +136,11 @@ fullTask horizon dur name =
       }
   , name
   )
+
+-- | Make a simple task with one availability interval @[0, horizon]@ and
+-- the given duration.
+fullTask :: Int -> Int -> Text -> ( BenchTask, Text )
+fullTask horizon = windowedTask 0 horizon
 
 -- | @n@ tasks sharing the single window @[0, horizon]@, with random durations
 -- in @[1, maxDur]@, where the horizon is sized from the /realised/ total
@@ -145,6 +163,61 @@ randomInstanceAtUtilisation utilisation n maxDur seed =
     -- individual task fitting even in degenerate (tiny-@n@) cases.
     horizon :: Int
     horizon = max maxDur ( ceiling ( fromIntegral ( sum durations ) / utilisation ) )
+
+-- | A feasible instance with /heterogeneous, overlapping/ availability windows.
+randomWindowedInstance
+  :: Double  -- ^ target utilisation, in @(0, 1]@
+  -> Int     -- ^ window slack: max extra room added to each side of a task's window
+  -> Int     -- ^ number of tasks
+  -> Int     -- ^ maximum task duration
+  -> Int     -- ^ PRNG seed
+  -> Instance
+randomWindowedInstance utilisation windowSlack n maxDur seed =
+  -- Emit tasks in id order @0 .. n-1@ (so the id is the list position, and thus
+  -- the SAT variable index), each with the window around its planted slot.
+  [ windowedTask
+      ( max 0       ( startOf t - lo ) )
+      ( min horizon ( startOf t + durOf t + hi ) )
+      ( durOf t )
+      ( Text.pack ( "w" ++ show t ) )
+  | ( t, ( lo, hi ) ) <- zip [ 0 .. n - 1 ] winSlacks
+  ]
+  where
+    ( gDur, g1 )   = split ( mkStdGen seed )
+    ( gKey, gWin ) = split g1
+
+    -- Random duration per task id.
+    durs :: IntMap Int
+    durs = IntMap.fromList ( zip [ 0 .. ] ( take n ( randomRs ( 1, maxDur ) gDur ) ) )
+    durOf :: Int -> Int
+    durOf t = durs IntMap.! t
+
+    total, horizon, gap :: Int
+    total   = sum ( IntMap.elems durs )
+    horizon = max maxDur ( ceiling ( fromIntegral total / utilisation ) )
+    -- Distribute the free space as a uniform gap between planted slots.
+    gap     = ( horizon - total ) `div` n
+
+    -- Randomise the layout to avoid the solver being able to luck out.
+    layout :: [ Int ]
+    layout = map snd ( sortOn fst ( zip keys [ 0 .. n - 1 ] ) )
+      where keys = take n ( randomRs ( 0 :: Int, 1_000_000_000 ) gKey )
+
+    -- Planted (non-overlapping) start of each task, following the layout order.
+    starts :: IntMap Int
+    starts = IntMap.fromList ( go 0 layout )
+      where
+        go _   []         = []
+        go acc ( i : is ) = ( i, acc ) : go ( acc + durOf i + gap ) is
+    startOf :: Int -> Int
+    startOf t = starts IntMap.! t
+
+    -- Per-task @(beforeSlack, afterSlack)@, consumed two at a time.
+    winSlacks :: [ ( Int, Int ) ]
+    winSlacks = take n ( pairUp ( randomRs ( 0, windowSlack ) gWin ) )
+    pairUp :: [ Int ] -> [ ( Int, Int ) ]
+    pairUp ( a : b : rest ) = ( a, b ) : pairUp rest
+    pairUp _                = []
 
 -- | An instance that's deliberately overloaded: @n@ tasks each of
 -- duration @dur@ over a window of @floor (n * dur / 2)@ — total demand

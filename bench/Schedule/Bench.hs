@@ -33,7 +33,8 @@ import Test.Tasty.Bench
 import Schedule.Bench.Instances
   ( BenchTime(..), Instance
   , runLCG, runPropOnly
-  , randomInstanceAtUtilisation, overloadedInstance, twoSegmentInstance
+  , randomInstanceAtUtilisation, randomWindowedInstance
+  , overloadedInstance, twoSegmentInstance
   , tightCliqueInstance, chainedWindowInstance, chainedOverloadedInstance
   )
 
@@ -81,6 +82,11 @@ benchmarks =
   , bgroup "under-constrained feasible (~20% utilisation; overhead baseline)"
       [ triple ( "n=" ++ show n ++ " maxDur=" ++ show d )
                ( randomInstanceAtUtilisation 0.2 n d 42 )
+      | ( n, d ) <- [ ( 4, 3 ), ( 6, 3 ), ( 8, 3 ), ( 12, 3 ), ( 16, 3 ) ]
+      ]
+  , bgroup "staggered windows, ~70% utilisation (propagation + search)"
+      [ triple ( "n=" ++ show n ++ " maxDur=" ++ show d )
+               ( randomWindowedInstance 0.7 4 n d 42 )
       | ( n, d ) <- [ ( 4, 3 ), ( 6, 3 ), ( 8, 3 ), ( 12, 3 ), ( 16, 3 ) ]
       ]
   , bgroup "infeasible (demand twice the horizon)"
