@@ -6,8 +6,9 @@ module Schedule.Constraint
     ( .. , NotEarlierThan, NotLaterThan, Outside, Inside )
   , HandedTimeConstraint(..)
   , Constraints(..)
+  , Infeasible(..), renderInfeasible
   , Reason
-  , tighten, tightenWithPrecedences, tightenMany
+  , tighten, tightenWithPrecedences, tightenBecause, tightenMany
   , constrainToBefore, constrainToAfter
   , constrainToInside, constrainToOutside
   , applyConstraint, applyConstraints
@@ -66,7 +67,7 @@ import Schedule.Interval
   , cutBefore, cutAfter, remove
   )
 import Schedule.Ordering
-  ( addIncidentEdges )
+  ( addIncidentEdges, CycleInfo )
 import Schedule.Task
   ( Task(..), TaskInfos(..), MutableTaskInfos
   , est, lct, lst, ect
@@ -138,18 +139,46 @@ data Constraints t
   = Constraints
   { constraints    :: !( IntMap ( Constraint t ) )
   , justifications :: !Text
-  , precedences    :: !( IntMap ( IntSet, IntSet ) )
+  , -- | Per task precedences: the new predecessors and successors to add
+    -- to the ordering matrix (so the precedence is reflected in the precedence graph).
+    precedences    :: !( IntMap ( IntSet, IntSet ) )
+  , -- | Per task, the responsible task subset for a bound tightening: the
+    -- @(tasks justifying a raised earliest start, tasks justifying a lowered
+    -- latest completion)@.
+    boundReasons   :: !( IntMap ( IntSet, IntSet ) )
   }
   deriving stock ( Show, Generic )
 
 instance Measurable t => Semigroup ( Constraints t ) where
-  ( Constraints cts1 logs1 precs1 ) <> ( Constraints cts2 logs2 precs2 ) =
+  ( Constraints cts1 logs1 precs1 brs1 ) <> ( Constraints cts2 logs2 precs2 brs2 ) =
     Constraints
       ( IntMap.unionWith (<>) cts1 cts2 )
       ( logs1 <> logs2 )
       ( IntMap.unionWith (<>) precs1 precs2 )
+      ( IntMap.unionWith (<>) brs1  brs2 )
 instance Measurable t => Monoid ( Constraints t ) where
-  mempty = Constraints IntMap.empty mempty mempty
+  mempty = Constraints IntMap.empty mempty mempty mempty
+
+-- | A reason a scheduling instance was found infeasible during propagation.
+data Infeasible
+  = -- | @EmptyDomain i msg@: task @i@'s availability was reduced to the empty
+    -- set by bound tightening.
+    EmptyDomain !Int !Text
+  | -- | @Overloaded culprit msg@: the @culprit@ subset of tasks cannot all fit
+    -- on the unary resource between their collective earliest start and latest
+    -- completion.
+    Overloaded !IntSet !Text
+  | -- | @CycleDetected info msg@: adding a precedence created a cycle in the
+    -- ordering matrix.
+    CycleDetected !CycleInfo !Text
+  deriving stock Show
+
+-- | The human-readable rendering carried by an 'Infeasible'.
+renderInfeasible :: Infeasible -> Text
+renderInfeasible = \ case
+  EmptyDomain   _ msg -> msg
+  Overloaded    _ msg -> msg
+  CycleDetected _ msg -> msg
 
 --------------------------------------------------------------------------------
 -- Smart constructors for emitting constraints.
@@ -160,22 +189,44 @@ instance Measurable t => Monoid ( Constraints t ) where
 type Reason = Text
 
 -- | Constrain a single task, recording the reason for the inference.
+--
+-- Records no responsible subset, so the LCG theory falls back to a coarse
+-- reason for the resulting bound literal. Use 'tightenBecause' (no new edges)
+-- or 'tightenWithPrecedences' (new edges) when the subset is known.
 tighten :: Int -> Constraint t -> Reason -> Constraints t
 tighten taskNb ct reason =
   Constraints
     { constraints    = IntMap.singleton taskNb ct
     , justifications = reason
     , precedences    = mempty
+    , boundReasons   = mempty
     }
 
--- | Like 'tighten', but also records precedence information
--- (the task's new predecessors and successors) for the precedence graph.
+-- | Like 'tighten', but also adds the task's new predecessors and successors
+-- to the precedence graph (and records them as the bound's responsible
+-- subset).
 tightenWithPrecedences :: Int -> Constraint t -> ( IntSet, IntSet ) -> Reason -> Constraints t
 tightenWithPrecedences taskNb ct precs reason =
   Constraints
     { constraints    = IntMap.singleton taskNb ct
     , justifications = reason
     , precedences    = IntMap.singleton taskNb precs
+    , boundReasons   = IntMap.singleton taskNb precs
+    }
+
+-- | Like 'tighten', but records the responsible task subset for the bound
+-- tightening, /without/ adding any precedence edge to the matrix.
+--
+-- Used by propagators whose inference rests on a subset of tasks that does not
+-- correspond to fresh precedence edges (the precedence-matrix and
+-- not-first\/not-last propagators).
+tightenBecause :: Int -> Constraint t -> ( IntSet, IntSet ) -> Reason -> Constraints t
+tightenBecause taskNb ct why reason =
+  Constraints
+    { constraints    = IntMap.singleton taskNb ct
+    , justifications = reason
+    , precedences    = mempty
+    , boundReasons   = IntMap.singleton taskNb why
     }
 
 -- | Constrain several tasks at once, with a shared reason and no precedence information.
@@ -185,13 +236,14 @@ tightenMany cts reason =
     { constraints    = IntMap.fromList cts
     , justifications = reason
     , precedences    = mempty
+    , boundReasons   = mempty
     }
 
 --------------------------------------------------------------------------------
 
 applyConstraints
   :: ( MonadReader ( MutableTaskInfos s task t ) m
-     , MonadError Text m
+     , MonadError Infeasible m
      , PrimMonad m, PrimState m ~ s
      , Num t, Measurable t, Bounded t
      -- debugging
@@ -206,7 +258,7 @@ applyConstraints trail ( Constraints { constraints, precedences } ) = do
   IntMap.traverseWithKey ( applyConstraint trail taskInfos ) constraints
 
 applyConstraint
-  :: ( MonadError Text m
+  :: ( MonadError Infeasible m
      , PrimMonad m, PrimState m ~ s
      , Num t, Measurable t, Bounded t
      -- debugging
@@ -229,7 +281,7 @@ applyConstraint trail taskInfos@( TaskInfos { taskAvails } ) i ( Constraint { ..
   -- empty domains.
   Task { taskAvailability } <- Boxed.MVector.unsafeRead taskAvails i
   when ( null ( intervals taskAvailability ) ) $
-    throwError $
+    throwError $ EmptyDomain i $
       "Task #" <> Text.pack ( show i ) <>
       " can no longer be scheduled: its availability has been reduced to the empty set.\n"
   pure ( l1 || l2 || l3, r1 || r2 || r3 )

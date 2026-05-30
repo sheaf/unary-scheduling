@@ -12,14 +12,12 @@ module Schedule.Monad
   ) where
 
 -- base
-import Control.Arrow
-  ( second )
 import Control.Category
   ( (>>>) )
 import Control.Monad.ST
   ( ST, runST )
 import Data.Bifunctor
-  ( bimap )
+  ( bimap, first )
 import Data.Coerce
   ( coerce )
 import Data.Function
@@ -41,7 +39,7 @@ import Data.Constraint.Extras.TH
 import Data.IntMap.Strict
   ( IntMap )
 import qualified Data.IntMap.Strict as IntMap
-  ( keysSet, filter )
+  ( keysSet, filter, unionWith )
 import qualified Data.IntSet as IntSet
   ( union )
 import Data.IntSet
@@ -107,7 +105,7 @@ import Data.Vector.PhaseTransition
 import Data.Vector.Ranking
   ( rankOn )
 import Schedule.Constraint
-  ( Constraints )
+  ( Constraints, Infeasible, renderInfeasible )
 import Schedule.Interval
   ( Measurable )
 import Schedule.Ordering
@@ -138,18 +136,24 @@ data TaskUpdates t
   = TaskUpdates
   { taskConstraints :: !(Constraints t)
   , tasksModified   :: !Modifications
+  , -- | Per task, whether its earliest start \/ latest completion bound moved
+    -- as constraints were applied this propagation pass.
+    tightenedBounds :: !( IntMap ( Bool, Bool ) )
   }
   deriving stock ( Show, Generic )
 
 instance Measurable t => Semigroup ( TaskUpdates t ) where
-  TaskUpdates cts1 mods1 <> TaskUpdates cts2 mods2 =
+  TaskUpdates cts1 mods1 tb1 <> TaskUpdates cts2 mods2 tb2 =
     TaskUpdates ( cts1 <> cts2 ) ( mods1 <> mods2 )
+      ( IntMap.unionWith orBoth tb1 tb2 )
+    where
+      orBoth ( a, b ) ( c, d ) = ( a || c, b || d )
 instance Measurable t => Monoid ( TaskUpdates t ) where
-  mempty = TaskUpdates mempty mempty
+  mempty = TaskUpdates mempty mempty mempty
 
 type ScheduleMonad s task t =
   ( ReaderT ( MutableTaskInfos s task t )
-    ( ExceptT Text
+    ( ExceptT Infeasible
       ( StateT ( TaskUpdates t )
         ( ST s )
       )
@@ -159,7 +163,7 @@ type ScheduleMonad s task t =
 type MonadSchedule s task t m =
   ( ( MonadReader ( MutableTaskInfos s task t ) m
     , MonadState  ( TaskUpdates t ) m
-    , MonadError  Text   m
+    , MonadError  Infeasible m
     , PrimMonad m, PrimState m ~ s
     ) :: Constraint
   )
@@ -180,7 +184,7 @@ runScheduleMonad givenTasks k = runST do
   trail            <- newTrail
   res <- k trail & ( ( `runReaderT` mutableTaskInfos ) >>> runExceptT >>> ( `runStateT` mempty ) )
   finalTaskData <- unsafeFreeze mutableTaskInfos
-  pure ( finalTaskData, second taskConstraints res )
+  pure ( finalTaskData, bimap ( first renderInfeasible ) taskConstraints res )
 
 constrain :: ( Measurable t, MonadState ( TaskUpdates t ) m ) => Constraints t -> m ()
 constrain s = modify' ( over ( field' @"taskConstraints" ) ( <> s ) )

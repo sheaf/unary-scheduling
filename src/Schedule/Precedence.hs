@@ -36,7 +36,7 @@ import qualified Data.Vector.Mutable as Boxed
 import Data.Vector.Generic.Index
   ( unsafeIndex )
 import Schedule.Constraint
-  ( Constraint(..), tightenMany )
+  ( Constraint(..), Infeasible(..), tightenMany )
 import Schedule.Interval
   ( Measurable )
 import Schedule.Monad
@@ -102,12 +102,14 @@ addEdge trail start end = do
           ]
           ""
 
-    errorMessage names ( SelfCycle i ) =
+    errorMessage names info@( SelfCycle i ) =
+      CycleDetected info $
       "Cycle involving \"" <> names Boxed.Vector.! i <> "\" detected after adding the precedence:\n\
       \  - \"" <> names Boxed.Vector.! start <> "\"\n\
       \  before\n\
       \  - \"" <> names Boxed.Vector.! end <> "\"\n\n"
-    errorMessage names ( DoubleCycle i j ) =
+    errorMessage names info@( DoubleCycle i j ) =
+      CycleDetected info $
       "Cycle between \"" <> names Boxed.Vector.! i <> "\" and \"" <>
       names Boxed.Vector.! j <> "\" detected after adding the precedence:\n\
       \  - \"" <> names Boxed.Vector.! start <> "\"\n\

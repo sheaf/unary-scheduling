@@ -47,6 +47,8 @@ import Data.Act
   ( Act((•)) )
 
 -- containers
+import qualified Data.IntMap.Strict as IntMap
+  ( unionWith )
 import Data.IntSet
   ( IntSet )
 import qualified Data.IntSet as IntSet
@@ -125,8 +127,8 @@ import Schedule.Constraint
     ( NotEarlierThan, NotLaterThan, Outside, Inside )
   , HandedTimeConstraint
     ( handedTimeConstraint )
-  , Constraints(..), applyConstraints
-  , tighten, tightenWithPrecedences
+  , Constraints(..), Infeasible(..), applyConstraints
+  , tighten, tightenWithPrecedences, tightenBecause
   )
 import Schedule.Interval
   ( flipClusivity
@@ -414,11 +416,12 @@ propagationLoop mon maxRounds trail propagators seed = do
         pure False
       else do
         modifs <- applyConstraints trail cts
-        -- NB: this resets 'constraints' but deliberately NOT 'precedences':
-        -- the LCG layer ('Schedule.LCG.Theory.runPropagators') reads the
-        -- accumulated precedence map at the end of the loop to learn which
-        -- precedences to channel onto the SAT trail. The cost of re-applying
-        -- it via 'addIncidentEdges' each round is now near-free — the
+        -- NB: this resets 'constraints' but deliberately NOT 'precedences' /
+        -- 'boundReasons': the LCG layer ('Schedule.LCG.Theory.runPropagators')
+        -- reads the accumulated precedence map and per-bound responsible
+        -- subsets at the end of the loop to channel precedences and bound
+        -- literals onto the SAT trail. The cost of re-applying the precedences
+        -- via 'addIncidentEdges' each round is near-free — the
         -- 'modify'Ordering' equality guard skips (and so does not re-trail)
         -- the idempotent re-adds. TODO: once channeling is the sole matrix
         -- owner ("one matrix owner"), 'applyConstraints' need not touch the
@@ -426,10 +429,16 @@ propagationLoop mon maxRounds trail propagators seed = do
         modify'
           -- Reset constraints: they have been applied.
           $ set  ( field' @"taskConstraints" . field' @"constraints" ) mempty
+          -- Accumulate which tasks had their est/lct move.
+          . over ( field' @"tightenedBounds" ) ( IntMap.unionWith orBoth modifs )
           -- Broadcast which tasks have been newly modified to the subscriptions
           -- of the propagators that should wake on them.
           . over ( field' @"tasksModified" ) ( broadcastModifications toNotify modifs )
         pure True
+
+-- | Componentwise disjunction of two @(est-moved, lct-moved)@ flags.
+orBoth :: ( Bool, Bool ) -> ( Bool, Bool ) -> ( Bool, Bool )
+orBoth ( a, b ) ( c, d ) = ( a || c, b || d )
 
 -- | The \"all tasks pending\" value for a subscription (seeding the initial run).
 fullValue :: Notifiee n -> IntSet -> n
@@ -633,7 +642,13 @@ precedenceMatrix = do
             currentSubsetTaskNames <> "\n\
             \As a result, \"" <> taskNames Boxed.Vector.! taskNb <> "\" must be scheduled " <> afterOrBefore <>
             "  * " <> Text.pack ( show limitTime ) <> "\n\n"
-        constrain $ tighten taskNb constraint reason
+        -- The bound rests on the matrix precedences between 'taskNb' and the
+        -- subset; record them as the responsible subset (no new edge is added,
+        -- the matrix already holds them).
+        constrain $
+          tightenBecause taskNb constraint
+            ( handedPrecedences @h ( IntSet.fromList subsetTaskNbs ) )
+            reason
       | otherwise
       -- Loop over predecessors in increasing earliest start time / successors in decreasing latest completion time,
       -- to propagate information from the precedence matrix.
@@ -673,7 +688,7 @@ precedenceMatrix = do
 overloadCheck
   :: forall s task t m bvec uvec
   .  ( MonadReader ( TaskInfos bvec uvec task t ) m
-     , MonadError Text  m
+     , MonadError Infeasible  m
      , PrimMonad m, s ~ PrimState m
      , Num t, Measurable t, Bounded t, Show t
      , ReadableVector m ( Task task t ) ( bvec ( Task task t ) )
@@ -706,16 +721,18 @@ overloadCheck = do
         let
           currentLCT :: Endpoint (LatestTime t)
           currentLCT = lct task
-        -- When the unary resource is overloaded, throw an error to put an end to constraint propagation.
+        -- When the unary resource is overloaded, throw to end propagation.
         when ( overloaded estimatedECT currentLCT ) do
           let
+            culprit :: IntSet
+            culprit = IntSet.fromList ( taskNb : seenTaskNbs )
             currentTaskName, currentSubsetTaskNames :: Text
             currentTaskName = taskNames Boxed.Vector.! taskNb
             currentSubsetTaskNames =
               foldMap
                 ( \ i -> "  * \"" <> taskNames Boxed.Vector.! i <> "\"\n" )
                 ( taskNb : seenTaskNbs )
-          throwError $
+          throwError $ Overloaded culprit $
             "Could not schedule tasks:\n\
             \  - \"" <> currentTaskName <> "\" must complete by\n\
             \      * " <> Text.pack ( show currentLCT ) <> "\n\
@@ -953,7 +970,11 @@ notExtremal = do
                 subsetText <>
                 "As a consequence, the task is constrained to " <> earlierOrLater <> "\n\
                 \  * " <> Text.pack ( show associatedOtherInnerTime ) <> "\n\n"
-            constrain $ tighten currentTaskNb constraint reason
+            -- The bound is an energetic consequence of the current subset's
+            -- bounds (no precedence edge is implied), so record the subset on
+            -- both sides as the responsible set.
+            let cs = IntSet.fromList currentSubset'
+            constrain $ tightenBecause currentTaskNb constraint ( cs, cs ) reason
 
       -- Next step of outer loop.
       go ( i + 1 ) j' currentSubset'

@@ -42,8 +42,7 @@ import qualified Schedule.Bench.Instances as Instances
 -------------------------------------------------------------------------------
 
 theInstance :: Instance
-theInstance = Instances.randomWindowedInstance 0.98 1 n d 42
-  where n = 14; d = 3
+theInstance = Instances.randomWindowedInstance 0.7 4 16 3 42
 
 iterations :: Int
 iterations = 1

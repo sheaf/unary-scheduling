@@ -9,6 +9,7 @@ module SAT.VarOrder
   , newVarOrder
   , numVars
   , insertVar
+  , insertAuxVar
     -- * Activity
   , bumpActivity
   , decayActivities
@@ -150,6 +151,19 @@ insertVar vo = do
   Growable.push ( heapPos vo ) ( InHeap i )
   -- Activity is 0, equal to or below every existing activity, so the new
   -- entry already sits at a valid max-heap leaf; no percolate-up needed.
+  pure v
+
+-- | Allocate a fresh variable that is /not/ placed in the activity heap.
+--
+-- Used for auxiliary variables the search must never branch on (e.g.
+-- theory-only bound atoms).
+insertAuxVar :: PrimMonad m => VarOrder ( PrimState m ) -> m Var
+insertAuxVar vo = do
+  n <- numVars vo
+  let v = Var n
+  Growable.push ( activity vo ) 0
+  -- No heap slot: the variable starts (and stays) 'NotInHeap'.
+  Growable.push ( heapPos vo ) NotInHeap
   pure v
 
 -- | Read the current VSIDS activity of a variable.

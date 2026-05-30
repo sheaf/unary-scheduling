@@ -4,6 +4,7 @@
 module Schedule.Interval
   ( Clusivity(..), flipClusivity
   , Endpoint(..)
+  , estLowerToStartUpper, startUpperToEstLower
   , Interval(.., (:<..<), (:<..<=), (:<=..<), (:<=..<=))
   , startTime, endTime
   , intersection
@@ -166,6 +167,18 @@ instance Ord t => TotallyOrderedLattice ( Endpoint ( LatestTime t ) ) where
 
 flipClusivity :: Endpoint a -> Endpoint a
 flipClusivity ( Endpoint t clu ) = Endpoint t $ negation clu
+
+-- | Reinterpret an earliest-start /lower/ bound @start ≥ e@ as the latest-start
+-- threshold @k@ for which @start ≤ k@ is exactly its negation (@start > k@).
+estLowerToStartUpper :: Endpoint ( EarliestTime t ) -> Endpoint ( LatestTime t )
+estLowerToStartUpper ( Endpoint ( EarliestTime v ) clu ) =
+  Endpoint ( LatestTime v ) ( negation clu )
+
+-- | Inverse of 'estLowerToStartUpper': the earliest-start lower bound whose
+-- negation is the given latest-start threshold.
+startUpperToEstLower :: Endpoint ( LatestTime t ) -> Endpoint ( EarliestTime t )
+startUpperToEstLower ( Endpoint ( LatestTime v ) clu ) =
+  Endpoint ( EarliestTime v ) ( negation clu )
 
 -------------------------------------------------------------------------------
 -- Intervals.

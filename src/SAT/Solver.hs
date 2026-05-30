@@ -49,6 +49,7 @@ module SAT.Solver
   , newSolver
     -- * Building the problem
   , newVar
+  , newAuxVar
   , addClause
   , PostResult(..)
   , numVariables
@@ -172,7 +173,9 @@ import qualified SAT.Restart as Restart
 import SAT.VarOrder
   ( VarOrder, newVarOrder )
 import qualified SAT.VarOrder as VarOrder
-  ( insertVar, bumpActivity, decayActivities, extractMaxBy, reinsertVar )
+  ( insertVar, insertAuxVar, reinsertVar
+  , bumpActivity, decayActivities, extractMaxBy
+  )
 
 -------------------------------------------------------------------------------
 -- Decision levels.
@@ -314,6 +317,9 @@ data Solver s = Solver
     --
     -- Defaults to 'Positive' for variables that have never been assigned.
     phase     :: !( Growable Unboxed.MVector s Polarity )
+  , -- | Whether each variable is a /decision/ variable, i.e. eligible to be
+    -- branched on by 'decide'. Indexed by 'varIndex'.
+    decidable :: !( Growable Unboxed.MVector s Bit )
   , -- | Activity-ordered priority queue over variables (also owns the
     -- VSIDS activity scores, current bump increment, and decay factor).
     --
@@ -385,6 +391,7 @@ newSolver = do
   lvl   <- Growable.new 16
   rsn   <- Growable.new 16
   phs   <- Growable.new 16
+  dec   <- Growable.new 16
   vo    <- newVarOrder 0.95
   sen   <- Growable.new 16
   senL  <- Growable.new 32
@@ -413,6 +420,7 @@ newSolver = do
     , level              = lvl
     , reason             = rsn
     , phase              = phs
+    , decidable          = dec
     , varOrder           = vo
     , seen               = sen
     , seenLit            = senL
@@ -439,18 +447,32 @@ newSolver = do
 numVariables :: PrimMonad m => Solver ( PrimState m ) -> m Int
 numVariables s = Growable.length ( assigns s )
 
--- | Allocate a fresh variable. All per-variable and per-literal tables grow
--- to accommodate it; the new variable is initially unassigned with zero
--- activity and no saved phase. It is registered at the bottom of the
--- activity heap.
+-- | Allocate a fresh /decision/ variable. All per-variable and per-literal
+-- tables grow to accommodate it; the new variable is initially unassigned
+-- with zero activity and no saved phase. It is registered at the bottom of
+-- the activity heap and is eligible to be branched on by 'decide'.
 newVar :: PrimMonad m => Solver ( PrimState m ) -> m Var
-newVar s = do
-  v <- VarOrder.insertVar ( varOrder s )
-  Growable.push ( assigns s ) LUndef
-  Growable.push ( level s )   UnassignedLevel
-  Growable.push ( reason s )  Clause.RDecision
-  Growable.push ( phase s )   Positive
-  Growable.push ( seen s )    ( Bit False )
+newVar s = newVarWith s True
+
+-- | Allocate a fresh /auxiliary/ (non-decision) variable.
+--
+-- Identical to 'newVar' except that the variable is kept out of the activity
+-- heap and flagged non-decidable: 'decide' never branches on it and
+-- 'cancelUntil' never returns it to the heap.
+newAuxVar :: PrimMonad m => Solver ( PrimState m ) -> m Var
+newAuxVar s = newVarWith s False
+
+-- | Shared allocator for 'newVar' / 'newAuxVar'.
+newVarWith :: PrimMonad m => Solver ( PrimState m ) -> Bool -> m Var
+newVarWith s isDecision = do
+  v <- ( if isDecision then VarOrder.insertVar else VarOrder.insertAuxVar )
+         ( varOrder s )
+  Growable.push ( assigns s )   LUndef
+  Growable.push ( level s )     UnassignedLevel
+  Growable.push ( reason s )    Clause.RDecision
+  Growable.push ( phase s )     Positive
+  Growable.push ( decidable s ) ( Bit isDecision )
+  Growable.push ( seen s )      ( Bit False )
   -- Two seenLit slots per variable (one per polarity).
   Growable.push ( seenLit s ) ( Bit False )
   Growable.push ( seenLit s ) ( Bit False )
@@ -1157,11 +1179,13 @@ cancelUntil s tgtLevel@( DecisionLevel tgt ) = do
             Growable.write ( assigns s ) vi LUndef
             Growable.write ( level s )   vi UnassignedLevel
             Growable.write ( reason s )  vi Clause.RDecision
-            -- The variable is unassigned again, so it must be in the heap
-            -- to be eligible for future decisions; 'reinsertVar' is a
+            -- A decision variable is unassigned again, so it must be in the
+            -- heap to be eligible for future decisions; 'reinsertVar' is a
             -- no-op if it was already there (i.e. it was propagated, not
-            -- popped).
-            VarOrder.reinsertVar ( varOrder s ) v
+            -- popped). Auxiliary (non-decision) variables are deliberately
+            -- never returned to the heap.
+            Bit dec <- Growable.read ( decidable s ) vi
+            when dec ( VarOrder.reinsertVar ( varOrder s ) v )
             undo ( i - 1 )
     undo ( sz - 1 )
     Growable.truncate ( trail s )    limI
