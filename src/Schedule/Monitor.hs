@@ -76,9 +76,10 @@ class MonitorMode mode where
   -- | Record @n@ transitively-derived edges asserted as theory propagations.
   tickDerivedEdges :: PrimMonad m => Monitor mode ( PrimState m ) -> Int -> m ()
 
-  -- | Record one theory conflict (currently always explained by a trail
-  -- snapshot).
-  tickTheoryConflict :: PrimMonad m => Monitor mode ( PrimState m ) -> m ()
+  -- | Record one theory conflict: its @label@ (source) and whether it was
+  -- explained by a /tight/ local reason ('True') or a coarse trail snapshot
+  -- ('False').
+  tickConflict :: PrimMonad m => Monitor mode ( PrimState m ) -> Text -> Bool -> m ()
 
   -- | Record the length (number of literals) of a materialised reason clause.
   recordReasonLen :: PrimMonad m => Monitor mode ( PrimState m ) -> Int -> m ()
@@ -98,8 +99,8 @@ instance MonitorMode MonitoringOff where
   {-# INLINE tickChannelCall #-}
   tickDerivedEdges   _ _   = pure ()
   {-# INLINE tickDerivedEdges #-}
-  tickTheoryConflict _     = pure ()
-  {-# INLINE tickTheoryConflict #-}
+  tickConflict       _ _ _ = pure ()
+  {-# INLINE tickConflict #-}
   recordReasonLen    _ _   = pure ()
   {-# INLINE recordReasonLen #-}
   readReport         _     = pure emptyReport
@@ -111,7 +112,7 @@ instance MonitorMode MonitoringOn where
     , onRounds          :: !( MutVar s Int )
     , onChannelCalls    :: !( MutVar s Int )
     , onDerivedEdges    :: !( MutVar s Int )
-    , onTheoryConflicts :: !( MutVar s Int )
+    , onConflicts       :: !( MutVar s ( Map Text ( Int, Int ) ) )
     , onReasonCount     :: !( MutVar s Int )
     , onReasonTotalLen  :: !( MutVar s Int )
     , onReasonMaxLen    :: !( MutVar s Int )
@@ -122,7 +123,7 @@ instance MonitorMode MonitoringOn where
       <*> newMutVar 0
       <*> newMutVar 0
       <*> newMutVar 0
-      <*> newMutVar 0
+      <*> newMutVar Map.empty
       <*> newMutVar 0
       <*> newMutVar 0
       <*> newMutVar 0
@@ -134,7 +135,11 @@ instance MonitorMode MonitoringOn where
   tickRound          mon   = modifyMutVar' ( onRounds mon )          ( + 1 )
   tickChannelCall    mon   = modifyMutVar' ( onChannelCalls mon )    ( + 1 )
   tickDerivedEdges   mon n = modifyMutVar' ( onDerivedEdges mon )    ( + n )
-  tickTheoryConflict mon   = modifyMutVar' ( onTheoryConflicts mon ) ( + 1 )
+  tickConflict mon label tight =
+    modifyMutVar' ( onConflicts mon )
+      ( Map.insertWith addPair label ( if tight then ( 1, 0 ) else ( 0, 1 ) ) )
+    where
+      addPair ( t1, c1 ) ( t2, c2 ) = ( t1 + t2, c1 + c2 )
   recordReasonLen    mon n = do
     modifyMutVar' ( onReasonCount mon )    ( + 1 )
     modifyMutVar' ( onReasonTotalLen mon ) ( + n )
@@ -145,7 +150,7 @@ instance MonitorMode MonitoringOn where
       <*> readMutVar ( onRounds mon )
       <*> readMutVar ( onChannelCalls mon )
       <*> readMutVar ( onDerivedEdges mon )
-      <*> readMutVar ( onTheoryConflicts mon )
+      <*> readMutVar ( onConflicts mon )
       <*> readMutVar ( onReasonCount mon )
       <*> readMutVar ( onReasonTotalLen mon )
       <*> readMutVar ( onReasonMaxLen mon )
@@ -164,8 +169,10 @@ data MonitorReport = MonitorReport
     channelCalls    :: !Int
   , -- | Transitively-derived edges asserted as theory propagations.
     derivedEdges    :: !Int
-  , -- | Theory conflicts encountered.
-    theoryConflicts :: !Int
+  , -- | Theory conflicts broken down by source label, each as
+    -- @(tight, coarse)@ counts (tight = locally explained, coarse =
+    -- snapshot-explained).
+    conflictBreakdown :: !( Map Text ( Int, Int ) )
   , -- | Number of reason clauses whose length was recorded.
     --
     -- Currently this counts eagerly-materialised theory-conflict clauses;
@@ -186,8 +193,8 @@ emptyReport = MonitorReport
   { perPropagator   = Map.empty
   , rounds          = 0
   , channelCalls    = 0
-  , derivedEdges    = 0
-  , theoryConflicts = 0
+  , derivedEdges      = 0
+  , conflictBreakdown = Map.empty
   , reasonCount     = 0
   , reasonTotalLen  = 0
   , reasonMaxLen    = 0
@@ -200,17 +207,24 @@ renderReport r = unlines $
   , line "rounds"           ( rounds r )
   , line "channel calls"    ( channelCalls r )
   , line "derived edges"    ( derivedEdges r )
-  , line "theory conflicts" ( theoryConflicts r )
   , printf "  %-22s count=%d  mean=%.1f  max=%d"
       ( "reason lengths" :: String )
       ( reasonCount r )
       ( meanLen :: Double )
       ( reasonMaxLen r )
-  , "per-propagator (invocations / productive):"
+  , "conflicts by source (tight / coarse):"
+  ] ++ conflictLines ++
+  [ "per-propagator (invocations / productive):"
   ] ++ propLines
   where
     line :: String -> Int -> String
     line name n = printf "  %-22s %d" name n
+    conflictLines
+      | Map.null ( conflictBreakdown r ) = [ "  (none)" ]
+      | otherwise =
+          [ printf "  %-22s %d / %d" ( Text.unpack label ) tight coarse
+          | ( label, ( tight, coarse ) ) <- Map.toList ( conflictBreakdown r )
+          ]
     meanLen
       | reasonCount r == 0 = 0
       | otherwise          = fromIntegral ( reasonTotalLen r ) / fromIntegral ( reasonCount r )

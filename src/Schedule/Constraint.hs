@@ -7,6 +7,8 @@ module Schedule.Constraint
   , HandedTimeConstraint(..)
   , Constraints(..)
   , Infeasible(..), renderInfeasible
+  , BoundMove(..), boundMoved
+  , Applied(..)
   , Reason
   , tighten, tightenWithPrecedences, tightenBecause, tightenMany
   , constrainToBefore, constrainToAfter
@@ -19,7 +21,7 @@ module Schedule.Constraint
 import Control.Monad
   ( when )
 import Data.Maybe
-  ( fromMaybe )
+  ( fromMaybe, isJust )
 import GHC.Generics
   ( Generic )
 
@@ -160,10 +162,12 @@ instance Measurable t => Monoid ( Constraints t ) where
   mempty = Constraints IntMap.empty mempty mempty mempty
 
 -- | A reason a scheduling instance was found infeasible during propagation.
-data Infeasible
-  = -- | @EmptyDomain i msg@: task @i@'s availability was reduced to the empty
-    -- set by bound tightening.
-    EmptyDomain !Int !Text
+data Infeasible t
+  = -- | @EmptyDomain i lo hi msg@: task @i@'s window was emptied by bound
+    -- tightening. @lo@ is the earliest start and @hi@ the latest completion
+    -- the constraint enforced; together they leave no schedulable slot. The
+    -- LCG theory cites @i@'s bound atoms at these thresholds.
+    EmptyDomain !Int !( Endpoint ( EarliestTime t ) ) !( Endpoint ( LatestTime t ) ) !Text
   | -- | @Overloaded culprit msg@: the @culprit@ subset of tasks cannot all fit
     -- on the unary resource between their collective earliest start and latest
     -- completion.
@@ -171,14 +175,64 @@ data Infeasible
   | -- | @CycleDetected info msg@: adding a precedence created a cycle in the
     -- ordering matrix.
     CycleDetected !CycleInfo !Text
-  deriving stock Show
+
+deriving stock instance Show t => Show ( Infeasible t )
 
 -- | The human-readable rendering carried by an 'Infeasible'.
-renderInfeasible :: Infeasible -> Text
+renderInfeasible :: Infeasible t -> Text
 renderInfeasible = \ case
-  EmptyDomain   _ msg -> msg
-  Overloaded    _ msg -> msg
-  CycleDetected _ msg -> msg
+  EmptyDomain   _ _ _ msg -> msg
+  Overloaded    _ msg     -> msg
+  CycleDetected _ msg     -> msg
+
+-- | How a task's earliest start \/ latest completion moved when a constraint
+-- was applied.
+--
+-- The distinction matters for the LCG bound atoms: an /exact/ move lands the
+-- bound exactly on the cut endpoint, so the propagator's antecedents entail it
+-- precisely and the bound literal can carry a tight, local reason. A /jumped/
+-- move skips over a gap to the next available slot; the antecedents only entail
+-- the cut endpoint, with the jump justified by the availability structure (a
+-- ground fact for an /instance/ gap, but not for a propagator-carved one — see
+-- 'wasCarved').
+data BoundMove
+  = -- | The bound did not change.
+    Unmoved
+  | -- | The bound moved exactly onto the cut endpoint.
+    MovedExact
+  | -- | The bound jumped past the cut endpoint to the next available slot.
+    MovedJumped
+  deriving stock ( Eq, Show )
+
+-- | Whether the bound moved at all.
+boundMoved :: BoundMove -> Bool
+boundMoved Unmoved = False
+boundMoved _       = True
+
+-- | Combines two moves on the /same/ bound: 'Unmoved' is the identity; two
+-- exact moves stay exact (two clean cuts to ever-tighter endpoints); any jump
+-- makes the combination a jump (conservative).
+instance Semigroup BoundMove where
+  Unmoved     <> y           = y
+  x           <> Unmoved     = x
+  MovedExact  <> MovedExact  = MovedExact
+  _           <> _           = MovedJumped
+
+instance Monoid BoundMove where
+  mempty = Unmoved
+
+-- | The result of applying a task's accumulated constraint: how each bound
+-- moved, and whether the task was /carved/ — i.e. an 'Inside'\/'Outside'
+-- tightening was applied, which can introduce interior gaps that are not part
+-- of the ground instance structure. A later cut that jumps over such a gap is
+-- not soundly explained by the energetic antecedents alone, so the LCG theory
+-- falls back to a coarse reason for jumped moves on carved tasks.
+data Applied = Applied
+  { estMove   :: !BoundMove
+  , lctMove   :: !BoundMove
+  , wasCarved :: !Bool
+  }
+  deriving stock Show
 
 --------------------------------------------------------------------------------
 -- Smart constructors for emitting constraints.
@@ -243,7 +297,7 @@ tightenMany cts reason =
 
 applyConstraints
   :: ( MonadReader ( MutableTaskInfos s task t ) m
-     , MonadError Infeasible m
+     , MonadError ( Infeasible t ) m
      , PrimMonad m, PrimState m ~ s
      , Num t, Measurable t, Bounded t
      -- debugging
@@ -251,14 +305,14 @@ applyConstraints
      )
   => Trail s task t
   -> Constraints t
-  -> m ( IntMap ( Bool, Bool ) )
+  -> m ( IntMap Applied )
 applyConstraints trail ( Constraints { constraints, precedences } ) = do
   taskInfos@( TaskInfos { orderings } ) <- ask
   itraverse_ ( uncurry . addIncidentEdges ( orderingCellWriter trail taskInfos ) orderings ) precedences
   IntMap.traverseWithKey ( applyConstraint trail taskInfos ) constraints
 
 applyConstraint
-  :: ( MonadError Infeasible m
+  :: ( MonadError ( Infeasible t ) m
      , PrimMonad m, PrimState m ~ s
      , Num t, Measurable t, Bounded t
      -- debugging
@@ -268,23 +322,42 @@ applyConstraint
   -> MutableTaskInfos s task t
   -> Int
   -> Constraint t
-  -> m ( Bool, Bool )
-applyConstraint _ _ _ NoConstraint = pure ( False, False )
+  -> m Applied
+applyConstraint _ _ _ NoConstraint = pure ( Applied Unmoved Unmoved False )
 applyConstraint trail taskInfos@( TaskInfos { taskAvails } ) i ( Constraint { .. } ) = do
+  -- The pre-tightening bounds, so an emptied window can report the exact
+  -- earliest-start \/ latest-completion the constraint enforced.
+  task0 <- Boxed.MVector.unsafeRead taskAvails i
+  let est0 = est task0
+      lct0 = lct task0
   -- apply 'constrain to inside' first (useful in case restriction is not checked)
   ( l1, r1 ) <- fromMaybe ( False, False ) <$> traverse ( constrainToInside  trail taskInfos i ) inside
-  l2         <- fromMaybe False            <$> traverse ( constrainToAfter   trail taskInfos i ) notEarlierThan
-  r2         <- fromMaybe False            <$> traverse ( constrainToBefore  trail taskInfos i ) notLaterThan
+  l2         <- fromMaybe Unmoved          <$> traverse ( constrainToAfter   trail taskInfos i ) notEarlierThan
+  r2         <- fromMaybe Unmoved          <$> traverse ( constrainToBefore  trail taskInfos i ) notLaterThan
   ( l3, r3 ) <- fromMaybe ( False, False ) <$> traverse ( constrainToOutside trail taskInfos i ) outside
   -- If tightening reduces a task's availability to the empty set, report the
   -- infeasibility immediately instead of letting other propagators spin on
-  -- empty domains.
+  -- empty domains. Report the enforced earliest-start (@lo@) and
+  -- latest-completion (@hi@) bounds, which together leave no slot.
   Task { taskAvailability } <- Boxed.MVector.unsafeRead taskAvails i
   when ( null ( intervals taskAvailability ) ) $
-    throwError $ EmptyDomain i $
+    let lo = maybe est0 ( /\ est0 ) notEarlierThan
+        hi = maybe lct0 ( /\ lct0 ) notLaterThan
+    in throwError $ EmptyDomain i lo hi $
       "Task #" <> Text.pack ( show i ) <>
       " can no longer be scheduled: its availability has been reduced to the empty set.\n"
-  pure ( l1 || l2 || l3, r1 || r2 || r3 )
+  -- 'Inside'\/'Outside' moves are interval surgery (potential gap carving), so
+  -- they count as jumps; the lower\/upper cuts carry their own exact\/jumped
+  -- status. A task is /carved/ iff an 'Inside'\/'Outside' tightening applied.
+  pure Applied
+    { estMove   = jumpIf l1 <> l2 <> jumpIf l3
+    , lctMove   = jumpIf r1 <> r2 <> jumpIf r3
+    , wasCarved = isJust inside || isJust outside
+    }
+  where
+    jumpIf :: Bool -> BoundMove
+    jumpIf True  = MovedJumped
+    jumpIf False = Unmoved
 
 -------------------------------------------------------------------------------
 
@@ -307,7 +380,7 @@ constrainToAfter
   -> MutableTaskInfos s task t
   -> Int
   -> Endpoint ( EarliestTime t )
-  -> m Bool
+  -> m BoundMove
 constrainToAfter trail tis@( TaskInfos { taskAvails, rankingEST, rankingECT } ) taskNo t = do
   task@(Task { taskAvailability }) <- Boxed.MVector.unsafeRead taskAvails taskNo
   let
@@ -318,9 +391,11 @@ constrainToAfter trail tis@( TaskInfos { taskAvails, rankingEST, rankingECT } ) 
     recordSetTask trail tis taskNo newTask
     reorderAfterIncrease ( rankSwapper trail tis ( Ordered ByEST ) ) ( rankSwapper trail tis ( Ranks ByEST ) ) taskAvails rankingEST est taskNo
     reorderAfterIncrease ( rankSwapper trail tis ( Ordered ByECT ) ) ( rankSwapper trail tis ( Ranks ByECT ) ) taskAvails rankingECT ect taskNo
-    pure True
+    -- Exact iff the new earliest start lands on the cut endpoint; otherwise the
+    -- cut fell in a gap and the start jumped to the next available slot.
+    pure ( if est newTask == canonicalEarliest t then MovedExact else MovedJumped )
   else
-    pure False
+    pure Unmoved
 
 -- | Apply the constraint: task must end before the specified time.
 constrainToBefore
@@ -331,7 +406,7 @@ constrainToBefore
   -> MutableTaskInfos s task t
   -> Int
   -> Endpoint ( LatestTime t )
-  -> m Bool
+  -> m BoundMove
 constrainToBefore trail tis@( TaskInfos { taskAvails, rankingLCT, rankingLST } ) taskNo t = do
   task@(Task { taskAvailability }) <- Boxed.MVector.unsafeRead taskAvails taskNo
   let
@@ -342,9 +417,10 @@ constrainToBefore trail tis@( TaskInfos { taskAvails, rankingLCT, rankingLST } )
     recordSetTask trail tis taskNo newTask
     reorderAfterDecrease ( rankSwapper trail tis ( Ordered ByLCT ) ) ( rankSwapper trail tis ( Ranks ByLCT ) ) taskAvails rankingLCT lct taskNo
     reorderAfterDecrease ( rankSwapper trail tis ( Ordered ByLST ) ) ( rankSwapper trail tis ( Ranks ByLST ) ) taskAvails rankingLST lst taskNo
-    pure True
+    -- Exact iff the new latest completion lands on the cut endpoint.
+    pure ( if lct newTask == canonicalLatest t then MovedExact else MovedJumped )
   else
-    pure False
+    pure Unmoved
 
 -- | Remove intervals from the domain of availability of a task.
 constrainToOutside

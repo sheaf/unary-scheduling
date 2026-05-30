@@ -47,8 +47,10 @@ import Data.Act
   ( Act((•)) )
 
 -- containers
+import Data.IntMap.Strict
+  ( IntMap )
 import qualified Data.IntMap.Strict as IntMap
-  ( unionWith )
+  ( unionWith, keysSet, filter )
 import Data.IntSet
   ( IntSet )
 import qualified Data.IntSet as IntSet
@@ -128,6 +130,7 @@ import Schedule.Constraint
   , HandedTimeConstraint
     ( handedTimeConstraint )
   , Constraints(..), Infeasible(..), applyConstraints
+  , BoundMove, boundMoved, Applied(..)
   , tighten, tightenWithPrecedences, tightenBecause
   )
 import Schedule.Interval
@@ -415,7 +418,17 @@ propagationLoop mon maxRounds trail propagators seed = do
       then
         pure False
       else do
-        modifs <- applyConstraints trail cts
+        applied <- applyConstraints trail cts
+        let
+          -- How each task's bounds moved (exact vs jumped), for the LCG layer.
+          moves :: IntMap ( BoundMove, BoundMove )
+          moves = fmap ( \ a -> ( estMove a, lctMove a ) ) applied
+          -- Whether each bound moved at all, for waking subscriptions.
+          bools :: IntMap ( Bool, Bool )
+          bools = fmap ( \ ( e, l ) -> ( boundMoved e, boundMoved l ) ) moves
+          -- Tasks whose interior was carved this pass.
+          carved :: IntSet
+          carved = IntMap.keysSet ( IntMap.filter wasCarved applied )
         -- NB: this resets 'constraints' but deliberately NOT 'precedences' /
         -- 'boundReasons': the LCG layer ('Schedule.LCG.Theory.runPropagators')
         -- reads the accumulated precedence map and per-bound responsible
@@ -429,16 +442,16 @@ propagationLoop mon maxRounds trail propagators seed = do
         modify'
           -- Reset constraints: they have been applied.
           $ set  ( field' @"taskConstraints" . field' @"constraints" ) mempty
-          -- Accumulate which tasks had their est/lct move.
-          . over ( field' @"tightenedBounds" ) ( IntMap.unionWith orBoth modifs )
+          -- Accumulate how each task's bounds moved (exact vs jumped).
+          . over ( field' @"tightenedBounds" ) ( IntMap.unionWith bothMoves moves )
+          -- Remember which tasks were carved.
+          . over ( field' @"carvedTasks" ) ( carved <> )
           -- Broadcast which tasks have been newly modified to the subscriptions
           -- of the propagators that should wake on them.
-          . over ( field' @"tasksModified" ) ( broadcastModifications toNotify modifs )
+          . over ( field' @"tasksModified" ) ( broadcastModifications toNotify bools )
         pure True
-
--- | Componentwise disjunction of two @(est-moved, lct-moved)@ flags.
-orBoth :: ( Bool, Bool ) -> ( Bool, Bool ) -> ( Bool, Bool )
-orBoth ( a, b ) ( c, d ) = ( a || c, b || d )
+      where
+        bothMoves ( a, b ) ( c, d ) = ( a <> c, b <> d )
 
 -- | The \"all tasks pending\" value for a subscription (seeding the initial run).
 fullValue :: Notifiee n -> IntSet -> n
@@ -688,7 +701,7 @@ precedenceMatrix = do
 overloadCheck
   :: forall s task t m bvec uvec
   .  ( MonadReader ( TaskInfos bvec uvec task t ) m
-     , MonadError Infeasible  m
+     , MonadError ( Infeasible t )  m
      , PrimMonad m, s ~ PrimState m
      , Num t, Measurable t, Bounded t, Show t
      , ReadableVector m ( Task task t ) ( bvec ( Task task t ) )

@@ -105,7 +105,7 @@ import Data.Vector.PhaseTransition
 import Data.Vector.Ranking
   ( rankOn )
 import Schedule.Constraint
-  ( Constraints, Infeasible, renderInfeasible )
+  ( Constraints, Infeasible, renderInfeasible, BoundMove )
 import Schedule.Interval
   ( Measurable )
 import Schedule.Ordering
@@ -136,24 +136,30 @@ data TaskUpdates t
   = TaskUpdates
   { taskConstraints :: !(Constraints t)
   , tasksModified   :: !Modifications
-  , -- | Per task, whether its earliest start \/ latest completion bound moved
-    -- as constraints were applied this propagation pass.
-    tightenedBounds :: !( IntMap ( Bool, Bool ) )
+  , -- | Per task, how its earliest start \/ latest completion bound moved as
+    -- constraints were applied this pass (exact vs jumped); the LCG theory uses
+    -- this to promote bound literals with tight or coarse reasons.
+    tightenedBounds :: !( IntMap ( BoundMove, BoundMove ) )
+  , -- | Tasks /carved/ this pass (an 'Schedule.Constraint.Inside'\/
+    -- 'Schedule.Constraint.Outside' tightening applied), which may introduce
+    -- non-ground interior gaps.
+    carvedTasks     :: !IntSet
   }
   deriving stock ( Show, Generic )
 
 instance Measurable t => Semigroup ( TaskUpdates t ) where
-  TaskUpdates cts1 mods1 tb1 <> TaskUpdates cts2 mods2 tb2 =
+  TaskUpdates cts1 mods1 tb1 cv1 <> TaskUpdates cts2 mods2 tb2 cv2 =
     TaskUpdates ( cts1 <> cts2 ) ( mods1 <> mods2 )
-      ( IntMap.unionWith orBoth tb1 tb2 )
+      ( IntMap.unionWith bothMoves tb1 tb2 )
+      ( cv1 <> cv2 )
     where
-      orBoth ( a, b ) ( c, d ) = ( a || c, b || d )
+      bothMoves ( a, b ) ( c, d ) = ( a <> c, b <> d )
 instance Measurable t => Monoid ( TaskUpdates t ) where
-  mempty = TaskUpdates mempty mempty mempty
+  mempty = TaskUpdates mempty mempty mempty mempty
 
 type ScheduleMonad s task t =
   ( ReaderT ( MutableTaskInfos s task t )
-    ( ExceptT Infeasible
+    ( ExceptT ( Infeasible t )
       ( StateT ( TaskUpdates t )
         ( ST s )
       )
@@ -163,7 +169,7 @@ type ScheduleMonad s task t =
 type MonadSchedule s task t m =
   ( ( MonadReader ( MutableTaskInfos s task t ) m
     , MonadState  ( TaskUpdates t ) m
-    , MonadError  Infeasible m
+    , MonadError  ( Infeasible t ) m
     , PrimMonad m, PrimState m ~ s
     ) :: Constraint
   )
