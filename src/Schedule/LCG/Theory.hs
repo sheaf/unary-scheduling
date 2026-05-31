@@ -1231,18 +1231,12 @@ buildInfeasibleConflict t brs carvedSet inf
           -- A culprit's actual bound is not a reified, on-trail atom: fall back.
           Nothing   -> snapshotConflict t "overload" Nothing
       EmptyDomain i lo hi _
-<<<<<<< HEAD
-        -- A carved task's emptiness may rest on a non-ground interior gap.
-        | IntSet.member i carvedSet -> snapshotConflict t "empty-domain" Nothing
-        | otherwise                 -> emptyDomainConflict t brs i lo hi
-=======
         -- A carved task's emptiness rests on non-ground interior holes (other
         -- tasks' compulsory parts), so its tight reason must additionally cite
         -- the carvers. If the gaps were in the ground instance, the two
         -- crossing atoms suffice.
         | IntSet.member i carvedSet -> carvedEmptyDomainConflict t brs i lo hi
         | otherwise                 -> emptyDomainConflict t brs i lo hi "empty-domain" []
->>>>>>> 2993ede (LCG roadmap M3: tight, self-verifying carved-empty-domain reasons)
       CycleDetected _ _ -> snapshotConflict t "cycle" Nothing
 
 -- | Tight conflict for an emptied task @i@: its enforced earliest start @lo@ and

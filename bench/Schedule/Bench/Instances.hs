@@ -18,7 +18,8 @@ module Schedule.Bench.Instances
   , rehearsalInstance
   , overloadedInstance
   , tightCliqueInstance
-  , chainedWindowInstance
+  , intervalPigeonholeInstance
+  , infeasibleRehearsalInstance
   )
   where
 
@@ -195,21 +196,7 @@ randomWindowedInstance utilisation windowSlack n maxDur seed =
     pairUp ( a : b : rest ) = ( a, b ) : pairUp rest
     pairUp _                = []
 
--- | A multi-day /rehearsal/ instance: a single director (the unary resource)
--- must run every rehearsal, spread over @numDays@ back-to-back days. Days are
--- separated only by a single carved-out boundary slot — just enough that a
--- rehearsal cannot straddle the day boundary, with no wasted timeline. Each
--- song has a random duration and is available on a random non-empty subset of
--- days (its students' availability); since a song cannot span the boundary, the
--- choice of /which day/ each song lands on is a genuine, availability-restricted
--- bin-packing.
---
--- Days are sized so the total rehearsal demand runs at the target @utilisation@
--- of the director's available time, so at high @utilisation@ packing the songs
--- into days is tight — the regime that produces real day-assignment conflicts
--- (and the one where reasoning about start bounds is meant to matter). Lower
--- @availProb@ pins songs to fewer days (more constrained); raise @utilisation@
--- towards 1 (or past feasibility) for a harder instance.
+-- | A multi-day /rehearsal/ instance (simulacrum of realistic use case).
 rehearsalInstance
   :: Double  -- ^ utilisation: total demand / total day capacity, in @(0, 1]@
   -> Double  -- ^ per-(song, day) availability probability, in @(0, 1]@
@@ -267,6 +254,51 @@ multiDayTask days dayLen dayGap dur name =
            ( Endpoint ( EarliestTime ( Time ( BenchTime start ) ) ) Inclusive )
            ( Endpoint ( LatestTime   ( Time ( BenchTime ( start + dayLen - 1 ) ) ) ) Inclusive )
 
+-- | Difficult infeasible instance that requires search.
+intervalPigeonholeInstance
+  :: Int   -- ^ number of slots @m@ (the instance has @m + 1@ tasks)
+  -> Int   -- ^ task\/slot duration
+  -> Instance
+intervalPigeonholeInstance numSlots dur =
+  [ ( Task
+        { taskAvailability =
+            mkIntervals ( Seq.fromList [ slot j | j <- [ 0 .. numSlots - 1 ] ] )
+        , taskDuration     = Delta ( BenchTime dur )
+        , taskInfo         = ()
+        }
+    , Text.pack ( "ph" ++ show k )
+    )
+  | k <- [ 0 .. numSlots ]
+  ]
+  where
+    -- Slot @j@ is the window @[2·j·dur, 2·j·dur + dur]@: just wide enough for one
+    -- duration-@dur@ task, pinned to start at its left edge.
+    slot :: Int -> Interval BenchTime
+    slot j =
+      let lo = 2 * j * dur
+      in Interval
+           ( Endpoint ( EarliestTime ( Time ( BenchTime lo ) ) )           Inclusive )
+           ( Endpoint ( LatestTime   ( Time ( BenchTime ( lo + dur ) ) ) ) Inclusive )
+
+-- | A multi-day rehearsal that is infeasible but that requires genuine search
+-- to prove so.
+infeasibleRehearsalInstance
+  :: Int   -- ^ number of copies of the five-song fragmentation gadget (@>= 1@)
+  -> Instance
+infeasibleRehearsalInstance numCopies =
+  [ multiDayTask [ 0 .. numBins - 1 ] dayLen dayGap sz
+      ( Text.pack ( "bp" ++ show c ++ "_" ++ show sz ) )
+  | c  <- [ 0 .. numCopies - 1 ]
+  , sz <- itemSizes
+  ]
+  where
+    itemSizes :: [ Int ]
+    itemSizes = [ 8, 7, 6, 5, 4 ]   -- per copy: total 30, but needs four length-10 days
+    numBins, dayLen, dayGap :: Int
+    numBins = 3 * numCopies
+    dayLen  = 10
+    dayGap  = 10                    -- >= dayLen: convex envelope dwarfs windowed capacity
+
 -- | An instance that's deliberately overloaded: @n@ tasks each of
 -- duration @dur@ over a window of @floor (n * dur / 2)@ — total demand
 -- twice the capacity, so the propagators or search must report infeasibility.
@@ -288,28 +320,3 @@ tightCliqueInstance n d =
   | k <- [ 0 .. n - 1 ]
   ]
 
--- | A /chained-window/ instance: task @k@ has the single availability
--- window @[k, k + window]@. Each task individually has @window@-many slots
--- of choice, but adjacent tasks compete for overlapping slots, forcing the
--- search to commit to an ordering.
---
--- For @window = 2@ and duration 1, this is the rolling-window analogue
--- of @n@-pigeon-into-@n+1@-holes: feasible (exactly @n+1@ solutions)
--- but requires actual SAT-side decisions.
-chainedWindowInstance :: Int -> Int -> Int -> Instance
-chainedWindowInstance n window dur =
-  [ ( Task
-        { taskAvailability = mkIntervals
-            ( Seq.fromList
-              [ Interval
-                ( Endpoint ( EarliestTime ( Time ( BenchTime k ) ) ) Inclusive )
-                ( Endpoint ( LatestTime   ( Time ( BenchTime ( k + window ) ) ) ) Inclusive )
-              ]
-            )
-        , taskDuration     = Delta ( BenchTime dur )
-        , taskInfo         = ()
-        }
-    , Text.pack ( "cw" ++ show k )
-    )
-  | k <- [ 0 .. n - 1 ]
-  ]

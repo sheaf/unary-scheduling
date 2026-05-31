@@ -1,16 +1,28 @@
 {-# OPTIONS_GHC -fno-full-laziness #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TypeApplications    #-}
 
--- | A self-contained harness that runs a single scheduling benchmark through
--- the LCG search, /with/ and /without/ the bound-atom machinery, and prints an
--- A\/B comparison. For profiling, Core dumps, and gauging where bound atoms
--- (tight clausal reasons + monotonicity) actually help the search.
+-- | A self-contained harness that runs scheduling benchmarks through the LCG
+-- search and reports /search-tree size/ (decisions, conflicts, learnt clauses,
+-- theory propagations) alongside wall-clock time. Two views:
+--
+--   * an A\/B matrix over the four combinations of the bound-atom roles
+--     (channel-out learning × day-assignment decisions) on one fixed instance,
+--     so each role's net effect — including learning held against a coarse
+--     baseline — is isolated; plus the full conflict\/reason breakdown for the
+--     default configuration;
+--
+--   * a size sweep over the benchmark instance families, reporting the node
+--     counts (not just time) that show whether the cost is the search tree.
+--
+-- For profiling, Core dumps, and gauging where the milestones move the numbers.
 module Main ( main ) where
 
 -- base
 import Control.Exception
   ( evaluate )
 import Control.Monad
-  ( forM )
+  ( forM, forM_ )
 import Data.Word
   ( Word64 )
 import GHC.Clock
@@ -22,17 +34,13 @@ import Text.Printf
 import Control.DeepSeq
   ( force )
 
--- text
-import qualified Data.Text as Text
-  ( unpack )
-
 -- unary-scheduling
 import Schedule.LCG.Search
   ( SearchResult(..), SearchStats(..), SearchOptions(..)
   , defaultSearchOptions, lcgSearch
   )
 import Schedule.Monitor
-  ( Monitoring(..), renderReport )
+  ( Monitoring(..), MonitorReport(..), renderReport )
 import Schedule.Propagators
   ( basicPropagators )
 
@@ -42,63 +50,34 @@ import Schedule.Bench.Instances
 import qualified Schedule.Bench.Instances as Instances
 
 -------------------------------------------------------------------------------
+-- Configuration under test.
 
--- | The instance under test. Candidates (edit this line):
---   * @rehearsalInstance util availProb days songs maxDur seed@ — multi-day
---     day-assignment bin-packing; raise @util@ towards 1 and lower @availProb@
---     until @conflicts > 0@. The bound-atom / bound-decision testbed.
---   * @randomWindowedInstance 0.7 4 n maxDur seed@ — dense ordering-hard (does
---     produce conflicts, but bounds are precedence-determined → bound atoms
---     don't help).
---   * @tightCliqueInstance n d@ — pure precedence search baseline.
+-- | The fixed instance for the A\/B matrix. The multi-day rehearsal target is
+-- where day-assignment decisions are designed to help and where we currently
+-- trail Z3, so it is the most informative instance for the role comparison.
 theInstance :: Instance
 theInstance = Instances.rehearsalInstance 0.9 0.6 8 20 8 7
 
--- | A short description of 'theInstance' for the report header.
 instanceLabel :: String
 instanceLabel = "rehearsalInstance util=0.9 avail=0.6 days=8 songs=20 maxDur=8 seed=7"
 
--- | Timing iterations (the per-run statistics are deterministic and measured
--- once; only wall-clock timing is repeated for a stable minimum). Lower this if
--- a harder instance makes each solve slow.
+-- | Timing iterations (per-run statistics are deterministic and measured once;
+-- only the wall-clock minimum is repeated).
 iterations :: Int
 iterations = 1
 {-# NOINLINE iterations #-}
 
--------------------------------------------------------------------------------
--- The two configurations under comparison.
-
--- | The comparison: plain precedence-only search versus branching on
--- day-assignment bound atoms (the design — see "Schedule.LCG.Theory").
-optsWith, optsWithout :: SearchOptions
-optsWithout = defaultSearchOptions { optBoundDecisions = False }
-optsWith    = defaultSearchOptions { optBoundDecisions = True }
-
-solveRaw :: SearchOptions -> Instance -> SearchResult () BenchTime
-solveRaw opts = lcgSearch @MonitoringOff opts basicPropagators
-
-solveInstrumented :: SearchOptions -> Instance -> SearchResult () BenchTime
-solveInstrumented opts = lcgSearch @MonitoringOn opts basicPropagators
-
--- | One configuration's measured outcome.
-data Outcome = Outcome
-  { oMinNs  :: !Word64
-  , oResult :: !( SearchResult () BenchTime )   -- ^ the instrumented result
+-- | A named search configuration.
+data Cfg = Cfg
+  { cfgLabel :: !String
+  , cfgOpts  :: !SearchOptions
   }
 
-<<<<<<< HEAD
-runMode :: SearchOptions -> IO Outcome
-runMode opts = do
-  -- Repeat the raw (uninstrumented) path for a stable minimum wall-clock time.
-=======
--- | The four combinations of the two bound-atom roles. Holding day-decisions
--- off while toggling @optBoundAtoms@ isolates channel-out learning's net effect
--- against the coarse-reason baseline (the comparison the earlier harness, which
--- only varied @optBoundDecisions@, could not make).
 abConfigs :: [ Cfg ]
 abConfigs =
-  [ Cfg "precedence-only" base { optBoundAtoms = False, optBoundDecisions = False, optTheoryDecide = False }
-  , Cfg "+learning"       base { optBoundAtoms = True , optBoundDecisions = False, optTheoryDecide = False }
+  [ -- Too slow
+    -- Cfg "precedence-only" base { optBoundAtoms = False, optBoundDecisions = False, optTheoryDecide = False }
+    Cfg "+learning"       base { optBoundAtoms = True , optBoundDecisions = False, optTheoryDecide = False }
   , Cfg "+day (VSIDS)"    base { optBoundAtoms = False, optBoundDecisions = True , optTheoryDecide = False }
   , Cfg "+both (VSIDS)"   base { optBoundAtoms = True , optBoundDecisions = True , optTheoryDecide = False }
   , Cfg "+both +struct"   base { optBoundAtoms = True , optBoundDecisions = True , optTheoryDecide = True  }
@@ -113,15 +92,13 @@ abConfigs =
 -- (from the uninstrumented path) and one instrumented (deterministic) result.
 measure :: SearchOptions -> Instance -> IO ( Word64, SearchResult () BenchTime )
 measure opts inst = do
->>>>>>> 4531dcf (LCG roadmap M2: theory decision hook (structural day-assignment))
   times <- forM [ 1 .. iterations ] \ _ -> do
     t0 <- getMonotonicTimeNSec
-    _  <- evaluate ( force ( solveRaw opts theInstance ) )
+    _  <- evaluate ( force ( lcgSearch @MonitoringOff opts basicPropagators inst ) )
     t1 <- getMonotonicTimeNSec
     pure ( t1 - t0 )
-  -- Statistics come from one instrumented run (deterministic).
-  instr <- evaluate ( force ( solveInstrumented opts theInstance ) )
-  pure ( Outcome ( minimum times ) instr )
+  instr <- evaluate ( force ( lcgSearch @MonitoringOn opts basicPropagators inst ) )
+  pure ( minimum times, instr )
 
 -- | Like 'measure', but the returned result is from the uninstrumented run, so
 -- no second (potentially very slow) instrumented solve is paid. The 'stats' and
@@ -130,51 +107,138 @@ measure opts inst = do
 measureOff :: SearchOptions -> Instance -> IO ( Word64, SearchResult () BenchTime )
 measureOff opts inst = do
   let solve = evaluate ( force ( lcgSearch @MonitoringOff opts basicPropagators inst ) )
-  -- The result is deterministic across iterations; keep the first, time the rest.
-  res   <- solve
-  times <- forM [ 1 .. iterations ] \ _ -> do
+  -- Time each of 'iterations' solves (the result is deterministic; keep the
+  -- first). One solve when iterations == 1 — important for the slow configs.
+  runs <- forM [ 1 .. iterations ] \ _ -> do
     t0 <- getMonotonicTimeNSec
-    _  <- solve
+    r  <- solve
     t1 <- getMonotonicTimeNSec
-    pure ( t1 - t0 )
-  pure ( minimum times, res )
+    pure ( t1 - t0, r )
+  case runs of
+    ( ( _, r0 ) : _ ) -> pure ( minimum ( map fst runs ), r0 )
+    []                -> error "measureOff: iterations must be >= 1"
 
 -------------------------------------------------------------------------------
 
 main :: IO ()
 main = do
   _ <- evaluate ( force theInstance )
-  printf "=== unary-scheduling LCG inspection harness (bound-atom A/B) ===\n"
-  printf "instance: %s   tasks: %d   timing iterations: %d\n\n"
-    instanceLabel ( length theInstance ) iterations
+  printf "=== unary-scheduling LCG inspection harness ===\n\n"
 
-  on  <- runMode optsWith
-  off <- runMode optsWithout
+  abMatrix
+  putStrLn ""
+  sizeSweeps
 
-  let col :: String -> String -> String -> String
-      col label a b = printf "  %-22s %-18s %s" label a b
-  putStrLn ( col "" "+ day decisions" "precedence-only" )
-  putStrLn ( col "time (min)"     ( fmtNs ( oMinNs on ) )         ( fmtNs ( oMinNs off ) ) )
-  putStrLn ( col "verdict"        ( verdict ( oResult on ) )      ( verdict ( oResult off ) ) )
-  putStrLn ( col "decisions"      ( stat numDecisions on )        ( stat numDecisions off ) )
-  putStrLn ( col "conflicts"      ( stat numConflicts on )        ( stat numConflicts off ) )
-  putStrLn ( col "learnt clauses" ( stat numLearnts on )          ( stat numLearnts off ) )
-  putStrLn ( col "theory props"   ( stat numTheoryPropagations on ) ( stat numTheoryPropagations off ) )
+-- | The bound-atom role A\/B matrix on 'theInstance'.
+abMatrix :: IO ()
+abMatrix = do
+  printf "A/B matrix on: %s   (tasks: %d)\n\n" instanceLabel ( length theInstance )
+  printf "  %-18s %-12s %-12s %6s %6s %7s %7s\n"
+    ( "config" :: String ) ( "time" :: String ) ( "verdict" :: String )
+    ( "dec" :: String ) ( "conf" :: String ) ( "learnt" :: String ) ( "tprop" :: String )
+  forM_ abConfigs \ ( Cfg { cfgLabel, cfgOpts } ) -> do
+    ( t, res ) <- measureOff cfgOpts theInstance
+    let st = stats res
+    printf "  %-18s %-12s %-12s %6d %6d %7d %7d\n"
+      cfgLabel ( fmtNs t ) ( verdict res )
+      ( numDecisions st ) ( numConflicts st ) ( numLearnts st ) ( numTheoryPropagations st )
+  putStrLn ""
+  putStrLn "default-config (+both +struct) instrumentation:"
+  -- One instrumented solve, just for the detailed report (cheap on this config).
+  case [ cfgOpts c | c <- abConfigs, cfgLabel c == "+both +struct" ] of
+    ( dfltOpts : _ ) -> do
+      rep <- evaluate ( force ( lcgSearch @MonitoringOn dfltOpts basicPropagators theInstance ) )
+      putStr ( renderReport ( monitorReport rep ) )
+    [] -> pure ()
+
+-------------------------------------------------------------------------------
+-- Size sweeps: node counts across the instance families.
+
+sizeSweeps :: IO ()
+sizeSweeps = do
+  sweep "staggered windows (randomWindowed 0.7 slack=4 maxDur=3 seed=42)"
+    [ ( "n=" ++ show n, Instances.randomWindowedInstance 0.7 4 n 3 42 )
+    | n <- [ 4, 6, 8, 12, 16 ]
+    ]
+  sweep "disjunctive clique (tightClique d=2)"
+    [ ( "n=" ++ show n, Instances.tightCliqueInstance n 2 )
+    | n <- [ 4, 6, 8, 12, 16 ]
+    ]
+  sweep "multi-day rehearsal (util=0.9 avail=0.6 maxDur=8 seed=42)"
+    [ ( "days=" ++ show d ++ " songs=" ++ show s
+      , Instances.rehearsalInstance 0.9 0.6 d s 8 42 )
+    | ( d, s ) <- [ ( 3, 9 ), ( 4, 12 ), ( 5, 15 ), ( 5, 20 ) ]
+    ]
+  -- Tight feasible rehearsal (util=1.0 avail=0.4): near the feasibility boundary,
+  -- where even the structural heuristic backtracks. Seeds chosen per size so each
+  -- is feasible /and/ forces conflicts (most feasible rehearsals are 0-conflict
+  -- under the day-first-fail + critical-pair heuristic).
+  sweep "tight feasible rehearsal (util=1.0 avail=0.4; forces backtracking)"
+    [ ( "days=" ++ show d ++ " songs=" ++ show s ++ " seed=" ++ show sd
+      , Instances.rehearsalInstance 1.0 0.4 d s 8 sd )
+    | ( d, s, sd ) <- [ ( 4, 16, 5 ), ( 5, 20, 3 ), ( 6, 24, 3 ) ]
+    ]
+  sweep "interval pigeonhole (search-hard UNSAT; dur=2)"
+    [ ( "slots=" ++ show m, Instances.intervalPigeonholeInstance m 2 )
+    | m <- [ 3, 4, 5, 6 ]
+    ]
+  sweep "infeasible bin-packing fragmentation (overload-free; search-hard)"
+    [ ( "copies=" ++ show c ++ " (" ++ show ( 5 * c ) ++ " songs)"
+      , Instances.infeasibleRehearsalInstance c )
+    | c <- [ 1, 2 ] -- c=3 takes minutes
+    ]
+  detailReport "infeasible bin-packing fragmentation, copies=2"
+    ( Instances.infeasibleRehearsalInstance 2 )
+
+-- | Run the default configuration over a family of sizes, printing the
+-- search-tree node counts (and the tight\/coarse conflict split) per size.
+sweep :: String -> [ ( String, Instance ) ] -> IO ()
+sweep title sizes = do
+  printf "%s:\n" title
+  printf "  %-16s %-11s %6s %6s %7s %7s %11s %8s %-9s\n"
+    ( "size" :: String ) ( "time" :: String )
+    ( "dec" :: String ) ( "conf" :: String ) ( "learnt" :: String ) ( "tprop" :: String )
+    ( "tight/coarse" :: String ) ( "meanLen" :: String ) ( "verdict" :: String )
+  forM_ sizes \ ( lbl, inst ) -> do
+    _ <- evaluate ( force inst )
+    ( t, res ) <- measure defaultSearchOptions inst
+    let st        = stats res
+        rep       = monitorReport res
+        ( tight, coarse ) = conflictTotals rep
+    printf "  %-16s %-11s %6d %6d %7d %7d %5d/%-5d %8.1f %-9s\n"
+      lbl ( fmtNs t )
+      ( numDecisions st ) ( numConflicts st ) ( numLearnts st ) ( numTheoryPropagations st )
+      tight coarse ( meanReasonLen rep ) ( verdict res )
   putStrLn ""
 
-  putStrLn "+day-decisions instrumentation:"
-  putStr ( renderReport ( monitorReport ( oResult on ) ) )
-  where
-    stat :: ( SearchStats -> Int ) -> Outcome -> String
-    stat f = show . f . stats . oResult
+-- | Print the detailed monitor report (conflict sources, reason lengths,
+-- per-propagator) for one instance under the default configuration — to see
+-- /which/ source the conflicts come from, not just the tight\/coarse split.
+detailReport :: String -> Instance -> IO ()
+detailReport label inst = do
+  printf "%s (default config):\n" label
+  rep <- evaluate ( force ( lcgSearch @MonitoringOn defaultSearchOptions basicPropagators inst ) )
+  putStr ( renderReport ( monitorReport rep ) )
+  putStrLn ""
+
+-- | Sum the @(tight, coarse)@ conflict counts across all sources.
+conflictTotals :: MonitorReport -> ( Int, Int )
+conflictTotals rep =
+  foldr ( \ ( a, b ) ( accA, accB ) -> ( a + accA, b + accB ) )
+        ( 0, 0 ) ( conflictBreakdown rep )
+
+meanReasonLen :: MonitorReport -> Double
+meanReasonLen rep
+  | reasonCount rep == 0 = 0
+  | otherwise = fromIntegral ( reasonTotalLen rep ) / fromIntegral ( reasonCount rep )
 
 -------------------------------------------------------------------------------
 
 -- | One-line verdict from a search result.
 verdict :: SearchResult task t -> String
 verdict res = case solution res of
-  Left  msg -> "infeasible — " ++ takeWhile ( /= '\n' ) ( Text.unpack msg )
-  Right _   -> "feasible"
+  Left  _ -> "infeasible"
+  Right _ -> "feasible"
 
 -- | Format a nanosecond count with an appropriate unit.
 fmtNs :: Word64 -> String

@@ -35,7 +35,9 @@ import Schedule.Bench.Instances
   , runLCG, runPropOnly
   , randomWindowedInstance, rehearsalInstance
   , overloadedInstance
-  , tightCliqueInstance, chainedWindowInstance
+  , tightCliqueInstance
+  , intervalPigeonholeInstance
+  , infeasibleRehearsalInstance
   )
 
 -- z3-oracle
@@ -81,19 +83,34 @@ benchmarks =
                ( tightCliqueInstance n d )
       | ( n, d ) <- [ ( 4, 2 ), ( 6, 2 ), ( 8, 2 ), ( 12, 2 ), ( 16, 2 ) ]
       ]
-  , bgroup "chained window (rolling pigeonhole; each task k in [k, k+w])"
-      [ triple ( "n=" ++ show n ++ " w=" ++ show w )
-               ( chainedWindowInstance n w 1 )
-      | ( n, w ) <- [ ( 4, 2 ), ( 6, 2 ), ( 8, 2 ), ( 12, 2 ) ]
-      ]
   , bgroup "multi-day rehearsal (single director; day-assignment bin-packing)"
       [ triple ( "days=" ++ show days ++ " songs=" ++ show songs )
                ( rehearsalInstance 0.9 0.6 days songs 8 42 )
       | ( days, songs ) <- [ ( 3, 9 ), ( 4, 12 ), ( 5, 15 ), ( 5, 20 ) ]
       ]
+    -- Near the feasibility boundary (util=1.0, avail=0.4): feasible, but the
+    -- structural heuristic backtracks. Seeds chosen per size so each is feasible
+    -- (Z3-verified) yet forces conflicts — the only feasible family that exercises
+    -- conflict-driven learning, since slacker rehearsals solve with 0 conflicts.
+  , bgroup "tight feasible rehearsal (near boundary; forces backtracking)"
+      [ triple ( "days=" ++ show days ++ " songs=" ++ show songs )
+               ( rehearsalInstance 1.0 0.4 days songs 8 seed )
+      | ( days, songs, seed ) <- [ ( 4, 16, 5 ), ( 5, 20, 3 ), ( 6, 24, 3 ) ]
+      ]
   , bgroup "infeasible: resource overload (demand twice the horizon)"
       [ triple ( "n=" ++ show n ++ " d=" ++ show d )
                ( overloadedInstance n d )
       | ( n, d ) <- [ ( 4, 3 ), ( 6, 3 ), ( 8, 3 ), ( 12, 3 ), ( 16, 3 ) ]
+      ]
+  , bgroup "infeasible: interval pigeonhole (search-hard; overload-free)"
+      [ triple ( "slots=" ++ show m ++ " (" ++ show ( m + 1 ) ++ " tasks)" )
+               ( intervalPigeonholeInstance m 2 )
+      | m <- [ 3, 4, 5, 6 ]
+      ]
+    -- Capped at 2 for runtime: copies=3's search is exponential (minutes).
+  , bgroup "infeasible: bin-packing fragmentation (overload-free; search-hard)"
+      [ triple ( "copies=" ++ show c ++ " (" ++ show ( 5 * c ) ++ " songs, " ++ show ( 3 * c ) ++ " days)" )
+               ( infeasibleRehearsalInstance c )
+      | c <- [ 1, 2 ]
       ]
   ]
