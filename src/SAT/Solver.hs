@@ -104,10 +104,14 @@ module SAT.Solver
 -- base
 import Control.Monad
   ( when )
+import Data.Bits
+  ( (.&.), (.|.), unsafeShiftL )
 import Data.Foldable
   ( for_ )
 import Data.List
   ( intercalate )
+import Data.Word
+  ( Word64 )
 
 -- bitvec
 import Data.Bit
@@ -200,6 +204,14 @@ pattern GroundLevel = DecisionLevel 0
 -- | Level for unassigned variables (used as a sentinel value).
 pattern UnassignedLevel :: DecisionLevel
 pattern UnassignedLevel = DecisionLevel -1
+
+-- | Hash a decision level into one of 64 buckets as a single-bit mask. The OR
+-- of these over a clause's literals over-approximates its set of decision
+-- levels, letting 'minimiseLearnt' reject a self-subsumption candidate cheaply:
+-- a reason literal whose level-bit is absent from the clause mask cannot be
+-- covered. Hash collisions only make the test more conservative, never unsound.
+abstractLevel :: DecisionLevel -> Word64
+abstractLevel ( DecisionLevel l ) = 1 `unsafeShiftL` ( l .&. 63 )
 
 -------------------------------------------------------------------------------
 -- Trail positions.
@@ -382,6 +394,18 @@ data Solver s = Solver
   , -- | Levels matching 'analyzeOtherLits' in lockstep, used to find the
     -- second-watch literal and the backjump level.
     analyzeOtherLevels :: !( Growable Primitive.MVector s DecisionLevel )
+  , -- | Transient per-variable marker used by learnt-clause minimisation: a
+    -- variable proven /not/ self-subsumed (so its literal cannot be dropped).
+    -- Memoises failed redundancy checks so the recursion does not re-explore a
+    -- subtree. Always @False@ outside a 'minimiseLearnt' call.
+    --
+    -- The dual \"proven redundant\" state reuses the 'seen' marker (which also
+    -- marks clause membership): both make the redundancy check treat a variable
+    -- as covered, so they need not be distinguished.
+    minFailed          :: !( Growable Unboxed.MVector s Bit )
+  , -- | Variables whose 'minFailed' marker was set during minimisation; walked
+    -- to clear those markers at the end of the call.
+    minFailedTouched   :: !( Growable Primitive.MVector s Int )
   }
 
 -------------------------------------------------------------------------------
@@ -411,6 +435,8 @@ newSolver = do
   ato   <- Growable.new 32
   aol   <- Growable.new 16
   aolv  <- Growable.new 16
+  mf    <- Growable.new 16
+  mft   <- Growable.new 16
   -- TODO: expose the clause-store capacity via 'SolverOptions'. The
   -- default is a compromise (small enough to be cheap to preallocate,
   -- large enough that typical problems do not run out before we implement
@@ -440,6 +466,8 @@ newSolver = do
     , analyzeTouched     = ato
     , analyzeOtherLits   = aol
     , analyzeOtherLevels = aolv
+    , minFailed          = mf
+    , minFailedTouched   = mft
     }
   where
 
@@ -482,6 +510,7 @@ newVarWith s isDecision = do
   Growable.push ( phase s )     Positive
   Growable.push ( decidable s ) ( Bit isDecision )
   Growable.push ( seen s )      ( Bit False )
+  Growable.push ( minFailed s ) ( Bit False )
   -- Two seenLit slots per variable (one per polarity).
   Growable.push ( seenLit s ) ( Bit False )
   Growable.push ( seenLit s ) ( Bit False )
@@ -1064,7 +1093,12 @@ analyse s conflict0 = do
   initTrail <- trailSize s
   uipLit <- walkUIP s visit visitLit ( initTrail - 1 )
 
-  -- Clear the 'seen' bits we set during this analysis.
+  -- Drop self-subsumed body literals while 'seen' still marks the body. This
+  -- runs before the clause is built, so 'pickSecondWatch' sees the shorter body.
+  minimiseLearnt s
+
+  -- Clear the 'seen' bits we set during this analysis (including variables
+  -- 'minimiseLearnt' additionally marked while memoising proven-redundant ones).
   do
     touchedN <- Growable.length ( analyzeTouched s )
     let clearLoop !i
@@ -1081,10 +1115,150 @@ analyse s conflict0 = do
   let learnt = case mbSecond of
         Nothing    -> [ asserting ]
         Just secnd -> asserting : secnd : restLits
-  -- TODO: 1-UIP clause minimisation (recursive / local self-subsumption,
-  -- Sörensson & Biere 2009). Without this, learnt clauses are typically
-  -- twice as long as they need to be.
   pure ( learnt, bjLevel )
+
+-- | Recursive learnt-clause minimisation (self-subsumption; Sörensson \& Biere
+-- 2009). A body literal of the learnt clause is /redundant/ when its negation is
+-- already implied by the rest of the clause — i.e. every other literal of its
+-- reason is at the ground level, in the clause, or itself recursively redundant.
+-- Dropping all such literals leaves a logically-equivalent, typically much
+-- shorter clause (often roughly halved).
+--
+-- Precondition: 'seen' is set exactly for the body-literal variables (the state
+-- 'walkUIP' leaves behind). A variable proven redundant is additionally marked
+-- 'seen' (memoising success — harmlessly extending clause membership for the
+-- recursive check) and appended to 'analyzeTouched' so the caller clears it; a
+-- variable proven irredundant is marked 'minFailed', cleared before returning.
+minimiseLearnt
+  :: forall m
+  .  PrimMonad m
+  => Solver ( PrimState m ) -> m ()
+minimiseLearnt s = do
+  Growable.truncate ( minFailedTouched s ) 0
+  n <- Growable.length ( analyzeOtherLits s )
+  -- The set of decision levels present in the body, hashed into a 64-bit mask
+  -- ('abstractLevel'). A literal can only be self-subsumed if every other
+  -- literal of its reason resolves into a level already in the clause; a reason
+  -- literal whose level is absent from this mask is therefore not coverable, and
+  -- the redundancy check fails fast without forcing the (possibly large, coarse)
+  -- reason. (MiniSat's abstraction-levels optimisation; conservative under hash
+  -- collisions, never unsound.)
+  abstraction <- collectAbstraction n
+  let
+    -- Walk the body buffer, dropping redundant literals and compacting both
+    -- buffers in lockstep (read index @ri@, write index @wi@).
+    compact :: Int -> Int -> m ()
+    compact !ri !wi
+      | ri >= n = do
+          Growable.truncate ( analyzeOtherLits s )   wi
+          Growable.truncate ( analyzeOtherLevels s ) wi
+      | otherwise = do
+          l   <- Growable.read ( analyzeOtherLits s ) ri
+          red <- reasonRedundant abstraction ( varIndex ( litVar l ) )
+          if red
+          then compact ( ri + 1 ) wi
+          else do
+            when ( wi /= ri ) do
+              lvl <- Growable.read ( analyzeOtherLevels s ) ri
+              Growable.write ( analyzeOtherLits s )   wi l
+              Growable.write ( analyzeOtherLevels s ) wi lvl
+            compact ( ri + 1 ) ( wi + 1 )
+  compact 0 0
+  clearFailed
+  where
+    -- OR together the abstraction bits of every body literal's level.
+    collectAbstraction :: Int -> m Word64
+    collectAbstraction n = go 0 0
+      where
+        go !i !acc
+          | i >= n    = pure acc
+          | otherwise = do
+              lvl <- Growable.read ( analyzeOtherLevels s ) i
+              go ( i + 1 ) ( acc .|. abstractLevel lvl )
+    -- A variable's assignment is self-subsumed iff its reason exists and every
+    -- /other/ literal of that reason is covered. A decision (no reason) is not.
+    reasonRedundant :: Word64 -> Int -> m Bool
+    reasonRedundant abstraction vi = do
+      rsn <- Growable.read ( reason s ) vi
+      case rsn of
+        Clause.RDecision     -> pure False
+        Clause.RFact         -> pure True   -- a ground fact is unconditionally true
+        Clause.RBinary other -> covered abstraction other
+        Clause.RClause cref  -> clauseOthersCovered abstraction cref vi
+        Clause.RLazy lref    -> forceLazy s lref >>= othersCovered abstraction vi
+
+    -- Whether reason-literal @q@ is covered: at the ground level, already a
+    -- clause (or proven-redundant) variable, or recursively self-subsumed.
+    -- Memoises both outcomes (success via 'seen', failure via 'minFailed'). A
+    -- literal whose level is absent from the clause's @abstraction@ mask cannot
+    -- be covered, so it fails fast without forcing its reason.
+    covered :: Word64 -> Lit -> m Bool
+    covered abstraction q = do
+      let vq = varIndex ( litVar q )
+      lvl <- levelOfAssignedVar s ( litVar q )
+      if lvl <= GroundLevel
+      then pure True
+      else do
+        Bit isSeen <- Growable.read ( seen s ) vq
+        if isSeen
+        then pure True
+        else do
+          Bit isFailed <- Growable.read ( minFailed s ) vq
+          if isFailed
+          then pure False
+          else if abstractLevel lvl .&. abstraction == 0
+          then markFailed vq
+          else do
+            ok <- reasonRedundant abstraction vq
+            if ok
+            then do
+              Growable.write ( seen s ) vq ( Bit True )
+              Growable.push  ( analyzeTouched s ) vq
+              pure True
+            else markFailed vq
+
+    markFailed :: Int -> m Bool
+    markFailed vq = do
+      Growable.write ( minFailed s ) vq ( Bit True )
+      Growable.push  ( minFailedTouched s ) vq
+      pure False
+
+    -- Every literal of the reason clause other than the resolved variable @vi@.
+    clauseOthersCovered :: Word64 -> ClauseRef -> Int -> m Bool
+    clauseOthersCovered abstraction cref vi = do
+      c <- clauseAt s cref
+      let sz = clauseSize c
+          go !k
+            | k >= sz   = pure True
+            | otherwise = do
+                l <- clauseLit c k
+                if varIndex ( litVar l ) == vi
+                then go ( k + 1 )
+                else do
+                  cov <- covered abstraction l
+                  if cov then go ( k + 1 ) else pure False
+      go 0
+
+    othersCovered :: Word64 -> Int -> [ Lit ] -> m Bool
+    othersCovered abstraction vi = go
+      where
+        go [] = pure True
+        go ( l : ls )
+          | varIndex ( litVar l ) == vi = go ls
+          | otherwise = do
+              cov <- covered abstraction l
+              if cov then go ls else pure False
+
+    clearFailed :: m ()
+    clearFailed = do
+      k <- Growable.length ( minFailedTouched s )
+      let loop !i
+            | i >= k = pure ()
+            | otherwise = do
+                vi <- Growable.read ( minFailedTouched s ) i
+                Growable.write ( minFailed s ) vi ( Bit False )
+                loop ( i + 1 )
+      loop 0
 
 -- | Walk backwards along the trail at the current level, popping seen
 -- variables and resolving against their reason clauses, until a single
