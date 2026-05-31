@@ -39,6 +39,8 @@ module Schedule.LCG.Theory
   , popToLevel
     -- * One round of theory propagation
   , theoryPropagate
+    -- * Structural decision heuristic
+  , theoryDecide
     -- * Inspection
   , numPrecedenceDecisions
   )
@@ -46,7 +48,7 @@ module Schedule.LCG.Theory
 
 -- base
 import Control.Monad
-  ( replicateM_, when )
+  ( foldM, replicateM_, when )
 import Control.Monad.ST
   ( ST )
 import Data.Bits
@@ -55,12 +57,14 @@ import Data.Foldable
   ( for_, toList )
 import Data.Maybe
   ( catMaybes )
+import Data.Traversable
+  ( for )
 
 -- containers
 import Data.IntMap.Strict
   ( IntMap )
 import qualified Data.IntMap.Strict as IntMap
-  ( toList, lookup )
+  ( toList, lookup, insert )
 import Data.IntSet
   ( IntSet )
 import qualified Data.IntSet as IntSet
@@ -177,6 +181,14 @@ data Theory mode s task t = Theory
     -- at each task's internal availability-gap boundaries (see 'seedDecisionBounds').
     -- 'False' gives a precedence-only baseline (for A\/B comparison).
     useBoundDecisions :: !Bool
+  , -- | Whether 'theoryDecide' proposes structural day-assignment decisions
+    -- ahead of VSIDS. Only meaningful together with 'useBoundDecisions'.
+    useTheoryDecide :: !Bool
+  , -- | Per gappy task, its day-assignment decision atoms in ascending threshold
+    -- order (the positive literal @start ≤ boundary@), as seeded by
+    -- 'seedDecisionBounds'. Read by 'theoryDecide' for first-fail day branching;
+    -- written once at construction and never mutated thereafter.
+    decisionBounds :: !( MutVar s ( IntMap [ Lit ] ) )
   , -- | Next SAT trail position to channel into the scheduler.
     --
     -- @[0, theoryHead)@ have already been processed; @[theoryHead, trailSize)@
@@ -226,8 +238,9 @@ newTheory
   -> Int                          -- ^ propagator-round cap per theory step
   -> Bool                         -- ^ channel out tight bound reasons (learning)?
   -> Bool                         -- ^ branch on day-assignment bound atoms?
+  -> Bool                         -- ^ use the structural day-assignment decision heuristic?
   -> ST s ( Theory mode s task t )
-newTheory tis props rounds boundAtomsOn boundDecisionsOn = do
+newTheory tis props rounds boundAtomsOn boundDecisionsOn theoryDecideOn = do
   s     <- SAT.newSolver
   let nT  = Boxed.Vector.length ( taskNames tis )
       !nA = ( nT * ( nT - 1 ) ) `shiftR` 1
@@ -247,6 +260,7 @@ newTheory tis props rounds boundAtomsOn boundDecisionsOn = do
   bd    <- newMutVar IntSet.empty
   cv    <- newMutVar IntSet.empty
   tpc   <- newMutVar 0
+  db    <- newMutVar mempty
   mon   <- newMonitor @mode
   let t = Theory
         { solver          = s
@@ -258,6 +272,8 @@ newTheory tis props rounds boundAtomsOn boundDecisionsOn = do
         , maxPropRounds   = rounds
         , useBoundAtoms   = boundAtomsOn
         , useBoundDecisions = boundDecisionsOn
+        , useTheoryDecide = theoryDecideOn
+        , decisionBounds  = db
         , theoryHead      = th
         , levelMarks      = lms
         , dirtySeed       = ds
@@ -282,8 +298,12 @@ seedDecisionBounds t nT =
         ivals      = toList ( intervals ( taskAvailability task ) )
         -- The gap boundaries are the ends of every sub-interval but the last.
         boundaries = case ivals of { [] -> []; _ -> init ivals }
-    for_ boundaries \ iv ->
-      () <$ internDecisionBoundAtom t i ( latestStartFromCompletion dur ( end iv ) )
+    -- Intern the decision atom at each gap boundary, in ascending threshold
+    -- order, and record the literals so 'theoryDecide' can branch on them.
+    lits <- for boundaries \ iv ->
+      internDecisionBoundAtom t i ( latestStartFromCompletion dur ( end iv ) )
+    when ( not ( null lits ) ) $
+      modifyMutVar' ( decisionBounds t ) ( IntMap.insert i lits )
 
 -- | Create initial outer boundary atoms, so that propagators can cite them
 -- in tight reasons.
@@ -356,6 +376,58 @@ numPrecedenceDecisions t = do
           then loop ( i + 1 ) ( acc + 1 )
           else loop ( i + 1 ) acc
   loop 0 0
+
+-------------------------------------------------------------------------------
+-- Structural decision heuristic.
+
+{-# INLINABLE theoryDecide #-}
+
+-- | Propose the next branching literal from a CP search strategy, or 'Nothing'
+-- to defer to the SAT decision logic.
+--
+--  1. For gappy tasks, branch on the lowest undecided inner boundary atom of
+--     the most constrained task.
+--  2. Critical pair sequencing (settle the most resource critical unordered task pair).
+--
+-- Only when both stages abstain does it return 'Nothing', letting the SAT
+-- decision logic kick in.
+theoryDecide
+  :: forall mode s task t
+  .  ( Num t, Measurable t, Bounded t )
+  => Theory mode s task t
+  -> ST s ( Maybe Lit )
+theoryDecide t
+  | not ( useTheoryDecide t ) = pure Nothing
+  | otherwise = do
+      dbs  <- readMutVar ( decisionBounds t )
+      best <- foldM considerTask Nothing ( IntMap.toList dbs )
+      pure ( fmap ( \ ( _, _, lit ) -> lit ) best )
+  where
+    -- Keep the most-constrained candidate (fewest remaining intervals).
+    considerTask
+      :: Maybe ( Int, Int, Lit ) -> ( Int, [ Lit ] )
+      -> ST s ( Maybe ( Int, Int, Lit ) )
+    considerTask acc ( i, lits ) = do
+      task <- readTask t i
+      let nIvals = length ( intervals ( taskAvailability task ) )
+      if nIvals <= 1
+      then pure acc   -- already committed to a single interval
+      else do
+        mbLit <- firstUndecided lits
+        pure $ case mbLit of
+          Nothing  -> acc   -- no: all decided already
+          Just lit -> case acc of
+            Just ( bestN, _, _ ) | bestN <= nIvals -> acc
+            _                                      -> Just ( nIvals, i, lit )
+
+    -- The lowest-threshold inner-boundary atom not yet assigned.
+    firstUndecided :: [ Lit ] -> ST s ( Maybe Lit )
+    firstUndecided [] = pure Nothing
+    firstUndecided ( l : ls ) = do
+      v <- SAT.litValue ( solver t ) l
+      case v of
+        LUndef -> pure ( Just l )
+        _      -> firstUndecided ls
 
 -------------------------------------------------------------------------------
 -- One round of theory propagation.

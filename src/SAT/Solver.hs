@@ -89,6 +89,7 @@ module SAT.Solver
   , cancelUntil
   , pushNewLevel
   , enqueueUndef
+  , countDecision
   , tryEnqueue
   , installLearnt
   , resolveConflict
@@ -1521,6 +1522,14 @@ pushNewLevel
 pushNewLevel s = do
   n <- trailSize s
   Growable.push ( trailLim s ) n
+
+-- | Record a branching decision taken /outside/ 'decide' — e.g. a literal
+-- proposed by a DPLL(T) theory's own decision heuristic — so that
+-- 'numDecisions' counts the full search-tree size, not just VSIDS branches.
+countDecision
+  :: PrimMonad m
+  => Solver ( PrimState m ) -> m ()
+countDecision s = modifyMutVar' ( decCount s ) ( + 1 )
 
 -- | Install a learnt clause and unit-assert its asserting literal.
 --

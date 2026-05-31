@@ -86,9 +86,34 @@ data Outcome = Outcome
   , oResult :: !( SearchResult () BenchTime )   -- ^ the instrumented result
   }
 
+<<<<<<< HEAD
 runMode :: SearchOptions -> IO Outcome
 runMode opts = do
   -- Repeat the raw (uninstrumented) path for a stable minimum wall-clock time.
+=======
+-- | The four combinations of the two bound-atom roles. Holding day-decisions
+-- off while toggling @optBoundAtoms@ isolates channel-out learning's net effect
+-- against the coarse-reason baseline (the comparison the earlier harness, which
+-- only varied @optBoundDecisions@, could not make).
+abConfigs :: [ Cfg ]
+abConfigs =
+  [ Cfg "precedence-only" base { optBoundAtoms = False, optBoundDecisions = False, optTheoryDecide = False }
+  , Cfg "+learning"       base { optBoundAtoms = True , optBoundDecisions = False, optTheoryDecide = False }
+  , Cfg "+day (VSIDS)"    base { optBoundAtoms = False, optBoundDecisions = True , optTheoryDecide = False }
+  , Cfg "+both (VSIDS)"   base { optBoundAtoms = True , optBoundDecisions = True , optTheoryDecide = False }
+  , Cfg "+both +struct"   base { optBoundAtoms = True , optBoundDecisions = True , optTheoryDecide = True  }
+  ]
+  where
+    base = defaultSearchOptions
+
+-------------------------------------------------------------------------------
+-- Measurement.
+
+-- | Run one configuration, returning the minimum wall-clock over 'iterations'
+-- (from the uninstrumented path) and one instrumented (deterministic) result.
+measure :: SearchOptions -> Instance -> IO ( Word64, SearchResult () BenchTime )
+measure opts inst = do
+>>>>>>> 4531dcf (LCG roadmap M2: theory decision hook (structural day-assignment))
   times <- forM [ 1 .. iterations ] \ _ -> do
     t0 <- getMonotonicTimeNSec
     _  <- evaluate ( force ( solveRaw opts theInstance ) )

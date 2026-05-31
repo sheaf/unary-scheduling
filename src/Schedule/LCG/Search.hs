@@ -91,6 +91,11 @@ data SearchOptions = SearchOptions
     -- sub-interval before sequencing within it. 'False' gives a precedence-only
     -- baseline (for A\/B comparison). See "Schedule.LCG.Theory".
     optBoundDecisions :: !Bool
+  , -- | Use the theory's structural decision heuristic ('theoryDecide') ahead of
+    -- VSIDS.
+    --
+    -- Ensures we prioritise structural decisions to avoid VSIDS hijacking.
+    optTheoryDecide   :: !Bool
   }
 
 defaultSearchOptions :: SearchOptions
@@ -99,6 +104,7 @@ defaultSearchOptions = SearchOptions
   , optSolver         = SAT.defaultOptions
   , optBoundAtoms     = True
   , optBoundDecisions = True
+  , optTheoryDecide   = False
   }
 
 -------------------------------------------------------------------------------
@@ -161,7 +167,7 @@ lcgSearch opts props givenTasks = runST do
   -- Allocate scheduler state and theory in one go.
   tis    <- initialTaskData @taskData @task @t givenTasks
   theory <- newTheory @mode tis props ( optPropRounds opts )
-              ( optBoundAtoms opts ) ( optBoundDecisions opts )
+              ( optBoundAtoms opts ) ( optBoundDecisions opts ) ( optTheoryDecide opts )
 
   -- Drive the DPLL(T) loop. Its first iteration runs the propagators on
   -- the starting state, seeding any unconditional inferences before the
@@ -254,10 +260,17 @@ driveLoop solver theory = step
                   then step
                   else decideStep
 
-    -- Pick the next decision (or stop if everything is assigned).
+    -- Pick the next decision (or stop if everything is assigned). The theory's
+    -- structural heuristic gets first refusal ('theoryDecide'); when it abstains
+    -- the VSIDS heuristic ('SAT.decide') picks the literal.
     decideStep :: ST s SAT.Verdict
     decideStep = do
-      mbLit <- SAT.decide solver
+      mbTheory <- theoryDecide theory
+      mbLit <- case mbTheory of
+        -- A theory-proposed branch is still a decision: count it so that
+        -- 'numDecisions' reflects the full search-tree size.
+        Just lit -> SAT.countDecision solver *> pure ( Just lit )
+        Nothing  -> SAT.decide solver
       case mbLit of
         Nothing  -> pure SAT.Sat
         Just lit -> do
