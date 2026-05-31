@@ -5,6 +5,7 @@ module Schedule.Interval
   ( Clusivity(..), flipClusivity
   , Endpoint(..)
   , estLowerToStartUpper, startUpperToEstLower
+  , latestStartFromCompletion
   , Interval(.., (:<..<), (:<..<=), (:<=..<), (:<=..<=))
   , startTime, endTime
   , intersection
@@ -265,6 +266,18 @@ class Ord t => Measurable t where
   canonicalLatest :: Endpoint ( LatestTime t ) -> Endpoint ( LatestTime t )
   canonicalLatest = id
 
+  -- | The latest-/completion/ bound that enforces a latest-/start/ bound @l@ for
+  -- a task of the given duration: @start ≤ l@ is equivalent to
+  -- @completion ≤ completionFromLatestStart dur l@. Channelling a latest-start
+  -- atom into a task's domain applies 'cutAfter' to this completion bound.
+  --
+  -- This is the inverse of 'latestStartFromCompletion'. It is domain-specific
+  -- because relating a (closed-canonical) start bound to a (half-open,
+  -- 'Exclusive'-canonical) completion bound shifts by the duration /and/ moves
+  -- between the two clusivity conventions (which on a discrete domain is a unit
+  -- step).
+  completionFromLatestStart :: Delta t -> Endpoint ( LatestTime t ) -> Endpoint ( LatestTime t )
+
 instance Measurable Double where
   measure ival = max ( Delta 0 ) $ handedTime ( startTime ival ) --> handedTime ( endTime ival )
   isEmpty ( Interval (Endpoint (EarliestTime s) s_clu) (Endpoint (LatestTime e) e_clu) )
@@ -272,6 +285,10 @@ instance Measurable Double where
     || ( s == e && ( s_clu == Exclusive || e_clu == Exclusive ) )
   -- Continuous time: zero-measure boundaries, so neither endpoint needs
   -- normalisation.
+  -- A strict @start < v@ loosens to the half-open completion bound @end < v + dur@;
+  -- these differ only on a measure-zero boundary point.
+  completionFromLatestStart ( Delta d ) ( Endpoint ( LatestTime ( Time v ) ) _clu ) =
+    Endpoint ( LatestTime ( Time ( v + d ) ) ) Exclusive
 
 instance Measurable Int where
   measure ( Interval (Endpoint (EarliestTime (Time s)) s_clu) (Endpoint (LatestTime (Time e)) e_clu) ) =
@@ -291,6 +308,27 @@ instance Measurable Int where
   canonicalLatest ( Endpoint ( LatestTime ( Time e ) ) Inclusive ) =
     Endpoint ( LatestTime ( Time ( e + 1 ) ) ) Exclusive
   canonicalLatest e = e
+
+  -- @start ≤ v@ (Inclusive)  ⟹  occupies through @v + dur - 1@  ⟹  end @≤ v + dur@.
+  -- @start < v@ (Exclusive) ≡ @start ≤ v - 1@  ⟹  end @≤ v - 1 + dur@.
+  completionFromLatestStart ( Delta d ) ( Endpoint ( LatestTime ( Time v ) ) clu ) =
+    let v' = if clu == Inclusive then v else v - 1
+    in Endpoint ( LatestTime ( Time ( v' + d ) ) ) Exclusive
+
+-- | The latest-/start/ bound equivalent to a latest-/completion/ bound @lct@ for
+-- a task of the given duration: @completion ≤ lct@ is equivalent to
+-- @start ≤ latestStartFromCompletion dur lct@.
+--
+-- The boundary start is always attained (a task occupies a half-open interval,
+-- so its supremum is never reached), hence the result is the /inclusive/ bound
+-- @start ≤ v@. This is the inverse of 'completionFromLatestStart'; the two
+-- together let a single latest-start atom family round-trip through the domain.
+latestStartFromCompletion
+  :: ( Num t, Measurable t )
+  => Delta t -> Endpoint ( LatestTime t ) -> Endpoint ( LatestTime t )
+latestStartFromCompletion d lct =
+  case d • canonicalLatest lct of
+    Endpoint v _ -> Endpoint v Inclusive
 
 -------------------------------------------------------------------------------
 -- Intervals.

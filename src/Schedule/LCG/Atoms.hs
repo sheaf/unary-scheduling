@@ -9,13 +9,15 @@
 --     @T_i ≺ T_j@). These are the only /decision/ variables.
 --
 --   * /bound atoms/ ('BoundAtoms'): lazily-created auxiliary variables
---     reifying each task's start-time bounds. Two separate families avoid any
---     clusivity clash between the earliest- and latest-time conventions:
---
---       - a /lower-bound/ atom @(task, e)@ whose positive literal means
---         @start_task ≥ e@ (@e@ an 'EarliestTime' endpoint);
---       - an /upper-bound/ atom @(task, l)@ whose positive literal means
---         @start_task ≤ l@ (@l@ a 'LatestTime' endpoint, i.e. a latest start).
+--     reifying each task's start time on a /single/ latest-start axis. A bound
+--     atom @(task, l)@ has positive literal @start_task ≤ l@ (@l@ a 'LatestTime'
+--     endpoint, i.e. a latest start); its negation is @start_task > l@. A task's
+--     /lower/ bound @start ≥ e@ is therefore the /negative/ literal of the atom
+--     at threshold @'estLowerToStartUpper' e@, and its /upper/ bound
+--     @start ≤ lst@ the /positive/ literal at threshold @lst@. Keeping both on
+--     one axis (with both clusivities available) means a zero-slack task's lower
+--     and upper bounds get distinct atoms — @start < v@ vs @start ≤ v@ — related
+--     by monotonicity, with no clusivity clash.
 --
 --     Atoms are allocated on demand (we never enumerate the time horizon) and
 --     laid out /after/ the fixed precedence block, so a variable index alone
@@ -32,10 +34,10 @@ module Schedule.LCG.Atoms
     -- * Bound atoms (lazy)
   , BoundAtoms
   , newBoundAtoms
-  , internLowerBound, internUpperBound
+  , internStartUpper
+  , boundNeighbours
   , isBoundVar
     -- * Decoding a trail literal
-  , BoundThreshold(..)
   , AtomMeaning(..)
   , litMeaning
   )
@@ -55,7 +57,7 @@ import qualified Data.IntMap.Strict as IntMap
 import Data.Map.Strict
   ( Map )
 import qualified Data.Map.Strict as Map
-  ( empty, insert, lookup )
+  ( empty, insert, lookup, lookupLT, lookupGT )
 
 -- primitive
 import Data.Primitive.MutVar
@@ -76,7 +78,7 @@ import Schedule.Interval
 import Schedule.Ordering
   ( upperTriangular )
 import Schedule.Time
-  ( EarliestTime, LatestTime )
+  ( LatestTime )
 
 -------------------------------------------------------------------------------
 
@@ -161,35 +163,23 @@ isPrecedenceVar ps v =
 -------------------------------------------------------------------------------
 -- Bound atoms.
 
--- | A start-time bound reified as a bound atom: the positive literal of the
--- atom asserts this bound.
-data BoundThreshold t
-  = -- | Lower bound: @start ≥ e@.
-    LowerThreshold !( Endpoint ( EarliestTime t ) )
-  | -- | Upper bound: @start ≤ l@ (a latest start).
-    UpperThreshold !( Endpoint ( LatestTime t ) )
-
 -- | Lazily-grown registry of start-time bound atoms.
 --
--- Lower- and upper-bound atoms are kept in separate forward maps so that the
--- earliest- and latest-time clusivity conventions never clash (in particular,
--- a zero-slack task's coincident lower and upper bounds get distinct atoms).
--- Variables are allocated /after/ the fixed precedence block (variable index
+-- A single family on the latest-start axis: the atom @(task, l)@ has positive
+-- literal @start_task ≤ l@ (@l@ a 'LatestTime' endpoint). Variables are
+-- allocated /after/ the fixed precedence block (variable index
 -- @≥ firstBoundVar@), so 'isBoundVar' and 'isPrecedenceVar' classify any
 -- variable in O(1).
 data BoundAtoms s t = BoundAtoms
   { -- | First variable index reserved for bound atoms (one past the last
     -- precedence atom). Bound variables have index @≥ firstBoundVar@.
     firstBoundVar :: !Int
-  , -- | Lower-bound atoms: per task, the created earliest-start thresholds and
-    -- their variables (positive literal: @start ≥ e@).
-    boundLowerFwd :: !( MutVar s ( IntMap ( Map ( Endpoint ( EarliestTime t ) ) Var ) ) )
-  , -- | Upper-bound atoms: per task, the created latest-start thresholds and
-    -- their variables (positive literal: @start ≤ l@).
-    boundUpperFwd :: !( MutVar s ( IntMap ( Map ( Endpoint ( LatestTime t ) ) Var ) ) )
+  , -- | Per task, the created latest-start thresholds and their variables
+    -- (positive literal: @start ≤ l@).
+    boundFwd      :: !( MutVar s ( IntMap ( Map ( Endpoint ( LatestTime t ) ) Var ) ) )
   , -- | Reverse map: variable index → @(task, threshold)@, for decoding a
     -- drained trail literal.
-    boundRev      :: !( MutVar s ( IntMap ( Int, BoundThreshold t ) ) )
+    boundRev      :: !( MutVar s ( IntMap ( Int, Endpoint ( LatestTime t ) ) ) )
   }
 
 -- | Allocate an empty bound-atom registry. @firstBoundVar@ is the variable
@@ -197,60 +187,51 @@ data BoundAtoms s t = BoundAtoms
 -- block).
 newBoundAtoms :: Int -> ST s ( BoundAtoms s t )
 newBoundAtoms firstIx = do
-  lo  <- newMutVar IntMap.empty
-  hi  <- newMutVar IntMap.empty
+  fwd <- newMutVar IntMap.empty
   rev <- newMutVar IntMap.empty
   pure BoundAtoms
     { firstBoundVar = firstIx
-    , boundLowerFwd = lo
-    , boundUpperFwd = hi
+    , boundFwd      = fwd
     , boundRev      = rev
     }
 
--- | Get-or-create the lower-bound atom @start ≥ e@ for a task, returning its
+-- | Get-or-create the latest-start atom @start ≤ l@ for a task, returning its
 -- positive literal and whether the atom was freshly created.
-internLowerBound
-  :: Ord t
-  => BoundAtoms s t
-  -> ST s Var                    -- ^ fresh auxiliary (non-decision) variable allocator
-  -> Int                         -- ^ task index
-  -> Endpoint ( EarliestTime t ) -- ^ earliest-start threshold @e@
-  -> ST s ( Lit, Bool )
-internLowerBound ba =
-  internWith ( boundLowerFwd ba ) ( boundRev ba ) LowerThreshold
-
--- | Get-or-create the upper-bound atom @start ≤ l@ for a task, returning its
--- positive literal and whether the atom was freshly created.
-internUpperBound
+--
+-- A task's /upper/ bound @start ≤ lst@ is this positive literal; its /lower/
+-- bound @start ≥ e@ is the /negative/ literal of the atom at threshold
+-- @'estLowerToStartUpper' e@.
+internStartUpper
   :: Ord t
   => BoundAtoms s t
   -> ST s Var                    -- ^ fresh auxiliary (non-decision) variable allocator
   -> Int                         -- ^ task index
   -> Endpoint ( LatestTime t )   -- ^ latest-start threshold @l@
   -> ST s ( Lit, Bool )
-internUpperBound ba =
-  internWith ( boundUpperFwd ba ) ( boundRev ba ) UpperThreshold
-
--- | Shared get-or-create over one bound-atom family.
-internWith
-  :: Ord k
-  => MutVar s ( IntMap ( Map k Var ) )
-  -> MutVar s ( IntMap ( Int, BoundThreshold t ) )
-  -> ( k -> BoundThreshold t )   -- ^ how to record this threshold in the reverse map
-  -> ST s Var
-  -> Int
-  -> k
-  -> ST s ( Lit, Bool )
-internWith fwdRef revRef mkThreshold allocVar task thr = do
-  fwd <- readMutVar fwdRef
+internStartUpper ba allocVar task thr = do
+  fwd <- readMutVar ( boundFwd ba )
   let perTask = IntMap.findWithDefault Map.empty task fwd
   case Map.lookup thr perTask of
     Just v  -> pure ( mkLit v Positive, False )
     Nothing -> do
       v <- allocVar
-      writeMutVar   fwdRef ( IntMap.insert task ( Map.insert thr v perTask ) fwd )
-      modifyMutVar' revRef ( IntMap.insert ( varIndex v ) ( task, mkThreshold thr ) )
+      writeMutVar   ( boundFwd ba ) ( IntMap.insert task ( Map.insert thr v perTask ) fwd )
+      modifyMutVar' ( boundRev ba ) ( IntMap.insert ( varIndex v ) ( task, thr ) )
       pure ( mkLit v Positive, True )
+
+-- | The positive literals of a task's nearest /below/ and /above/ interned
+-- thresholds (strictly), for wiring monotonicity links @A_below ⟹ A_thr@ and
+-- @A_thr ⟹ A_above@. Query /after/ interning @thr@ (its own entry is excluded
+-- by the strict lookups).
+boundNeighbours
+  :: Ord t
+  => BoundAtoms s t -> Int -> Endpoint ( LatestTime t ) -> ST s ( Maybe Lit, Maybe Lit )
+boundNeighbours ba task thr = do
+  fwd <- readMutVar ( boundFwd ba )
+  let perTask  = IntMap.findWithDefault Map.empty task fwd
+      toLit ( _, v ) = mkLit v Positive
+  pure ( toLit <$> Map.lookupLT thr perTask
+       , toLit <$> Map.lookupGT thr perTask )
 
 -- | Whether a variable is a bound atom (i.e. lies above the fixed precedence
 -- block).
@@ -264,11 +245,10 @@ isBoundVar ba v = varIndex v >= firstBoundVar ba
 data AtomMeaning t
   = -- | A precedence literal asserting @T_predecessor ≺ T_successor@.
     MeansPrecedence !Int !Int
-  | -- | A bound literal on @task@ at the given threshold, with the literal's
-    -- 'Polarity'. With a 'LowerThreshold' @e@: 'Positive' is @start ≥ e@,
-    -- 'Negative' is @start < e@. With an 'UpperThreshold' @l@: 'Positive' is
-    -- @start ≤ l@, 'Negative' is @start > l@.
-    MeansBound !Int !( BoundThreshold t ) !Polarity
+  | -- | A latest-start bound literal on @task@ at threshold @l@, with the
+    -- literal's 'Polarity': 'Positive' is @start ≤ l@, 'Negative' is
+    -- @start > l@.
+    MeansBound !Int !( Endpoint ( LatestTime t ) ) !Polarity
 
 -- | Decode a trail literal into its scheduling meaning. 'Nothing' only for a
 -- variable belonging to neither registry (which should not occur).

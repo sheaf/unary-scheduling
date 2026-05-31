@@ -14,13 +14,11 @@ module Schedule.Bench.Instances
     -- * Instance families
   , fullTask
   , windowedTask
-  , randomInstanceAtUtilisation
   , randomWindowedInstance
+  , rehearsalInstance
   , overloadedInstance
-  , twoSegmentInstance
   , tightCliqueInstance
   , chainedWindowInstance
-  , chainedOverloadedInstance
   )
   where
 
@@ -44,7 +42,7 @@ import Control.DeepSeq
 
 -- random
 import System.Random
-  ( StdGen, mkStdGen, randomR, randomRs, split )
+  ( mkStdGen, randomRs, split )
 
 -- text
 import Data.Text
@@ -142,28 +140,6 @@ windowedTask release deadline dur name =
 fullTask :: Int -> Int -> Text -> ( BenchTask, Text )
 fullTask horizon = windowedTask 0 horizon
 
--- | @n@ tasks sharing the single window @[0, horizon]@, with random durations
--- in @[1, maxDur]@, where the horizon is sized from the /realised/ total
--- demand so the resource runs at the requested @utilisation@ (= demand /
--- capacity).
-randomInstanceAtUtilisation
-  :: Double  -- ^ target utilisation, in @(0, 1]@ for a feasible instance
-  -> Int     -- ^ number of tasks
-  -> Int     -- ^ maximum task duration
-  -> Int     -- ^ PRNG seed
-  -> Instance
-randomInstanceAtUtilisation utilisation n maxDur seed =
-  [ fullTask horizon d ( Text.pack ( "t" ++ show k ) )
-  | ( k, d ) <- zip [ 0 .. ] durations
-  ]
-  where
-    durations :: [ Int ]
-    durations = take n ( randomRs ( 1, maxDur ) ( mkStdGen seed ) )
-    -- Size the window from the realised demand. 'max maxDur' keeps every
-    -- individual task fitting even in degenerate (tiny-@n@) cases.
-    horizon :: Int
-    horizon = max maxDur ( ceiling ( fromIntegral ( sum durations ) / utilisation ) )
-
 -- | A feasible instance with /heterogeneous, overlapping/ availability windows.
 randomWindowedInstance
   :: Double  -- ^ target utilisation, in @(0, 1]@
@@ -219,6 +195,78 @@ randomWindowedInstance utilisation windowSlack n maxDur seed =
     pairUp ( a : b : rest ) = ( a, b ) : pairUp rest
     pairUp _                = []
 
+-- | A multi-day /rehearsal/ instance: a single director (the unary resource)
+-- must run every rehearsal, spread over @numDays@ back-to-back days. Days are
+-- separated only by a single carved-out boundary slot — just enough that a
+-- rehearsal cannot straddle the day boundary, with no wasted timeline. Each
+-- song has a random duration and is available on a random non-empty subset of
+-- days (its students' availability); since a song cannot span the boundary, the
+-- choice of /which day/ each song lands on is a genuine, availability-restricted
+-- bin-packing.
+--
+-- Days are sized so the total rehearsal demand runs at the target @utilisation@
+-- of the director's available time, so at high @utilisation@ packing the songs
+-- into days is tight — the regime that produces real day-assignment conflicts
+-- (and the one where reasoning about start bounds is meant to matter). Lower
+-- @availProb@ pins songs to fewer days (more constrained); raise @utilisation@
+-- towards 1 (or past feasibility) for a harder instance.
+rehearsalInstance
+  :: Double  -- ^ utilisation: total demand / total day capacity, in @(0, 1]@
+  -> Double  -- ^ per-(song, day) availability probability, in @(0, 1]@
+  -> Int     -- ^ number of days
+  -> Int     -- ^ number of songs
+  -> Int     -- ^ maximum rehearsal duration
+  -> Int     -- ^ PRNG seed
+  -> Instance
+rehearsalInstance utilisation availProb numDays numSongs maxDur seed =
+  [ multiDayTask ( songDays k ) dayLen dayGap ( durOf k ) ( Text.pack ( "song" ++ show k ) )
+  | k <- [ 0 .. numSongs - 1 ]
+  ]
+  where
+    ( gDur, gAvail ) = split ( mkStdGen seed )
+
+    durs :: IntMap Int
+    durs  = IntMap.fromList ( zip [ 0 .. ] ( take numSongs ( randomRs ( 1, maxDur ) gDur ) ) )
+    durOf :: Int -> Int
+    durOf k = durs IntMap.! k
+
+    -- Size a day so the whole schedule runs at the target utilisation; a single
+    -- carved boundary slot between days stops a rehearsal straddling the
+    -- boundary (one contiguous task cannot skip the missing slot).
+    total, dayLen, dayGap :: Int
+    total  = sum ( IntMap.elems durs )
+    dayLen = max maxDur ( ceiling ( fromIntegral total / ( fromIntegral numDays * utilisation ) ) )
+    dayGap = 1
+
+    -- Per-(song, day) availability draws, chunked @numDays@ per song.
+    availDraws :: [ Double ]
+    availDraws = take ( numSongs * numDays ) ( randomRs ( 0, 1 ) gAvail )
+    songDays :: Int -> [ Int ]
+    songDays k =
+      let mask = take numDays ( drop ( k * numDays ) availDraws )
+          ds   = [ d | ( d, p ) <- zip [ 0 .. ] mask, p < availProb ]
+      in if null ds then [ k `mod` numDays ] else ds
+
+-- | A task available on each of the given @days@. Day @d@ is the @dayLen@-slot
+-- window @[d * (dayLen + dayGap), d * (dayLen + dayGap) + dayLen - 1]@, so
+-- consecutive days are separated by @dayGap@ unoccupiable boundary slots.
+multiDayTask :: [ Int ] -> Int -> Int -> Int -> Text -> ( BenchTask, Text )
+multiDayTask days dayLen dayGap dur name =
+  ( Task
+      { taskAvailability = mkIntervals ( Seq.fromList ( map dayWindow days ) )
+      , taskDuration     = Delta ( BenchTime dur )
+      , taskInfo         = ()
+      }
+  , name
+  )
+  where
+    dayWindow :: Int -> Interval BenchTime
+    dayWindow d =
+      let start = d * ( dayLen + dayGap )
+      in Interval
+           ( Endpoint ( EarliestTime ( Time ( BenchTime start ) ) ) Inclusive )
+           ( Endpoint ( LatestTime   ( Time ( BenchTime ( start + dayLen - 1 ) ) ) ) Inclusive )
+
 -- | An instance that's deliberately overloaded: @n@ tasks each of
 -- duration @dur@ over a window of @floor (n * dur / 2)@ — total demand
 -- twice the capacity, so the propagators or search must report infeasibility.
@@ -229,30 +277,6 @@ overloadedInstance n dur =
   ]
   where
     horizon = ( n * dur ) `div` 2
-
--- | A two-segment instance: @n@ tasks each with two availability windows,
--- forcing the search to commit to which window each task lands in.
-twoSegmentInstance :: Int -> Int -> Int
-                   -> Int -> Instance
-twoSegmentInstance n horizon gap dur =
-  [ ( Task
-        { taskAvailability = mkIntervals
-            ( Seq.fromList
-              [ Interval
-                ( Endpoint ( EarliestTime ( Time ( BenchTime 0 ) ) ) Inclusive )
-                ( Endpoint ( LatestTime   ( Time ( BenchTime horizon ) ) ) Inclusive )
-              , Interval
-                ( Endpoint ( EarliestTime ( Time ( BenchTime ( horizon + gap ) ) ) ) Inclusive )
-                ( Endpoint ( LatestTime   ( Time ( BenchTime ( 2 * horizon + gap ) ) ) ) Inclusive )
-              ]
-            )
-        , taskDuration     = Delta ( BenchTime dur )
-        , taskInfo         = ()
-        }
-    , Text.pack ( "ts" ++ show k )
-    )
-  | k <- [ 0 .. n - 1 ]
-  ]
 
 -- | A /tight disjunctive clique/: @n@ duration-@d@ tasks, all sharing the
 -- single window @[0, n·d)@. Total demand equals capacity, so every feasible
@@ -289,14 +313,3 @@ chainedWindowInstance n window dur =
     )
   | k <- [ 0 .. n - 1 ]
   ]
-
--- | Same shape as 'chainedWindowInstance' but with an extra task that
--- pushes total demand past capacity; intended as a /structured/
--- infeasibility (each task individually fits, but the global schedule
--- cannot be completed).
-chainedOverloadedInstance :: Int -> Int -> Int -> Instance
-chainedOverloadedInstance n window dur =
-  chainedWindowInstance n window dur
-  ++
-  -- One extra task in the middle of the window.
-  [ fullTask ( n + window ) dur ( Text.pack ( "cw-extra" ) ) ]

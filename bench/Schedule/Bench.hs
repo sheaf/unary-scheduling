@@ -33,9 +33,9 @@ import Test.Tasty.Bench
 import Schedule.Bench.Instances
   ( BenchTime(..), Instance
   , runLCG, runPropOnly
-  , randomWindowedInstance
-  , overloadedInstance, twoSegmentInstance
-  , tightCliqueInstance, chainedWindowInstance, chainedOverloadedInstance
+  , randomWindowedInstance, rehearsalInstance
+  , overloadedInstance
+  , tightCliqueInstance, chainedWindowInstance
   )
 
 -- z3-oracle
@@ -86,19 +86,14 @@ benchmarks =
                ( chainedWindowInstance n w 1 )
       | ( n, w ) <- [ ( 4, 2 ), ( 6, 2 ), ( 8, 2 ), ( 12, 2 ) ]
       ]
-  , bgroup "two-segment availability"
-      [ triple ( "n=" ++ show n ++ " win=" ++ show h ++ " d=" ++ show d )
-               ( twoSegmentInstance n h 2 d )
-      | ( n, h, d ) <- [ ( 4, 8, 2 ), ( 6, 12, 2 ), ( 8, 16, 2 ) ]
+  , bgroup "multi-day rehearsal (single director; day-assignment bin-packing)"
+      [ triple ( "days=" ++ show days ++ " songs=" ++ show songs )
+               ( rehearsalInstance 0.9 0.6 days songs 8 42 )
+      | ( days, songs ) <- [ ( 3, 9 ), ( 4, 12 ), ( 5, 15 ), ( 5, 20 ) ]
       ]
   , bgroup "infeasible: resource overload (demand twice the horizon)"
       [ triple ( "n=" ++ show n ++ " d=" ++ show d )
                ( overloadedInstance n d )
       | ( n, d ) <- [ ( 4, 3 ), ( 6, 3 ), ( 8, 3 ), ( 12, 3 ), ( 16, 3 ) ]
-      ]
-  , bgroup "infeasible: structured (chained window + extra task)"
-      [ triple ( "n=" ++ show n ++ " w=" ++ show w )
-               ( chainedOverloadedInstance n w 1 )
-      | ( n, w ) <- [ ( 4, 2 ), ( 6, 2 ), ( 8, 2 ) ]
       ]
   ]

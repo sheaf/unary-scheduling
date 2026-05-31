@@ -51,6 +51,7 @@ module SAT.Solver
   , newVar
   , newAuxVar
   , addClause
+  , addBinaryLemma
   , PostResult(..)
   , numVariables
     -- * Solving
@@ -96,6 +97,7 @@ module SAT.Solver
   , ClauseRef(..)
   , isOk
   , markFalse
+  , bumpVarActivity
   )
   where
 
@@ -440,9 +442,9 @@ newSolver = do
     , analyzeOtherLevels = aolv
     }
   where
-    -- 16 MiB worth of 'Lit'-sized words = 2 Mi words on a 64-bit target.
+
     defaultStoreCapacityLits :: Int
-    defaultStoreCapacityLits = ( 16 * 1024 * 1024 ) `div` 8
+    defaultStoreCapacityLits = ( 1024 * 1024 * 1024 ) `div` 8
 
 numVariables :: PrimMonad m => Solver ( PrimState m ) -> m Int
 numVariables s = Growable.length ( assigns s )
@@ -451,6 +453,13 @@ numVariables s = Growable.length ( assigns s )
 -- tables grow to accommodate it; the new variable is initially unassigned
 -- with zero activity and no saved phase. It is registered at the bottom of
 -- the activity heap and is eligible to be branched on by 'decide'.
+-- | Add one activity bump to a variable (and re-heapify it). Exposed so a
+-- theory can bias the decision order towards variables it considers
+-- structurally important — e.g. the day-assignment bound atoms of the
+-- scheduler, which we want decided before the within-day sequencing.
+bumpVarActivity :: PrimMonad m => Solver ( PrimState m ) -> Var -> m ()
+bumpVarActivity s = VarOrder.bumpActivity ( varOrder s )
+
 newVar :: PrimMonad m => Solver ( PrimState m ) -> m Var
 newVar s = newVarWith s True
 
@@ -724,6 +733,28 @@ addClause s ls0 = do
         ( cref, c ) <- recordClause s False ls
         attachLong s cref c
         pure Posted
+
+-- | Attach a binary clause @[l, m]@ to the watch lists mid-search, /without/
+-- the unit-collapse and level-0 normalisation of 'addClause'.
+--
+-- 'addClause' is meant for input clauses posted at the ground level: when
+-- normalisation reduces a clause to a unit it enqueues the survivor as an
+-- 'RFact', which is only sound at the ground level. A binary clause generated
+-- lazily during the search — a theory lemma such as bound-atom monotonicity —
+-- must therefore be attached directly: were it left to 'addClause', a literal
+-- already false at the ground level would collapse it to a unit and enqueue an
+-- 'RFact' at the /current/ level, which later trips conflict analysis.
+--
+-- The caller must guarantee at least one literal is currently unassigned (true
+-- when one of them is a freshly created variable), so the clause is never
+-- already falsified at attach time; any later violation is caught by the watch
+-- on the second literal.
+addBinaryLemma
+  :: PrimMonad m
+  => Solver ( PrimState m ) -> Lit -> Lit -> m ()
+addBinaryLemma s l m = do
+  ok <- readMutVar ( okFlag s )
+  when ok ( attachBinary s l m )
 
 markFalse :: PrimMonad m => Solver ( PrimState m ) -> m ()
 markFalse s = writeMutVar ( okFlag s ) False

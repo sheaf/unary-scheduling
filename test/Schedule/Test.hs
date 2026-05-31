@@ -30,12 +30,14 @@ import qualified Data.Vector as Boxed.Vector
 
 -- unary-scheduling
 import Schedule.Interval
-  ( Interval(..), Intervals(..), Endpoint(..), Measurable(..), inside )
+  ( Interval(..), Intervals(..), Endpoint(..), Clusivity(..), Measurable(..), inside
+  , estLowerToStartUpper, latestStartFromCompletion
+  )
 import Schedule.Propagators
 import Schedule.Task
   ( Task(..), TaskInfos(..), est, lct )
 import Schedule.Time
-  ( Time(..), Delta(..), HandedTime(..) )
+  ( Time(..), Delta(..), HandedTime(..), EarliestTime, LatestTime )
 
 -------------------------------------------------------------------------------
 -- Notion of time used for the tests.
@@ -263,6 +265,24 @@ tests = testGroup "Schedule.Propagators"
       , testCase "no new constraint when #1 already fits" $ assertEstAt edgeLastTasks2  edgeLastPropagators  0 19
       , testCase "#1 must be first (lct = 00h12)"         $ assertLctAt edgeFirstTasks1 edgeFirstPropagators 0 12
       ]
+  , testGroup "bound-atom conversions (single latest-start axis)"
+      [ testCase "completion/start round-trips (canonical end)"     $ assertRoundTrips ( 0 `h` 30 ) ( lat ( 8 `h` 00 ) Exclusive )
+      , testCase "completion/start round-trips (inclusive end)"     $ assertRoundTrips ( 0 `h` 30 ) ( lat ( 8 `h` 00 ) Inclusive )
+      , testCase "completion/start round-trips (sub-hour duration)" $ assertRoundTrips ( 0 `h` 15 ) ( lat ( 11 `h` 30 ) Exclusive )
+      , testCase "zero-slack lower/upper thresholds stay distinct"  $ do
+          -- A task pinned to start at 05h00 (so @est = lst@): @est = 05h00@
+          -- inclusive, @lct = 05h30@ exclusive (canonical), duration 30. The
+          -- lower bound @start ≥ est@ and upper bound @start ≤ lst@ must reify as
+          -- /distinct/ atoms differing only in clusivity, ordered so that a
+          -- crossing is a (monotone) contradiction. This is the invariant that
+          -- removed the old two-family split.
+          let lowerThr = estLowerToStartUpper ( ear ( 5 `h` 00 ) Inclusive )
+              upperThr = latestStartFromCompletion ( Delta ( 0 `h` 30 ) ) ( lat ( 5 `h` 30 ) Exclusive )
+          assertBool "lower and upper thresholds must be distinct atoms" ( lowerThr /= upperThr )
+          -- @start < 05h00@ ⟹ @start ≤ 05h00@: the lower threshold precedes the
+          -- upper one, so an emptied window is a native ordering conflict.
+          compare lowerThr upperThr @?= LT
+      ]
   ]
 
 -------------------------------------------------------------------------------
@@ -311,3 +331,18 @@ assertNotOverloaded tasks =
   case runProp tasks overloadPropagators of
     Left err -> assertFailure ( "expected no overload, but got:\n" <> Text.unpack err )
     Right _  -> pure ()
+
+-- | A latest-completion \/ latest-start endpoint at the given time of day.
+lat :: Minutes -> Clusivity -> Endpoint ( LatestTime Minutes )
+lat v clu = Endpoint ( LatestTime ( Time v ) ) clu
+
+-- | An earliest-start endpoint at the given time of day.
+ear :: Minutes -> Clusivity -> Endpoint ( EarliestTime Minutes )
+ear v clu = Endpoint ( EarliestTime ( Time v ) ) clu
+
+-- | Assert that 'completionFromLatestStart' and 'latestStartFromCompletion' are
+-- mutual inverses for the given duration (up to canonicalising the completion).
+assertRoundTrips :: Minutes -> Endpoint ( LatestTime Minutes ) -> Assertion
+assertRoundTrips d lct0 =
+  completionFromLatestStart ( Delta d ) ( latestStartFromCompletion ( Delta d ) lct0 )
+    @?= canonicalLatest lct0
