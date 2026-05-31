@@ -104,7 +104,7 @@ defaultSearchOptions = SearchOptions
   , optSolver         = SAT.defaultOptions
   , optBoundAtoms     = True
   , optBoundDecisions = True
-  , optTheoryDecide   = False
+  , optTheoryDecide   = True
   }
 
 -------------------------------------------------------------------------------

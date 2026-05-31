@@ -123,6 +123,22 @@ measure opts inst = do
   instr <- evaluate ( force ( solveInstrumented opts theInstance ) )
   pure ( Outcome ( minimum times ) instr )
 
+-- | Like 'measure', but the returned result is from the uninstrumented run, so
+-- no second (potentially very slow) instrumented solve is paid. The 'stats' and
+-- 'verdict' are still exact; only the detailed 'monitorReport' is empty. Used for
+-- the A\/B matrix rows, whose columns are all in 'stats'.
+measureOff :: SearchOptions -> Instance -> IO ( Word64, SearchResult () BenchTime )
+measureOff opts inst = do
+  let solve = evaluate ( force ( lcgSearch @MonitoringOff opts basicPropagators inst ) )
+  -- The result is deterministic across iterations; keep the first, time the rest.
+  res   <- solve
+  times <- forM [ 1 .. iterations ] \ _ -> do
+    t0 <- getMonotonicTimeNSec
+    _  <- solve
+    t1 <- getMonotonicTimeNSec
+    pure ( t1 - t0 )
+  pure ( minimum times, res )
+
 -------------------------------------------------------------------------------
 
 main :: IO ()

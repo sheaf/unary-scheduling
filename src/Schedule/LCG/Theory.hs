@@ -70,6 +70,10 @@ import Data.IntSet
 import qualified Data.IntSet as IntSet
   ( empty, fromList, insert, singleton, toList, null, member )
 
+-- acts
+import Data.Act
+  ( Torsor((-->)) )
+
 -- mtl
 import Control.Monad.Trans.Class
   ( lift )
@@ -118,7 +122,7 @@ import Schedule.Constraint
   , constrainToAfter, constrainToBefore
   )
 import Schedule.Interval
-  ( Endpoint, Intervals(..), Measurable, end
+  ( Endpoint(endpoint), Intervals(..), Measurable, end
   , estLowerToStartUpper, startUpperToEstLower
   , latestStartFromCompletion, completionFromLatestStart
   )
@@ -142,9 +146,9 @@ import Schedule.Propagators
   ( Propagator, propagationLoop, seedAllOf, seedMatrixWatchers )
 import Schedule.Task
   ( MutableTaskInfos, TaskInfos(..), Task(..)
-  , est, lct )
+  , est, ect, lst, lct )
 import Schedule.Time
-  ( EarliestTime, LatestTime )
+  ( EarliestTime, LatestTime, Delta, HandedTime(handedTime) )
 import Schedule.Trail
   ( Trail, newTrail, currentMark, undoTo, orderingCellWriter )
 
@@ -401,7 +405,9 @@ theoryDecide t
   | otherwise = do
       dbs  <- readMutVar ( decisionBounds t )
       best <- foldM considerTask Nothing ( IntMap.toList dbs )
-      pure ( fmap ( \ ( _, _, lit ) -> lit ) best )
+      case best of
+        Just ( _, _, lit ) -> pure ( Just lit )
+        Nothing            -> criticalPair t
   where
     -- Keep the most-constrained candidate (fewest remaining intervals).
     considerTask
@@ -428,6 +434,73 @@ theoryDecide t
       case v of
         LUndef -> pure ( Just l )
         _      -> firstUndecided ls
+
+{-# INLINABLE criticalPair #-}
+
+-- | Settle the most resource-critical unordered task pair.
+--
+-- The most /contended/ disjunction is the pair minimising the larger of the two
+-- slacks (even its looser ordering is tight). branch its larger-slack direction
+-- first (textbook disjunctive-scheduling order).
+--
+-- (Clusivity is ignored in the slack — it shifts a bound by at most one unit,
+-- which is immaterial to a branching /heuristic/.)
+--
+-- Returns 'Nothing' when every pair is ordered (the precedence tournament
+-- is complete).
+criticalPair
+  :: forall mode s task t
+  .  ( Num t, Measurable t, Bounded t )
+  => Theory mode s task t
+  -> ST s ( Maybe Lit )
+criticalPair t = do
+  best <- go 0 1 Nothing
+  pure ( fmap snd best )
+  where
+    ps  = atoms t
+    n   = numTasks ps
+    mat = orderings ( tasks t )
+
+    -- Scan the upper-triangular pairs, keeping the minimum-criticality candidate.
+    go :: Int -> Int -> Maybe ( Delta t, Lit ) -> ST s ( Maybe ( Delta t, Lit ) )
+    go i j best
+      | i >= n - 1 = pure best
+      | j >= n     = go ( i + 1 ) ( i + 2 ) best
+      | otherwise  = do
+          o <- readOrdering mat i j
+          case o of
+            Unknown -> do
+              v <- SAT.litValue ( solver t ) ( precLit ps i j )
+              case v of
+                -- 'Unknown' in the matrix should mean the precedence atom is
+                -- unassigned; the check guards against deciding an assigned one.
+                LUndef -> do
+                  cand <- evalPair i j
+                  go i ( j + 1 ) ( keepMin best cand )
+                _ -> go i ( j + 1 ) best
+            _ -> go i ( j + 1 ) best
+
+    keepMin :: Maybe ( Delta t, Lit ) -> ( Delta t, Lit ) -> Maybe ( Delta t, Lit )
+    keepMin Nothing               cand            = Just cand
+    keepMin acc@( Just ( b, _ ) ) cand@( c, _ )
+      | c < b     = Just cand
+      | otherwise = acc
+
+    -- The criticality (smaller = more contended) and chosen directed literal.
+    evalPair :: Int -> Int -> ST s ( Delta t, Lit )
+    evalPair i j = do
+      ti <- readTask t i
+      tj <- readTask t j
+      let ectI = handedTime ( endpoint ( ect ti ) )
+          lstI = handedTime ( endpoint ( lst ti ) )
+          ectJ = handedTime ( endpoint ( ect tj ) )
+          lstJ = handedTime ( endpoint ( lst tj ) )
+          slackIJ = ectI --> lstJ   -- room if i precedes j
+          slackJI = ectJ --> lstI   -- room if j precedes i
+          crit    = max slackIJ slackJI
+          lit | slackIJ >= slackJI = precLit ps i j   -- larger-slack direction first
+              | otherwise          = precLit ps j i
+      pure ( crit, lit )
 
 -------------------------------------------------------------------------------
 -- One round of theory propagation.
