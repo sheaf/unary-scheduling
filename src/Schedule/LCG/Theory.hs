@@ -53,6 +53,8 @@ import Control.Monad.ST
   ( ST )
 import Data.Bits
   ( shiftR )
+import Data.Coerce
+  ( coerce )
 import Data.Foldable
   ( for_, toList )
 import Data.Maybe
@@ -101,7 +103,7 @@ import Data.Text
 
 -- vector
 import qualified Data.Vector as Boxed.Vector
-  ( length )
+  ( Vector, length, (!), generateM )
 import qualified Data.Vector.Mutable as Boxed.MVector
   ( unsafeRead )
 import qualified Data.Vector.Primitive.Mutable as Primitive
@@ -122,7 +124,8 @@ import Schedule.Constraint
   , constrainToAfter, constrainToBefore
   )
 import Schedule.Interval
-  ( Endpoint(endpoint), Intervals(..), Measurable, end
+  ( Endpoint(endpoint), Intervals(..), Interval(..), Measurable(..), end
+  , flipClusivity, cutBefore, cutAfter, remove
   , estLowerToStartUpper, startUpperToEstLower
   , latestStartFromCompletion, completionFromLatestStart
   )
@@ -169,6 +172,11 @@ data Theory mode s task t = Theory
     boundAtoms     :: !( BoundAtoms s t )
   , -- | The borrowed shared scheduler state (in-place mutated).
     tasks          :: !( MutableTaskInfos s task t )
+  , -- | Each task's /ground/ (initial instance) availability, snapshot before
+    -- any propagation.
+    --
+    -- Never mutated.
+    groundAvail    :: !( Boxed.Vector.Vector ( Intervals t ) )
   , -- | The schedule trail for in-place undo.
     schedTrail     :: !( Trail s task t )
   , -- | Scheduling propagators run on each theory round.
@@ -265,12 +273,16 @@ newTheory tis props rounds boundAtomsOn boundDecisionsOn theoryDecideOn = do
   cv    <- newMutVar IntSet.empty
   tpc   <- newMutVar 0
   db    <- newMutVar mempty
+  -- Snapshot ground availabilities now, before any propagation mutates them.
+  gav   <- Boxed.Vector.generateM nT \ i ->
+             taskAvailability <$> Boxed.MVector.unsafeRead ( taskAvails tis ) i
   mon   <- newMonitor @mode
   let t = Theory
         { solver          = s
         , atoms           = ps
         , boundAtoms      = ba
         , tasks           = tis
+        , groundAvail     = gav
         , schedTrail      = trail
         , propagators     = props
         , maxPropRounds   = rounds
@@ -1219,19 +1231,25 @@ buildInfeasibleConflict t brs carvedSet inf
           -- A culprit's actual bound is not a reified, on-trail atom: fall back.
           Nothing   -> snapshotConflict t "overload" Nothing
       EmptyDomain i lo hi _
+<<<<<<< HEAD
         -- A carved task's emptiness may rest on a non-ground interior gap.
         | IntSet.member i carvedSet -> snapshotConflict t "empty-domain" Nothing
         | otherwise                 -> emptyDomainConflict t brs i lo hi
+=======
+        -- A carved task's emptiness rests on non-ground interior holes (other
+        -- tasks' compulsory parts), so its tight reason must additionally cite
+        -- the carvers. If the gaps were in the ground instance, the two
+        -- crossing atoms suffice.
+        | IntSet.member i carvedSet -> carvedEmptyDomainConflict t brs i lo hi
+        | otherwise                 -> emptyDomainConflict t brs i lo hi "empty-domain" []
+>>>>>>> 2993ede (LCG roadmap M3: tight, self-verifying carved-empty-domain reasons)
       CycleDetected _ _ -> snapshotConflict t "cycle" Nothing
 
--- | Tight conflict for an emptied (non-carved) task @i@: its enforced earliest
--- start @lo@ and latest completion @hi@ leave no slot. Cite @i@'s two crossing
--- bound atoms @[start ≥ lo]@ and @[start ≤ lst]@ (each reasoned from the
--- squeezing predecessors\/successors), whose conjunction is infeasible — for a
--- non-carved task this rests only on the (ground) instance availability. The
--- conflict clause is exactly the monotonicity relation the two bounds violate;
--- 1-UIP resolves the two atoms through their reasons into the relevant
--- precedences\/bounds.
+-- | Tight conflict for an emptied task @i@: its enforced earliest start @lo@ and
+-- latest completion @hi@ leave no slot. Cite @i@'s two crossing bound atoms
+-- @[start ≥ lo]@ and @[start ≤ lst]@ (each reasoned from the squeezing
+-- predecessors\/successors), together with any @carverLits@: already-true bound
+-- atoms of the tasks whose compulsory parts carved @i@'s interior.
 emptyDomainConflict
   :: forall mode s task t
   .  ( Num t, Measurable t, Bounded t, MonitorMode mode )
@@ -1240,8 +1258,10 @@ emptyDomainConflict
   -> Int
   -> Endpoint ( EarliestTime t )
   -> Endpoint ( LatestTime t )
+  -> Text          -- ^ conflict-source label
+  -> [ Lit ]       -- ^ extra carver bound atoms (already true on the trail)
   -> ST s ( Maybe SAT.Conflict )
-emptyDomainConflict t brs i lo hi = do
+emptyDomainConflict t brs i lo hi label carverLits = do
   let ( estWhy, lctWhy ) = maybe ( IntSet.empty, IntSet.empty ) id ( IntMap.lookup i brs )
   task <- readTask t i
   let lstThr = latestStartFromCompletion ( taskDuration task ) hi
@@ -1260,9 +1280,74 @@ emptyDomainConflict t brs i lo hi = do
       case mb2 of
         Just c  -> pure ( Just c )
         Nothing -> do
-          tickConflict ( monitor t ) "empty-domain" True
-          recordReasonLen ( monitor t ) 2
-          literalsAsConflict ( solver t ) [ negateLit lowerLit, negateLit upperLit ]
+          let body = negateLit lowerLit : negateLit upperLit : map negateLit carverLits
+          tickConflict ( monitor t ) label True
+          recordReasonLen ( monitor t ) ( length body )
+          literalsAsConflict ( solver t ) body
+
+-- | Tight conflict for a /carved/ emptied task @i@. Its emptiness rests on the
+-- interior holes carved by other tasks' compulsory parts @[lst_c, ect_c]@, which
+-- are /not/ ground (they follow from the carvers' current bounds), so the
+-- two-atom reason of 'emptyDomainConflict' alone would be unsound.
+--
+-- Reconstruct the carvers (tasks with a non-empty current compulsory part) and
+-- /verify/, against @i@'s retained ground availability, that restricting to
+-- @[lo, hi]@ and removing those compulsory parts leaves no slot long enough for
+-- @i@.
+--
+-- Fall-back: if the residual still admits @i@, meaning that the current carvers
+-- do not explain the emptiness (e.g. it arose from carvers whose bounds have since
+-- moved, or the cited carver bound is not a reified on-trail atom), fall back
+-- to the coarse snapshot (always sound).
+carvedEmptyDomainConflict
+  :: forall mode s task t
+  .  ( Num t, Measurable t, Bounded t, MonitorMode mode )
+  => Theory mode s task t
+  -> IntMap ( IntSet, IntSet )
+  -> Int
+  -> Endpoint ( EarliestTime t )
+  -> Endpoint ( LatestTime t )
+  -> ST s ( Maybe SAT.Conflict )
+carvedEmptyDomainConflict t brs i lo hi = do
+  task <- readTask t i
+  let dur     = taskDuration task
+      window0 = cutAfter hi ( cutBefore lo ( groundAvail t Boxed.Vector.! i ) )
+  ( residual, usedCarvers ) <- collectCarvers ( numTasks ( atoms t ) - 1 ) window0 []
+  -- Verified iff no surviving slot is long enough to hold @i@.
+  let fits iv = measure iv >= dur
+      verified = not ( any fits ( toList ( intervals residual ) ) )
+  if not verified
+  then snapshotConflict t "empty-domain (carved)" Nothing
+  else do
+    mbCarverLits <- checkedBoundLits t usedCarvers
+    case mbCarverLits of
+      Nothing         -> snapshotConflict t "empty-domain (carved)" Nothing
+      Just carverLits -> emptyDomainConflict t brs i lo hi "empty-domain (carved)" carverLits
+  where
+    -- Walk tasks @c = n .. 0@, removing each non-empty compulsory part from the
+    -- residual window and recording the carvers that actually shrank it.
+    collectCarvers :: Int -> Intervals t -> [ Int ] -> ST s ( Intervals t, [ Int ] )
+    collectCarvers c acc used
+      | c < 0     = pure ( acc, used )
+      | c == i    = collectCarvers ( c - 1 ) acc used
+      | otherwise = do
+          taskC <- readTask t c
+          let comp = compulsoryPart taskC
+          if isEmpty comp
+          then collectCarvers ( c - 1 ) acc used
+          else
+            let acc' = remove acc comp
+            in if acc' == acc
+               then collectCarvers ( c - 1 ) acc  used        -- did not shrink: skip
+               else collectCarvers ( c - 1 ) acc' ( c : used )
+
+    -- A task's compulsory part @[lst, ect]@: the interval it necessarily
+    -- occupies under its current bounds (the same construction 'timetable' carves
+    -- with). Empty when the task is not yet fixed enough to have one.
+    compulsoryPart :: Task task t -> Interval t
+    compulsoryPart taskC =
+      Interval ( flipClusivity ( coerce ( lst taskC ) ) )
+               ( flipClusivity ( coerce ( ect taskC ) ) )
 
 -------------------------------------------------------------------------------
 -- Coarse snapshot reasons (fallback for cycles, emptied domains, rare
