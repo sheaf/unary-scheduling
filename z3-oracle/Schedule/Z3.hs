@@ -55,6 +55,8 @@ import Z3.Monad
 import qualified Z3.Monad as Z3
 
 -- unary-scheduling
+import Schedule.Constraint
+  ( Infeasible, renderInfeasible )
 import Schedule.Interval
   ( Clusivity(..), Endpoint(..), Interval(..), Intervals(..), Measurable )
 import Schedule.Monad
@@ -179,7 +181,7 @@ verifyAgainstZ3 propagators namedTasks = do
           let order = map snd ( sortOn fst ( zip starts [ 0 :: Int .. ] ) )
           in  zip order ( drop 1 order )
         ti  :: ImmutableTaskInfos task t
-        res :: Either Text ()
+        res :: Either ( Infeasible t ) ()
         ( ti, ( res, _ ) ) =
           runScheduleMonad namedTasks \ trail -> do
             -- Only post precedences that aren't already determined, as the
@@ -202,7 +204,7 @@ verifyAgainstZ3 propagators namedTasks = do
           , null ( intervals ( taskAvailability task ) ) || st < estV || st > lstV
           ]
       in case res of
-           Left err -> NativeRejected err
+           Left err -> NativeRejected ( renderInfeasible ( taskNames ti ) err )
            Right ()
              | not ( null violators ) -> NativePruned violators
              | otherwise              -> Consistent starts

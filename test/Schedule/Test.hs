@@ -29,6 +29,8 @@ import qualified Data.Vector as Boxed.Vector
   ( fromList, (!) )
 
 -- unary-scheduling
+import Schedule.Constraint
+  ( renderInfeasible )
 import Schedule.Interval
   ( Interval(..), Intervals(..), Endpoint(..), Clusivity(..), Measurable(..), inside
   , estLowerToStartUpper, latestStartFromCompletion
@@ -296,7 +298,7 @@ runProp
   -> Either Text ( Boxed.Vector TimeOfDayTask )
 runProp tasks props =
   case propagateConstraints tasks 10 props of
-    ( _,   _, Just err ) -> Left err
+    ( ti,  _, Just err ) -> Left ( renderInfeasible ( taskNames ti ) err )
     ( end, _, Nothing  ) -> Right ( taskAvails end )
 
 -- | Earliest start time / latest completion time of a task, as a raw minute count.

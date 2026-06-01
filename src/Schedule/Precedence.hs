@@ -13,6 +13,8 @@ module Schedule.Precedence
 -- containers
 import qualified Data.IntSet as IntSet
   ( singleton )
+import qualified Data.Sequence as Seq
+  ( singleton )
 
 -- lens
 import Control.Lens
@@ -27,8 +29,6 @@ import Control.Monad.Reader
   ( ask )
 
 -- vector
-import qualified Data.Vector as Boxed.Vector
-  ( (!) )
 import qualified Data.Vector.Mutable as Boxed
   ( MVector )
 
@@ -36,7 +36,7 @@ import qualified Data.Vector.Mutable as Boxed
 import Data.Vector.Generic.Index
   ( unsafeIndex )
 import Schedule.Constraint
-  ( Constraint(..), Infeasible(..), tightenMany )
+  ( Constraint(..), Infeasible(..), Justification(..), tightenMany )
 import Schedule.Interval
   ( Measurable )
 import Schedule.Monad
@@ -44,7 +44,7 @@ import Schedule.Monad
   , constrain
   )
 import Schedule.Ordering
-  ( CycleInfo(..)
+  ( CycleInfo
   , addIncidentEdgesTransitively
   )
 import Schedule.Task
@@ -71,20 +71,16 @@ addEdge
   -> Int                 -- ^ end task index
   -> m ()
 addEdge trail start end = do
-  tis@( TaskInfos { taskNames, taskAvails, orderings } ) <- ask
+  tis@( TaskInfos { taskAvails, orderings } ) <- ask
 
-  -- Audit log entry for the human-readable justifications channel.
+  -- Structured audit-log entry for the inference explanation channel.
   modifying ( field' @"taskConstraints" . field' @"justifications" )
-    ( <>
-      "Search decision has introduced the precedence:\n\
-      \\"" <> taskNames Boxed.Vector.! start <> "\" < \""
-          <> taskNames Boxed.Vector.! end <> "\n\n"
-    )
+    ( <> Seq.singleton ( SearchPrecedence { earlier = start, later = end } ) )
 
   addIncidentEdgesTransitively
     ( orderingCellWriter trail tis )
     ( \ _origin i j -> propagateNewEdge taskAvails i j )
-    ( errorMessage taskNames )
+    errorMessage
     orderings
     end ( IntSet.singleton start ) mempty
 
@@ -100,18 +96,6 @@ addEdge trail start end = do
           [ ( i, NotLaterThan   $ lst tk_j )
           , ( j, NotEarlierThan $ ect tk_i )
           ]
-          ""
 
-    errorMessage names info@( SelfCycle i ) =
-      CycleDetected info $
-      "Cycle involving \"" <> names Boxed.Vector.! i <> "\" detected after adding the precedence:\n\
-      \  - \"" <> names Boxed.Vector.! start <> "\"\n\
-      \  before\n\
-      \  - \"" <> names Boxed.Vector.! end <> "\"\n\n"
-    errorMessage names info@( DoubleCycle i j ) =
-      CycleDetected info $
-      "Cycle between \"" <> names Boxed.Vector.! i <> "\" and \"" <>
-      names Boxed.Vector.! j <> "\" detected after adding the precedence:\n\
-      \  - \"" <> names Boxed.Vector.! start <> "\"\n\
-      \  before\n\
-      \  - \"" <> names Boxed.Vector.! end <> "\"\n\n"
+    errorMessage :: CycleInfo -> Infeasible t
+    errorMessage info = CycleDetected { cycleInfo = info, addedEdge = ( start, end ) }

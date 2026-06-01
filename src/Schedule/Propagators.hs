@@ -55,6 +55,8 @@ import Data.IntSet
   ( IntSet )
 import qualified Data.IntSet as IntSet
   ( fromList, delete, null, empty )
+import Data.Sequence
+  ( Seq )
 import qualified Data.Sequence as Seq
   ( singleton )
 
@@ -78,7 +80,7 @@ import Data.Generics.Product.Fields
 import Control.Lens
   ( assign )
 import Control.Lens.Fold
-  ( forOf_, foldMapOf )
+  ( forOf_ )
 import qualified Data.IntSet.Lens as IntSet
   ( members )
 
@@ -99,8 +101,6 @@ import Control.Monad.Primitive
 -- text
 import Data.Text
   ( Text )
-import qualified Data.Text as Text
-  ( pack )
 
 -- transformers
 import Control.Monad.Trans.Class
@@ -108,7 +108,7 @@ import Control.Monad.Trans.Class
 
 -- vector
 import Data.Vector as Boxed.Vector
-  ( length, (!) )
+  ( length )
 
 -- unary-scheduling
 import Data.Lattice
@@ -126,10 +126,11 @@ import Data.Vector.Ranking
   ( Ranking(..) )
 import Schedule.Constraint
   ( Constraint
-    ( NotEarlierThan, NotLaterThan, Outside, Inside )
+    ( Outside, Inside )
   , HandedTimeConstraint
-    ( handedTimeConstraint )
+    ( handedTimeConstraint, handedEndpoint )
   , Constraints(..), Infeasible(..), applyConstraints
+  , Justification(..), BoundRule(..), HandedEndpoint(..)
   , BoundMove, boundMoved, Applied(..)
   , tighten, tightenWithPrecedences, tightenBecause
   )
@@ -318,11 +319,11 @@ propagateConstraints
   => taskData
   -> Int
   -> [ Propagator task t ]
-  -> ( ImmutableTaskInfos task t, Text, Maybe Text )
+  -> ( ImmutableTaskInfos task t, Seq ( Justification t ), Maybe ( Infeasible t ) )
 propagateConstraints taskData maxLoopIterations propagators =
   case runScheduleMonad taskData run of
-    ( updatedTasks, ( mbGaveUpText, Constraints { justifications } ) ) ->
-      ( updatedTasks, justifications, either Just ( const Nothing ) mbGaveUpText )
+    ( updatedTasks, ( mbInfeasible, Constraints { justifications } ) ) ->
+      ( updatedTasks, justifications, either Just ( const Nothing ) mbInfeasible )
   where
     run :: forall s. Trail s task t -> ScheduleMonad s task t ()
     run trail = do
@@ -541,9 +542,7 @@ prune = do
     task <- taskAvails `unsafeIndex` taskNb
     for_ ( pruneShorterThan ( taskDuration task ) ( taskAvailability task ) ) \ ( kept, removed ) ->
       constrain $ tighten taskNb ( Inside kept ) $
-        "The following time slots have been removed from \"" <> taskNames Boxed.Vector.! taskNb <> "\",\n\
-        \as they are too short to allow the task to complete:\n" <>
-        ( Text.pack ( show removed ) ) <> "\n\n"
+        SlotsTooShort { task = taskNb, removed }
   assign ( field' @"tasksModified" . DMap.dmat ( Coarse "prune" ) ) ( Just mempty )
 
 -- | Check time spans for which a task is necessarily scheduled, and remove them
@@ -592,11 +591,12 @@ timetable = do
             removedIntervals = necessaryIntervals /\ otherAvailability
           unless ( null $ intervals removedIntervals ) do
             constrain $ tighten otherTaskNb ( Outside necessaryIntervals ) $
-              "\"" <> taskNames Boxed.Vector.! taskNb <> "\" must be in progress during\n\
-              \  * " <> Text.pack ( show necessaryInterval ) <> "\n\
-              \As a result, the intervals \n\
-              \  * " <> Text.pack ( show removedIntervals ) <> "\n\
-              \have been removed from \"" <> taskNames Boxed.Vector.! otherTaskNb <> "\"\n\n"
+              MustBeInProgress
+                { duringTask  = taskNb
+                , necessary   = necessaryInterval
+                , blockedTask = otherTaskNb
+                , removed     = removedIntervals
+                }
 
 -------------------------------------------------------------------------------
 -- Global propagators.
@@ -638,30 +638,20 @@ precedenceMatrix = do
         let
           constraint :: Constraint t
           constraint = handedTimeConstraint limitTime
-          precedesOrSuccedes, afterOrBefore :: Text
-          ( precedesOrSuccedes, afterOrBefore )
-            | NotEarlierThan _ <- constraint
-            = ( "succedes", "after" )
-            | otherwise
-            = ( "precedes", "before" )
-          currentSubsetTaskNames :: Text
-          currentSubsetTaskNames =
-            foldMap
-              ( \ i -> "  * \"" <> taskNames Boxed.Vector.! i <> "\"\n" )
-              subsetTaskNbs
-          reason :: Text
-          reason =
-            "Precedence matrix: \"" <> taskNames Boxed.Vector.! taskNb <> "\" " <> precedesOrSuccedes <> " the following tasks:\n" <>
-            currentSubsetTaskNames <> "\n\
-            \As a result, \"" <> taskNames Boxed.Vector.! taskNb <> "\" must be scheduled " <> afterOrBefore <>
-            "  * " <> Text.pack ( show limitTime ) <> "\n\n"
+          subset :: IntSet
+          subset = IntSet.fromList subsetTaskNbs
         -- The bound rests on the matrix precedences between 'taskNb' and the
         -- subset; record them as the responsible subset (no new edge is added,
         -- the matrix already holds them).
         constrain $
           tightenBecause taskNb constraint
-            ( handedPrecedences @h ( IntSet.fromList subsetTaskNbs ) )
-            reason
+            ( handedPrecedences @h subset )
+            SubsetPrecedence
+              { rule          = PrecedenceMatrix
+              , task          = taskNb
+              , relatedSubset = subset
+              , newBound      = handedEndpoint @h limitTime
+              }
       | otherwise
       -- Loop over predecessors in increasing earliest start time / successors in decreasing latest completion time,
       -- to propagate information from the precedence matrix.
@@ -739,19 +729,12 @@ overloadCheck = do
           let
             culprit :: IntSet
             culprit = IntSet.fromList ( taskNb : seenTaskNbs )
-            currentTaskName, currentSubsetTaskNames :: Text
-            currentTaskName = taskNames Boxed.Vector.! taskNb
-            currentSubsetTaskNames =
-              foldMap
-                ( \ i -> "  * \"" <> taskNames Boxed.Vector.! i <> "\"\n" )
-                ( taskNb : seenTaskNbs )
-          throwError $ Overloaded culprit $
-            "Could not schedule tasks:\n\
-            \  - \"" <> currentTaskName <> "\" must complete by\n\
-            \      * " <> Text.pack ( show currentLCT ) <> "\n\
-            \  - the following set of tasks cannot complete before\n\
-            \      * " <> Text.pack ( show estimatedECT ) <> "\n"
-            <> currentSubsetTaskNames <> "\n"
+          throwError $ Overloaded
+            { bindingTask = taskNb
+            , bindingLCT  = currentLCT
+            , subsetECT   = estimatedECT
+            , culprit     = culprit
+            }
 
         go (j+1) (taskNb:seenTaskNbs)
 
@@ -859,31 +842,20 @@ detectablePrecedences = do
         -- Check that this succedence/precedence would induce a nontrivial constraint on the current task availability.
         when ( ( currentOuterTime /\ excludeCurrentTaskSubsetInnerTime ) /= currentOuterTime ) do
           let
-            currentTaskSubset :: Text
-            currentTaskSubset =
-              foldMap
-                ( \ tk -> "  * \"" <> taskNames Boxed.Vector.! tk <> "\"\n" )
-                otherTaskNbs
             constraint :: Constraint t
             constraint = handedTimeConstraint excludeCurrentTaskSubsetInnerTime
-            succedeOrPrecede, earlierOrLater :: Text
-            ( succedeOrPrecede, earlierOrLater )
-              | NotEarlierThan _ <- constraint
-              = ( "succede", "start after" )
-              | otherwise
-              = ( "precede", "end before" )
-            reason :: Text
-            reason =
-              "Precedence detected:\n" <>
-              "\"" <> taskNames Boxed.Vector.! taskNb <> "\" must " <> succedeOrPrecede <> " all of the following tasks:\n" <>
-              currentTaskSubset <>
-              "As a consequence, this task is constrained to " <> earlierOrLater <> "\n\
-              \  * " <> Text.pack ( show excludeCurrentTaskSubsetInnerTime ) <> "\n\n"
+            subset :: IntSet
+            subset = IntSet.fromList otherTaskNbs
           -- TODO: add precedence to precedence graph to avoid unnecessary duplication of effort.
           constrain $
             tightenWithPrecedences taskNb constraint
-              ( handedPrecedences @h $ IntSet.fromList otherTaskNbs )
-              reason
+              ( handedPrecedences @h subset )
+              SubsetPrecedence
+                { rule          = DetectablePrecedence
+                , task          = taskNb
+                , relatedSubset = subset
+                , newBound      = handedEndpoint @h excludeCurrentTaskSubsetInnerTime
+                }
       -- Continue to next iteration of outer loop.
       go ( i + 1 ) j otherTaskNbs
 
@@ -967,27 +939,20 @@ notExtremal = do
           )
           do
             let
-              subsetText :: Text
-              subsetText = foldMap ( \ tk -> "  * \"" <> taskNames Boxed.Vector.! tk <> "\"\n" ) currentSubset'
               constraint :: Constraint t
               constraint = handedTimeConstraint associatedOtherInnerTime
-              lastOrFirst, earlierOrLater :: Text
-              ( lastOrFirst, earlierOrLater )
-                | NotLaterThan _ <- constraint
-                = ( "last", "finish before" )
-                | otherwise
-                = ( "first", "start after" )
-              reason :: Text
-              reason =
-                "\"" <> taskNames Boxed.Vector.! currentTaskNb <> "\" cannot be scheduled " <> lastOrFirst <> " among the following tasks:\n" <>
-                subsetText <>
-                "As a consequence, the task is constrained to " <> earlierOrLater <> "\n\
-                \  * " <> Text.pack ( show associatedOtherInnerTime ) <> "\n\n"
-            -- The bound is an energetic consequence of the current subset's
-            -- bounds (no precedence edge is implied), so record the subset on
-            -- both sides as the responsible set.
-            let cs = IntSet.fromList currentSubset'
-            constrain $ tightenBecause currentTaskNb constraint ( cs, cs ) reason
+              -- The bound is an energetic consequence of the current subset's
+              -- bounds (no precedence edge is implied), so record the subset on
+              -- both sides as the responsible set.
+              cs :: IntSet
+              cs = IntSet.fromList currentSubset'
+            constrain $ tightenBecause currentTaskNb constraint ( cs, cs )
+              SubsetPrecedence
+                { rule          = NotExtremal
+                , task          = currentTaskNb
+                , relatedSubset = cs
+                , newBound      = handedEndpoint @oh associatedOtherInnerTime
+                }
 
       -- Next step of outer loop.
       go ( i + 1 ) j' currentSubset'
@@ -1148,26 +1113,16 @@ edgeFinding = do
             let
               constraint :: Constraint t
               constraint = handedTimeConstraint currentSubsetInnerTime
-              subsetText :: Text
-              subsetText = foldMapOf IntSet.members ( \ tk -> "  * \"" <> taskNames Boxed.Vector.! tk <> "\"\n" ) currentTaskSubset
-              afterOrBefore, laterOrEarlier :: Text
-              ( afterOrBefore, laterOrEarlier )
-                | NotEarlierThan _ <- constraint
-                = ( "after", "start after" )
-                | otherwise
-                = ( "before", "finish before" )
-              reason :: Text
-              reason =
-                "Edge found:\n" <>
-                "\"" <> taskNames Boxed.Vector.! blamedTaskNb <> "\" must be scheduled " <> afterOrBefore <> " all the following tasks:\n" <>
-                subsetText <>
-                "As a consequence, the task is constrained to " <> laterOrEarlier <> "\n\
-                \  * " <> Text.pack ( show currentSubsetInnerTime ) <> "\n\n"
             -- TODO: add precedence to precedence graph to avoid unnecessary duplication of effort.
             constrain $
               tightenWithPrecedences blamedTaskNb constraint
                 ( handedPrecedences @h currentTaskSubset )
-                reason
+                SubsetPrecedence
+                  { rule          = EdgeFinding
+                  , task          = blamedTaskNb
+                  , relatedSubset = currentTaskSubset
+                  , newBound      = handedEndpoint @h currentSubsetInnerTime
+                  }
           -- Continue to see if more activities can be removed.
           innerLoop j currentTaskSubset nextOtherOuterTime currentSubsetInnerTime subsetExtraInnerTime'
     innerLoop j currentTaskSubset _ _ _
@@ -1250,13 +1205,14 @@ makespan label taskNbs mkspans = do
             removedIntervals = avail /\ outsides
           unless ( null $ intervals removedIntervals ) do
             constrain $ tighten taskNb ( Outside outsides ) $
-              "The makespan constraint " <> Text.pack ( show mkspan ) <> ", " <> Text.pack ( show cap ) <> "\n\
-              \with label " <> label <> ",\n\
-              \prevents the task \"" <> taskNames Boxed.Vector.! taskNb <> "\"\n\
-              \from being scheduled before " <> Text.pack ( show latestStart ) <> " within the makespan interval.\n\
-              \As a result, the intervals \n\
-              \  * " <> Text.pack ( show removedIntervals ) <> "\n\
-              \have been removed from this task.\n\n"
+              MakespanRemoval
+                { makespanLabel    = label
+                , makespanInterval = mkspan
+                , makespanCap      = cap
+                , task             = taskNb
+                , makespanBound    = LatestBound latestStart
+                , removed          = removedIntervals
+                }
     -- Check whether we need to constrain tasks to not finish near the end of the makespan range,
     -- because the subset must be in progress near the start of the makespan range.
     unless ( isEmpty $ Interval ( start mkspan ) subsetLST ) do
@@ -1275,13 +1231,14 @@ makespan label taskNbs mkspans = do
             removedIntervals = avail /\ outsides
           unless ( null $ intervals removedIntervals ) do
             constrain $ tighten taskNb ( Outside outsides ) $
-              "The makespan constraint " <> Text.pack ( show mkspan ) <> ", " <> Text.pack ( show cap ) <> "\n\
-              \with label " <> label <> ",\n\
-              \prevents the task \"" <> taskNames Boxed.Vector.! taskNb <> "\"\n\
-              \from being scheduled after " <> Text.pack ( show earliestEnd ) <> " within the makespan interval.\n\
-              \As a result, the intervals \n\
-              \  * " <> Text.pack ( show removedIntervals ) <> "\n\
-              \have been removed from this task.\n\n"
+              MakespanRemoval
+                { makespanLabel    = label
+                , makespanInterval = mkspan
+                , makespanCap      = cap
+                , task             = taskNb
+                , makespanBound    = EarliestBound earliestEnd
+                , removed          = removedIntervals
+                }
 {-
 TODO: take into account internal fragmentation or un-schedulable gaps in the
 makespan calculation.

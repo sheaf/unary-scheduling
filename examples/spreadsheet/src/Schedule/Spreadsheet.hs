@@ -155,6 +155,8 @@ import qualified Codec.Xlsx as Xlsx
 -- unary-scheduling
 import Data.Lattice
   ( Meet(..) )
+import Schedule.Constraint
+  ( Infeasible, renderInfeasible, renderJustifications )
 import Schedule.Propagators
   ( propagateConstraints, propagationLoop, seedAllOf, Propagator(..), basicPropagators
   , makespan
@@ -273,11 +275,12 @@ scheduleSpreadsheet = do
       ( timeBox currentTimeZone startTime <>
       "Input:  " <> Text.pack inputPath <> "\n" <>
       "Output: " <> Text.pack outputPath <> "\n-------\n\n" <>
-      justifications
+      renderJustifications ( taskNames afterPropTasks ) justifications
       )
 
   -- Throw an error if scheduling has been found to be impossible.
-  for_ mbError \ err -> throwError ( NoSchedulingPossible err )
+  for_ mbError \ err ->
+    throwError ( NoSchedulingPossible ( renderInfeasible ( taskNames afterPropTasks ) err ) )
 
   -- Search the remaining possibilities (if search is enabled).
   finalTasks <-
@@ -298,7 +301,7 @@ scheduleSpreadsheet = do
             chain :: [ ( Int, Int ) ]
             chain = let order = map snd $ sortOn fst $ zip starts [ 0 .. ] in zip order ( drop 1 order )
             ti  :: ImmutableTaskInfos ( Set Staff ) Column
-            res :: Either Text ()
+            res :: Either ( Infeasible Column ) ()
             ( ti, ( res, _ ) ) =
               runScheduleMonad schedulingTasks
                 ( \ trail -> do
@@ -323,7 +326,8 @@ scheduleSpreadsheet = do
           case res of
             Left err ->
               throwError ( NoSchedulingPossible
-                ( "VERIFY FAILED: we rejected the Z3 schedule.\n\n" <> err ) )
+                ( "VERIFY FAILED: we rejected the Z3 schedule.\n\n"
+                  <> renderInfeasible ( taskNames ti ) err ) )
             Right ()
               | not ( null violators ) ->
                 throwError ( NoSchedulingPossible

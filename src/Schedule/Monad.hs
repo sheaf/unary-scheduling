@@ -17,7 +17,7 @@ import Control.Category
 import Control.Monad.ST
   ( ST, runST )
 import Data.Bifunctor
-  ( bimap, first )
+  ( bimap, second )
 import Data.Coerce
   ( coerce )
 import Data.Function
@@ -105,7 +105,7 @@ import Data.Vector.PhaseTransition
 import Data.Vector.Ranking
   ( rankOn )
 import Schedule.Constraint
-  ( Constraints, Infeasible, renderInfeasible, BoundMove )
+  ( Constraints, Infeasible, BoundMove )
 import Schedule.Interval
   ( Measurable )
 import Schedule.Ordering
@@ -184,13 +184,13 @@ runScheduleMonad
   => taskData
   -> ( forall s. Trail s task t -> ScheduleMonad s task t a )
       -- ^ Action to run. Supplied with a fresh 'Trail' for backtracking.
-  -> ( ImmutableTaskInfos task t, ( Either Text a, Constraints t ) )
+  -> ( ImmutableTaskInfos task t, ( Either ( Infeasible t ) a, Constraints t ) )
 runScheduleMonad givenTasks k = runST do
   mutableTaskInfos <- initialTaskData givenTasks
   trail            <- newTrail
   res <- k trail & ( ( `runReaderT` mutableTaskInfos ) >>> runExceptT >>> ( `runStateT` mempty ) )
   finalTaskData <- unsafeFreeze mutableTaskInfos
-  pure ( finalTaskData, bimap ( first renderInfeasible ) taskConstraints res )
+  pure ( finalTaskData, second taskConstraints res )
 
 constrain :: ( Measurable t, MonadState ( TaskUpdates t ) m ) => Constraints t -> m ()
 constrain s = modify' ( over ( field' @"taskConstraints" ) ( <> s ) )

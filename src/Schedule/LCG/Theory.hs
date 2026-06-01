@@ -1217,11 +1217,11 @@ buildInfeasibleConflict
   -> ST s ( Maybe SAT.Conflict )
 buildInfeasibleConflict t brs carvedSet inf
   | not ( useBoundAtoms t ) = case inf of
-      Overloaded    _ _     -> snapshotConflict t "overload"     Nothing
-      EmptyDomain   _ _ _ _ -> snapshotConflict t "empty-domain" Nothing
-      CycleDetected _ _     -> snapshotConflict t "cycle"        Nothing
+      Overloaded    {} -> snapshotConflict t "overload"     Nothing
+      EmptyDomain   {} -> snapshotConflict t "empty-domain" Nothing
+      CycleDetected {} -> snapshotConflict t "cycle"        Nothing
   | otherwise = case inf of
-      Overloaded culprit _ -> do
+      Overloaded { culprit } -> do
         mbLits <- checkedBoundLits t ( IntSet.toList culprit )
         case mbLits of
           Just lits -> do
@@ -1230,14 +1230,14 @@ buildInfeasibleConflict t brs carvedSet inf
             literalsAsConflict ( solver t ) ( map negateLit lits )
           -- A culprit's actual bound is not a reified, on-trail atom: fall back.
           Nothing   -> snapshotConflict t "overload" Nothing
-      EmptyDomain i lo hi _
+      EmptyDomain { emptiedTask = i, enforcedEarliest = lo, enforcedLatest = hi }
         -- A carved task's emptiness rests on non-ground interior holes (other
         -- tasks' compulsory parts), so its tight reason must additionally cite
         -- the carvers. If the gaps were in the ground instance, the two
         -- crossing atoms suffice.
         | IntSet.member i carvedSet -> carvedEmptyDomainConflict t brs i lo hi
         | otherwise                 -> emptyDomainConflict t brs i lo hi "empty-domain" []
-      CycleDetected _ _ -> snapshotConflict t "cycle" Nothing
+      CycleDetected {} -> snapshotConflict t "cycle" Nothing
 
 -- | Tight conflict for an emptied task @i@: its enforced earliest start @lo@ and
 -- latest completion @hi@ leave no slot. Cite @i@'s two crossing bound atoms

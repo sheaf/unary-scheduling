@@ -7,9 +7,11 @@ module Schedule.Constraint
   , HandedTimeConstraint(..)
   , Constraints(..)
   , Infeasible(..), renderInfeasible
+  , HandedEndpoint(..)
+  , Justification(..), BoundRule(..)
+  , renderJustification, renderJustifications
   , BoundMove(..), boundMoved
   , Applied(..)
-  , Reason
   , tighten, tightenWithPrecedences, tightenBecause, tightenMany
   , constrainToBefore, constrainToAfter
   , constrainToInside, constrainToOutside
@@ -30,8 +32,14 @@ import Data.IntMap.Strict
   ( IntMap )
 import qualified Data.IntMap.Strict as IntMap
   ( empty, singleton, fromList, unionWith, traverseWithKey )
+import qualified Data.IntSet as IntSet
+  ( toList )
 import Data.IntSet
   ( IntSet )
+import Data.Sequence
+  ( Seq )
+import qualified Data.Sequence as Seq
+  ( singleton )
 
 -- lens
 import Control.Lens
@@ -54,6 +62,10 @@ import qualified Data.Text as Text
   ( pack )
 
 -- vector
+import qualified Data.Vector as Boxed
+  ( Vector )
+import qualified Data.Vector as Boxed.Vector
+  ( (!) )
 import qualified Data.Vector.Mutable as Boxed.MVector
   ( unsafeRead )
 
@@ -65,11 +77,11 @@ import Data.Lattice
 import Data.Vector.Ranking
   ( reorderAfterIncrease, reorderAfterDecrease )
 import Schedule.Interval
-  ( Endpoint(..), Intervals(..), Measurable(..)
+  ( Endpoint(..), Interval, Intervals(..), Measurable(..)
   , cutBefore, cutAfter, remove
   )
 import Schedule.Ordering
-  ( addIncidentEdges, CycleInfo )
+  ( addIncidentEdges, CycleInfo(..) )
 import Schedule.Task
   ( Task(..), TaskInfos(..), MutableTaskInfos
   , est, lct, lst, ect
@@ -84,6 +96,7 @@ import Schedule.Time
     ( Earliest, Latest )
   , HandedTime
   , EarliestTime, LatestTime
+  , Delta
   )
 
 -------------------------------------------------------------------------------
@@ -140,7 +153,7 @@ instance Measurable t => Monoid ( Constraint t ) where
 data Constraints t
   = Constraints
   { constraints    :: !( IntMap ( Constraint t ) )
-  , justifications :: !Text
+  , justifications :: !( Seq ( Justification t ) )
   , -- | Per task precedences: the new predecessors and successors to add
     -- to the ordering matrix (so the precedence is reflected in the precedence graph).
     precedences    :: !( IntMap ( IntSet, IntSet ) )
@@ -161,29 +174,232 @@ instance Measurable t => Semigroup ( Constraints t ) where
 instance Measurable t => Monoid ( Constraints t ) where
   mempty = Constraints IntMap.empty mempty mempty mempty
 
+-- | An earliest-start or latest-completion bound. The propagators that emit
+-- these are handedness-polymorphic, so the tag records, at the value level,
+-- which kind of bound a structured explanation refers to.
+data HandedEndpoint t
+  = -- | A lower bound on a task's start: it may not begin earlier than this.
+    EarliestBound !( Endpoint ( EarliestTime t ) )
+  | -- | An upper bound on a task's completion: it must finish by this.
+    LatestBound   !( Endpoint ( LatestTime   t ) )
+
+deriving stock instance Show t => Show ( HandedEndpoint t )
+deriving stock instance Eq   t => Eq   ( HandedEndpoint t )
+
+-- | The propagation rule responsible for a subset-based bound tightening.
+data BoundRule
+  = -- | Propagation through the precedence matrix ('Schedule.Propagators.precedenceMatrix').
+    PrecedenceMatrix
+  | -- | Detectable precedences ('Schedule.Propagators.detectablePrecedences').
+    DetectablePrecedence
+  | -- | Not-first \/ not-last ('Schedule.Propagators.notExtremal').
+    NotExtremal
+  | -- | Edge finding ('Schedule.Propagators.edgeFinding').
+    EdgeFinding
+  deriving stock ( Eq, Show )
+
+-- | A structured, inspectable explanation for a single inference made during
+-- propagation.
+data Justification t
+  = -- | 'Schedule.Propagators.prune': time slots too short to fit @task@'s
+    -- duration were removed from it.
+    SlotsTooShort
+      { task    :: !Int
+      , removed :: !( Intervals t )
+      }
+  | -- | 'Schedule.Propagators.timetable': @duringTask@ is necessarily in
+    -- progress throughout @necessary@, so that interval is removed from
+    -- @blockedTask@.
+    MustBeInProgress
+      { duringTask  :: !Int
+      , necessary   :: !( Interval t )
+      , blockedTask :: !Int
+      , removed     :: !( Intervals t )
+      }
+  | -- | A subset-based bound tightening: @task@'s bound is moved to @newBound@
+    -- because of its ordering relation to @relatedSubset@, as established by
+    -- the given @rule@.
+    SubsetPrecedence
+      { rule          :: !BoundRule
+      , task          :: !Int
+      , relatedSubset :: !IntSet
+      , newBound      :: !( HandedEndpoint t )
+      }
+  | -- | 'Schedule.Propagators.makespan': a makespan constraint (with the given
+    -- @makespanLabel@, range @makespanInterval@ and capacity @makespanCap@)
+    -- forbids @task@ from being scheduled past @makespanBound@, removing the
+    -- @removed@ slots.
+    MakespanRemoval
+      { makespanLabel    :: !Text
+      , makespanInterval :: !( Interval t )
+      , makespanCap      :: !( Delta t )
+      , task             :: !Int
+      , makespanBound    :: !( HandedEndpoint t )
+      , removed          :: !( Intervals t )
+      }
+  | -- | A precedence @earlier ≺ later@ introduced directly by a search
+    -- decision ('Schedule.Precedence.addEdge').
+    SearchPrecedence
+      { earlier :: !Int
+      , later   :: !Int
+      }
+
+deriving stock instance Show t => Show ( Justification t )
+deriving stock instance Eq   t => Eq   ( Justification t )
+
 -- | A reason a scheduling instance was found infeasible during propagation.
+--
+-- Render using 'renderInfeasible'.
 data Infeasible t
-  = -- | @EmptyDomain i lo hi msg@: task @i@'s window was emptied by bound
-    -- tightening. @lo@ is the earliest start and @hi@ the latest completion
-    -- the constraint enforced; together they leave no schedulable slot. The
-    -- LCG theory cites @i@'s bound atoms at these thresholds.
-    EmptyDomain !Int !( Endpoint ( EarliestTime t ) ) !( Endpoint ( LatestTime t ) ) !Text
-  | -- | @Overloaded culprit msg@: the @culprit@ subset of tasks cannot all fit
-    -- on the unary resource between their collective earliest start and latest
-    -- completion.
-    Overloaded !IntSet !Text
-  | -- | @CycleDetected info msg@: adding a precedence created a cycle in the
-    -- ordering matrix.
-    CycleDetected !CycleInfo !Text
+  = -- | Task @emptiedTask@'s window was emptied by bound tightening.
+    EmptyDomain
+      { emptiedTask      :: !Int
+      , enforcedEarliest :: !( Endpoint ( EarliestTime t ) )
+      , enforcedLatest   :: !( Endpoint ( LatestTime   t ) )
+      }
+  | -- | The @culprit@ subset of tasks cannot all fit on the unary resource.
+    Overloaded
+      { bindingTask :: !Int
+      , bindingLCT  :: !( Endpoint ( LatestTime   t ) )
+      , subsetECT   :: !( Endpoint ( EarliestTime t ) )
+      , culprit     :: !IntSet
+      }
+  | -- | Adding the precedence @addedEdge@ (an @(earlier, later)@ index pair)
+    -- created a cycle in the ordering matrix.
+    CycleDetected
+      { cycleInfo :: !CycleInfo
+      , addedEdge :: !( Int, Int )
+      }
 
 deriving stock instance Show t => Show ( Infeasible t )
+deriving stock instance Eq   t => Eq   ( Infeasible t )
 
--- | The human-readable rendering carried by an 'Infeasible'.
-renderInfeasible :: Infeasible t -> Text
-renderInfeasible = \ case
-  EmptyDomain   _ _ _ msg -> msg
-  Overloaded    _ msg     -> msg
-  CycleDetected _ msg     -> msg
+--------------------------------------------------------------------------------
+-- Pretty-printing of structured explanations.
+
+-- | Look up a task's display name.
+renderTaskName :: Boxed.Vector Text -> Int -> Text
+renderTaskName names i = "\"" <> names Boxed.Vector.! i <> "\""
+
+-- | Render a subset of tasks as indented, quoted name lines.
+renderTaskSubset :: Boxed.Vector Text -> IntSet -> Text
+renderTaskSubset names =
+  foldMap ( \ i -> "  * " <> renderTaskName names i <> "\n" ) . IntSet.toList
+
+-- | Show the time carried by a 'HandedEndpoint'.
+renderHandedEndpoint :: Show t => HandedEndpoint t -> Text
+renderHandedEndpoint ( EarliestBound e ) = Text.pack ( show e )
+renderHandedEndpoint ( LatestBound   l ) = Text.pack ( show l )
+
+-- | Render a human-readable explanation for an infeasibility.
+renderInfeasible :: Show t => Boxed.Vector Text -> Infeasible t -> Text
+renderInfeasible names = \ case
+  EmptyDomain { emptiedTask, enforcedEarliest, enforcedLatest } ->
+    "Task " <> renderTaskName names emptiedTask <>
+    " can no longer be scheduled: its availability has been reduced to the empty set\n\
+    \(enforced earliest start " <> Text.pack ( show enforcedEarliest ) <>
+    ", latest completion " <> Text.pack ( show enforcedLatest ) <> ").\n"
+  Overloaded { bindingTask, bindingLCT, subsetECT, culprit } ->
+    "Could not schedule tasks:\n\
+    \  - " <> renderTaskName names bindingTask <> " must complete by\n\
+    \      * " <> Text.pack ( show bindingLCT ) <> "\n\
+    \  - the following set of tasks cannot complete before\n\
+    \      * " <> Text.pack ( show subsetECT ) <> "\n" <>
+    renderTaskSubset names culprit <> "\n"
+  CycleDetected { cycleInfo, addedEdge = ( start, end ) } ->
+    let edge =
+          "  - " <> renderTaskName names start <> "\n\
+          \  before\n\
+          \  - " <> renderTaskName names end <> "\n\n"
+    in case cycleInfo of
+      SelfCycle i ->
+        "Cycle involving " <> renderTaskName names i <>
+        " detected after adding the precedence:\n" <> edge
+      DoubleCycle i j ->
+        "Cycle between " <> renderTaskName names i <> " and " <> renderTaskName names j <>
+        " detected after adding the precedence:\n" <> edge
+
+-- | Render a sequence of inference explanations, in order.
+renderJustifications :: Show t => Boxed.Vector Text -> Seq ( Justification t ) -> Text
+renderJustifications names = foldMap ( renderJustification names )
+
+-- | Render a human-readable explanation for a single inference.
+renderJustification :: Show t => Boxed.Vector Text -> Justification t -> Text
+renderJustification names = \ case
+  SlotsTooShort { task, removed } ->
+    "The following time slots have been removed from " <> renderTaskName names task <> ",\n\
+    \as they are too short to allow the task to complete:\n" <>
+    Text.pack ( show removed ) <> "\n\n"
+  MustBeInProgress { duringTask, necessary, blockedTask, removed } ->
+    renderTaskName names duringTask <> " must be in progress during\n\
+    \  * " <> Text.pack ( show necessary ) <> "\n\
+    \As a result, the intervals \n\
+    \  * " <> Text.pack ( show removed ) <> "\n\
+    \have been removed from " <> renderTaskName names blockedTask <> "\n\n"
+  SubsetPrecedence { rule, task, relatedSubset, newBound } ->
+    renderSubsetPrecedence names rule task relatedSubset newBound
+  MakespanRemoval { makespanLabel, makespanInterval, makespanCap, task, makespanBound, removed } ->
+    let beforeOrAfter = case makespanBound of
+          LatestBound   {} -> "before"
+          EarliestBound {} -> "after"
+    in "The makespan constraint " <> Text.pack ( show makespanInterval ) <> ", " <> Text.pack ( show makespanCap ) <> "\n\
+       \with label " <> makespanLabel <> ",\n\
+       \prevents the task " <> renderTaskName names task <> "\n\
+       \from being scheduled " <> beforeOrAfter <> " " <> renderHandedEndpoint makespanBound <> " within the makespan interval.\n\
+       \As a result, the intervals \n\
+       \  * " <> Text.pack ( show removed ) <> "\n\
+       \have been removed from this task.\n\n"
+  SearchPrecedence { earlier, later } ->
+    "Search decision has introduced the precedence:\n" <>
+    renderTaskName names earlier <> " < " <> renderTaskName names later <> "\n\n"
+
+-- | Render a subset-based bound tightening, choosing the phrasing from the rule
+-- and the direction (earlier \/ later) from the new bound.
+renderSubsetPrecedence
+  :: Show t
+  => Boxed.Vector Text
+  -> BoundRule -- ^ rule that generated the tightening (affects phrasing only)
+  -> Int -- ^ task
+  -> IntSet -- ^ subset
+  -> HandedEndpoint t -- ^ new bound
+  -> Text
+renderSubsetPrecedence names rule task subset newBound =
+  case rule of
+    PrecedenceMatrix ->
+      let ( verb, direction ) = case newBound of
+            EarliestBound {} -> ( "succedes", "after"  )
+            LatestBound   {} -> ( "precedes", "before" )
+      in "Precedence matrix: " <> name <> " " <> verb <> " the following tasks:\n" <>
+         renderTaskSubset names subset <> "\n\
+         \As a result, " <> name <> " must be scheduled " <> direction <>
+         "  * " <> bound <> "\n\n"
+    DetectablePrecedence ->
+      let ( verb, direction ) = case newBound of
+            EarliestBound {} -> ( "succede", "start after" )
+            LatestBound   {} -> ( "precede", "end before"  )
+      in "Precedence detected:\n" <> name <> " must " <> verb <> " all of the following tasks:\n" <>
+         renderTaskSubset names subset <>
+         "As a consequence, this task is constrained to " <> direction <> "\n\
+         \  * " <> bound <> "\n\n"
+    NotExtremal ->
+      let ( position, direction ) = case newBound of
+            LatestBound   {} -> ( "last",  "finish before" )
+            EarliestBound {} -> ( "first", "start after"   )
+      in name <> " cannot be scheduled " <> position <> " among the following tasks:\n" <>
+         renderTaskSubset names subset <>
+         "As a consequence, the task is constrained to " <> direction <> "\n\
+         \  * " <> bound <> "\n\n"
+    EdgeFinding ->
+      let ( relation, direction ) = case newBound of
+            EarliestBound {} -> ( "after",  "start after"   )
+            LatestBound   {} -> ( "before", "finish before" )
+      in "Edge found:\n" <> name <> " must be scheduled " <> relation <> " all the following tasks:\n" <>
+         renderTaskSubset names subset <>
+         "As a consequence, the task is constrained to " <> direction <> "\n\
+         \  * " <> bound <> "\n\n"
+  where
+    name  = renderTaskName names task
+    bound = renderHandedEndpoint newBound
 
 -- | How a task's earliest start \/ latest completion moved when a constraint
 -- was applied.
@@ -237,21 +453,17 @@ data Applied = Applied
 --------------------------------------------------------------------------------
 -- Smart constructors for emitting constraints.
 
--- | A human-readable explanation for an inference.
---
--- TODO: turn into a structured clausal reason for lazy clause generation.
-type Reason = Text
-
--- | Constrain a single task, recording the reason for the inference.
+-- | Constrain a single task, recording a structured explanation for the
+-- inference.
 --
 -- Records no responsible subset, so the LCG theory falls back to a coarse
 -- reason for the resulting bound literal. Use 'tightenBecause' (no new edges)
 -- or 'tightenWithPrecedences' (new edges) when the subset is known.
-tighten :: Int -> Constraint t -> Reason -> Constraints t
-tighten taskNb ct reason =
+tighten :: Int -> Constraint t -> Justification t -> Constraints t
+tighten taskNb ct justification =
   Constraints
     { constraints    = IntMap.singleton taskNb ct
-    , justifications = reason
+    , justifications = Seq.singleton justification
     , precedences    = mempty
     , boundReasons   = mempty
     }
@@ -259,11 +471,11 @@ tighten taskNb ct reason =
 -- | Like 'tighten', but also adds the task's new predecessors and successors
 -- to the precedence graph (and records them as the bound's responsible
 -- subset).
-tightenWithPrecedences :: Int -> Constraint t -> ( IntSet, IntSet ) -> Reason -> Constraints t
-tightenWithPrecedences taskNb ct precs reason =
+tightenWithPrecedences :: Int -> Constraint t -> ( IntSet, IntSet ) -> Justification t -> Constraints t
+tightenWithPrecedences taskNb ct precs justification =
   Constraints
     { constraints    = IntMap.singleton taskNb ct
-    , justifications = reason
+    , justifications = Seq.singleton justification
     , precedences    = IntMap.singleton taskNb precs
     , boundReasons   = IntMap.singleton taskNb precs
     }
@@ -274,21 +486,22 @@ tightenWithPrecedences taskNb ct precs reason =
 -- Used by propagators whose inference rests on a subset of tasks that does not
 -- correspond to fresh precedence edges (the precedence-matrix and
 -- not-first\/not-last propagators).
-tightenBecause :: Int -> Constraint t -> ( IntSet, IntSet ) -> Reason -> Constraints t
-tightenBecause taskNb ct why reason =
+tightenBecause :: Int -> Constraint t -> ( IntSet, IntSet ) -> Justification t -> Constraints t
+tightenBecause taskNb ct why justification =
   Constraints
     { constraints    = IntMap.singleton taskNb ct
-    , justifications = reason
+    , justifications = Seq.singleton justification
     , precedences    = mempty
     , boundReasons   = IntMap.singleton taskNb why
     }
 
--- | Constrain several tasks at once, with a shared reason and no precedence information.
-tightenMany :: [ ( Int, Constraint t ) ] -> Reason -> Constraints t
-tightenMany cts reason =
+-- | Constrain several tasks at once, with no recorded explanation or precedence
+-- information.
+tightenMany :: [ ( Int, Constraint t ) ] -> Constraints t
+tightenMany cts =
   Constraints
     { constraints    = IntMap.fromList cts
-    , justifications = reason
+    , justifications = mempty
     , precedences    = mempty
     , boundReasons   = mempty
     }
@@ -343,9 +556,11 @@ applyConstraint trail taskInfos@( TaskInfos { taskAvails } ) i ( Constraint { ..
   when ( null ( intervals taskAvailability ) ) $
     let lo = maybe est0 ( /\ est0 ) notEarlierThan
         hi = maybe lct0 ( /\ lct0 ) notLaterThan
-    in throwError $ EmptyDomain i lo hi $
-      "Task #" <> Text.pack ( show i ) <>
-      " can no longer be scheduled: its availability has been reduced to the empty set.\n"
+    in throwError $ EmptyDomain
+         { emptiedTask      = i
+         , enforcedEarliest = lo
+         , enforcedLatest   = hi
+         }
   -- 'Inside'\/'Outside' moves are interval surgery (potential gap carving), so
   -- they count as jumps; the lower\/upper cuts carry their own exact\/jumped
   -- status. A task is /carved/ iff an 'Inside'\/'Outside' tightening applied.
@@ -366,10 +581,16 @@ class HandedTimeConstraint (h :: Handedness) where
   --   - @Earliest t@ : @NotEarlierThan t@
   --   - @Latest t@ : @NotLaterThan t@.
   handedTimeConstraint :: Measurable t => Endpoint (HandedTime h t) -> Constraint t
+  -- | Tag a handed time at the value level, for structured explanations:
+  --   - @Earliest t@ : 'EarliestBound'
+  --   - @Latest t@ : 'LatestBound'.
+  handedEndpoint :: Endpoint (HandedTime h t) -> HandedEndpoint t
 instance HandedTimeConstraint Earliest where
   handedTimeConstraint endpoint = NotEarlierThan endpoint
+  handedEndpoint       endpoint = EarliestBound  endpoint
 instance HandedTimeConstraint Latest   where
   handedTimeConstraint endpoint = NotLaterThan   endpoint
+  handedEndpoint       endpoint = LatestBound    endpoint
 
 -- | Apply the constraint: task must begin after the specified time.
 constrainToAfter

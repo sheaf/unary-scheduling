@@ -52,6 +52,8 @@ import qualified Data.Text as Text
   ( pack )
 
 -- unary-scheduling
+import Schedule.Constraint
+  ( renderInfeasible )
 import Schedule.Interval
   ( Clusivity(..), Endpoint(..), Interval(..)
   , Measurable, mkIntervals
@@ -63,7 +65,7 @@ import Schedule.Monitor
 import Schedule.Propagators
   ( basicPropagators, propagateConstraints )
 import Schedule.Task
-  ( ImmutableTaskInfos, Task(..) )
+  ( ImmutableTaskInfos, Task(..), taskNames )
 import Schedule.Time
   ( Delta(..), Time(..), HandedTime(..) )
 
@@ -108,7 +110,7 @@ data PropOutcome = PropOutcome
 runPropOnly :: Instance -> PropOutcome
 runPropOnly inst =
   case propagateConstraints inst 1000 basicPropagators of
-    ( ti, _, mbErr ) -> PropOutcome ti mbErr
+    ( ti, _, mbErr ) -> PropOutcome ti ( renderInfeasible ( taskNames ti ) <$> mbErr )
 
 -------------------------------------------------------------------------------
 -- Instance generators.
