@@ -139,7 +139,7 @@ data TaskUpdates t
   , -- | Per task, how its earliest start \/ latest completion bound moved as
     -- constraints were applied this pass (exact vs jumped); the LCG theory uses
     -- this to promote bound literals with tight or coarse reasons.
-    tightenedBounds :: !( IntMap ( BoundMove, BoundMove ) )
+    tightenedBounds :: !( IntMap ( Maybe BoundMove, Maybe BoundMove ) )
   , -- | Tasks /carved/ this pass (an 'Schedule.Constraint.Inside'\/
     -- 'Schedule.Constraint.Outside' tightening applied), which may introduce
     -- non-ground interior gaps.
@@ -150,10 +150,8 @@ data TaskUpdates t
 instance Measurable t => Semigroup ( TaskUpdates t ) where
   TaskUpdates cts1 mods1 tb1 cv1 <> TaskUpdates cts2 mods2 tb2 cv2 =
     TaskUpdates ( cts1 <> cts2 ) ( mods1 <> mods2 )
-      ( IntMap.unionWith bothMoves tb1 tb2 )
+      ( IntMap.unionWith (<>) tb1 tb2 )
       ( cv1 <> cv2 )
-    where
-      bothMoves ( a, b ) ( c, d ) = ( a <> c, b <> d )
 instance Measurable t => Monoid ( TaskUpdates t ) where
   mempty = TaskUpdates mempty mempty mempty mempty
 

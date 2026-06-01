@@ -37,6 +37,8 @@ import Data.Functor.Identity
   ( Identity(..) )
 import Data.Kind
   ( Type )
+import Data.Maybe
+  ( isJust )
 import Data.Semigroup
   ( Arg(..) )
 import Data.Foldable
@@ -131,7 +133,7 @@ import Schedule.Constraint
     ( handedTimeConstraint, handedEndpoint )
   , Constraints(..), Infeasible(..), applyConstraints
   , Justification(..), BoundRule(..), HandedEndpoint(..)
-  , BoundMove, boundMoved, Applied(..)
+  , BoundMove, Applied(..)
   , tighten, tightenWithPrecedences, tightenBecause
   )
 import Schedule.Interval
@@ -421,12 +423,13 @@ propagationLoop mon maxRounds trail propagators seed = do
       else do
         applied <- applyConstraints trail cts
         let
-          -- How each task's bounds moved (exact vs jumped), for the LCG layer.
-          moves :: IntMap ( BoundMove, BoundMove )
+          -- How each task's bounds moved (exact vs jumped, or not at all), for
+          -- the LCG layer.
+          moves :: IntMap ( Maybe BoundMove, Maybe BoundMove )
           moves = fmap ( \ a -> ( estMove a, lctMove a ) ) applied
           -- Whether each bound moved at all, for waking subscriptions.
           bools :: IntMap ( Bool, Bool )
-          bools = fmap ( \ ( e, l ) -> ( boundMoved e, boundMoved l ) ) moves
+          bools = fmap ( \ ( e, l ) -> ( isJust e, isJust l ) ) moves
           -- Tasks whose interior was carved this pass.
           carved :: IntSet
           carved = IntMap.keysSet ( IntMap.filter wasCarved applied )
@@ -444,15 +447,13 @@ propagationLoop mon maxRounds trail propagators seed = do
           -- Reset constraints: they have been applied.
           $ set  ( field' @"taskConstraints" . field' @"constraints" ) mempty
           -- Accumulate how each task's bounds moved (exact vs jumped).
-          . over ( field' @"tightenedBounds" ) ( IntMap.unionWith bothMoves moves )
+          . over ( field' @"tightenedBounds" ) ( IntMap.unionWith (<>) moves )
           -- Remember which tasks were carved.
           . over ( field' @"carvedTasks" ) ( carved <> )
           -- Broadcast which tasks have been newly modified to the subscriptions
           -- of the propagators that should wake on them.
           . over ( field' @"tasksModified" ) ( broadcastModifications toNotify bools )
         pure True
-      where
-        bothMoves ( a, b ) ( c, d ) = ( a <> c, b <> d )
 
 -- | The \"all tasks pending\" value for a subscription (seeding the initial run).
 fullValue :: Notifiee n -> IntSet -> n

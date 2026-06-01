@@ -10,7 +10,7 @@ module Schedule.Constraint
   , HandedEndpoint(..)
   , Justification(..), BoundRule(..)
   , renderJustification, renderJustifications
-  , BoundMove(..), boundMoved
+  , BoundMove(..)
   , Applied(..)
   , tighten, tightenWithPrecedences, tightenBecause, tightenMany
   , constrainToBefore, constrainToAfter
@@ -409,43 +409,22 @@ renderSubsetPrecedence names rule task subset newBound =
 -- precisely and the bound literal can carry a tight, local reason. A /jumped/
 -- move skips over a gap to the next available slot; the antecedents only entail
 -- the cut endpoint, with the jump justified by the availability structure (a
--- ground fact for an /instance/ gap, but not for a propagator-carved one — see
--- 'wasCarved').
+-- ground fact for an /instance/ gap, but not for a propagator-carved one).
 data BoundMove
-  = -- | The bound did not change.
-    Unmoved
-  | -- | The bound moved exactly onto the cut endpoint.
+  = -- | The bound moved exactly onto the cut endpoint.
     MovedExact
   | -- | The bound jumped past the cut endpoint to the next available slot.
     MovedJumped
   deriving stock ( Eq, Show )
 
--- | Whether the bound moved at all.
-boundMoved :: BoundMove -> Bool
-boundMoved Unmoved = False
-boundMoved _       = True
-
--- | Combines two moves on the /same/ bound: 'Unmoved' is the identity; two
--- exact moves stay exact (two clean cuts to ever-tighter endpoints); any jump
--- makes the combination a jump (conservative).
 instance Semigroup BoundMove where
-  Unmoved     <> y           = y
-  x           <> Unmoved     = x
-  MovedExact  <> MovedExact  = MovedExact
-  _           <> _           = MovedJumped
+  MovedExact <> MovedExact = MovedExact
+  _          <> _          = MovedJumped
 
-instance Monoid BoundMove where
-  mempty = Unmoved
-
--- | The result of applying a task's accumulated constraint: how each bound
--- moved, and whether the task was /carved/ — i.e. an 'Inside'\/'Outside'
--- tightening was applied, which can introduce interior gaps that are not part
--- of the ground instance structure. A later cut that jumps over such a gap is
--- not soundly explained by the energetic antecedents alone, so the LCG theory
--- falls back to a coarse reason for jumped moves on carved tasks.
+-- | The result of applying a task's accumulated constraint.
 data Applied = Applied
-  { estMove   :: !BoundMove
-  , lctMove   :: !BoundMove
+  { estMove   :: !( Maybe BoundMove )
+  , lctMove   :: !( Maybe BoundMove )
   , wasCarved :: !Bool
   }
   deriving stock Show
@@ -536,7 +515,7 @@ applyConstraint
   -> Int
   -> Constraint t
   -> m Applied
-applyConstraint _ _ _ NoConstraint = pure ( Applied Unmoved Unmoved False )
+applyConstraint _ _ _ NoConstraint = pure ( Applied Nothing Nothing False )
 applyConstraint trail taskInfos@( TaskInfos { taskAvails } ) i ( Constraint { .. } ) = do
   -- The pre-tightening bounds, so an emptied window can report the exact
   -- earliest-start \/ latest-completion the constraint enforced.
@@ -545,8 +524,8 @@ applyConstraint trail taskInfos@( TaskInfos { taskAvails } ) i ( Constraint { ..
       lct0 = lct task0
   -- apply 'constrain to inside' first (useful in case restriction is not checked)
   ( l1, r1 ) <- fromMaybe ( False, False ) <$> traverse ( constrainToInside  trail taskInfos i ) inside
-  l2         <- fromMaybe Unmoved          <$> traverse ( constrainToAfter   trail taskInfos i ) notEarlierThan
-  r2         <- fromMaybe Unmoved          <$> traverse ( constrainToBefore  trail taskInfos i ) notLaterThan
+  l2         <- fromMaybe Nothing          <$> traverse ( constrainToAfter   trail taskInfos i ) notEarlierThan
+  r2         <- fromMaybe Nothing          <$> traverse ( constrainToBefore  trail taskInfos i ) notLaterThan
   ( l3, r3 ) <- fromMaybe ( False, False ) <$> traverse ( constrainToOutside trail taskInfos i ) outside
   -- If tightening reduces a task's availability to the empty set, report the
   -- infeasibility immediately instead of letting other propagators spin on
@@ -570,9 +549,9 @@ applyConstraint trail taskInfos@( TaskInfos { taskAvails } ) i ( Constraint { ..
     , wasCarved = isJust inside || isJust outside
     }
   where
-    jumpIf :: Bool -> BoundMove
-    jumpIf True  = MovedJumped
-    jumpIf False = Unmoved
+    jumpIf :: Bool -> Maybe BoundMove
+    jumpIf True  = Just MovedJumped
+    jumpIf False = Nothing
 
 -------------------------------------------------------------------------------
 
@@ -601,7 +580,7 @@ constrainToAfter
   -> MutableTaskInfos s task t
   -> Int
   -> Endpoint ( EarliestTime t )
-  -> m BoundMove
+  -> m ( Maybe BoundMove )
 constrainToAfter trail tis@( TaskInfos { taskAvails, rankingEST, rankingECT } ) taskNo t = do
   task@(Task { taskAvailability }) <- Boxed.MVector.unsafeRead taskAvails taskNo
   let
@@ -614,9 +593,12 @@ constrainToAfter trail tis@( TaskInfos { taskAvails, rankingEST, rankingECT } ) 
     reorderAfterIncrease ( rankSwapper trail tis ( Ordered ByECT ) ) ( rankSwapper trail tis ( Ranks ByECT ) ) taskAvails rankingECT ect taskNo
     -- Exact iff the new earliest start lands on the cut endpoint; otherwise the
     -- cut fell in a gap and the start jumped to the next available slot.
-    pure ( if est newTask == canonicalEarliest t then MovedExact else MovedJumped )
+    pure $ Just $
+      if est newTask == canonicalEarliest t
+      then MovedExact
+      else MovedJumped
   else
-    pure Unmoved
+    pure Nothing
 
 -- | Apply the constraint: task must end before the specified time.
 constrainToBefore
@@ -627,7 +609,7 @@ constrainToBefore
   -> MutableTaskInfos s task t
   -> Int
   -> Endpoint ( LatestTime t )
-  -> m BoundMove
+  -> m ( Maybe BoundMove )
 constrainToBefore trail tis@( TaskInfos { taskAvails, rankingLCT, rankingLST } ) taskNo t = do
   task@(Task { taskAvailability }) <- Boxed.MVector.unsafeRead taskAvails taskNo
   let
@@ -639,9 +621,12 @@ constrainToBefore trail tis@( TaskInfos { taskAvails, rankingLCT, rankingLST } )
     reorderAfterDecrease ( rankSwapper trail tis ( Ordered ByLCT ) ) ( rankSwapper trail tis ( Ranks ByLCT ) ) taskAvails rankingLCT lct taskNo
     reorderAfterDecrease ( rankSwapper trail tis ( Ordered ByLST ) ) ( rankSwapper trail tis ( Ranks ByLST ) ) taskAvails rankingLST lst taskNo
     -- Exact iff the new latest completion lands on the cut endpoint.
-    pure ( if lct newTask == canonicalLatest t then MovedExact else MovedJumped )
+    pure $ Just $
+      if lct newTask == canonicalLatest t
+      then MovedExact
+      else MovedJumped
   else
-    pure Unmoved
+    pure Nothing
 
 -- | Remove intervals from the domain of availability of a task.
 constrainToOutside

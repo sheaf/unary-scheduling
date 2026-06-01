@@ -58,7 +58,7 @@ import Data.Coerce
 import Data.Foldable
   ( for_, toList )
 import Data.Maybe
-  ( catMaybes )
+  ( catMaybes, isJust )
 import Data.Traversable
   ( for )
 
@@ -120,7 +120,7 @@ import SAT.Clause
 import qualified SAT.Solver as SAT
 import Schedule.Constraint
   ( Constraints(..), Infeasible(..)
-  , BoundMove(..), boundMoved
+  , BoundMove(..)
   , constrainToAfter, constrainToBefore
   )
 import Schedule.Interval
@@ -743,7 +743,7 @@ channelBound t task l pol = do
   else do
     -- Wake every propagator on this task next round, but only if the domain
     -- actually moved: a no-op re-drain must not re-trigger the full sweep.
-    when ( boundMoved moved ) ( markBoundDirty t task )
+    when ( isJust moved ) ( markBoundDirty t task )
     pure Nothing
 
 -- | Add a pair of task indices to the precedence-dirty set so the next
@@ -1067,13 +1067,13 @@ channelOutBounds
   :: forall mode s task t
   .  ( Num t, Measurable t, Bounded t, MonitorMode mode )
   => Theory mode s task t
-  -> IntMap ( BoundMove, BoundMove )  -- ^ per task, how @(est, lct)@ moved
+  -> IntMap ( Maybe BoundMove, Maybe BoundMove )  -- ^ per task, how @(est, lct)@ moved
   -> IntMap ( IntSet, IntSet )        -- ^ per task, responsible subset @(est side, lct side)@
   -> IntSet                           -- ^ carved tasks (jumps on these get coarse reasons)
   -> ST s ( Maybe SAT.Conflict )
 channelOutBounds t deltas brs carvedSet = goTasks ( IntMap.toList deltas )
   where
-    goTasks :: [ ( Int, ( BoundMove, BoundMove ) ) ] -> ST s ( Maybe SAT.Conflict )
+    goTasks :: [ ( Int, ( Maybe BoundMove, Maybe BoundMove ) ) ] -> ST s ( Maybe SAT.Conflict )
     goTasks [] = pure Nothing
     goTasks ( ( i, ( estMv, lctMv ) ) : rest ) = do
       ok <- SAT.isOk ( solver t )
@@ -1102,7 +1102,7 @@ channelOutBounds t deltas brs carvedSet = goTasks ( IntMap.toList deltas )
 assertEstBound
   :: forall mode s task t
   .  ( Num t, Measurable t, Bounded t, MonitorMode mode )
-  => Theory mode s task t -> Int -> BoundMove -> IntSet -> Bool -> ST s ( Maybe SAT.Conflict )
+  => Theory mode s task t -> Int -> Maybe BoundMove -> IntSet -> Bool -> ST s ( Maybe SAT.Conflict )
 assertEstBound t i mv why iCarved =
   assertMovedBound t mv iCarved ( currentEstLit t i ) i ( IntSet.toList why )
 
@@ -1110,7 +1110,7 @@ assertEstBound t i mv why iCarved =
 assertLctBound
   :: forall mode s task t
   .  ( Num t, Measurable t, Bounded t, MonitorMode mode )
-  => Theory mode s task t -> Int -> BoundMove -> IntSet -> Bool -> ST s ( Maybe SAT.Conflict )
+  => Theory mode s task t -> Int -> Maybe BoundMove -> IntSet -> Bool -> ST s ( Maybe SAT.Conflict )
 assertLctBound t i mv why iCarved =
   assertMovedBound t mv iCarved ( currentLctLit t i ) i ( IntSet.toList why )
 
@@ -1121,16 +1121,16 @@ assertMovedBound
   :: forall mode s task t
   .  ( Num t, Measurable t, Bounded t, MonitorMode mode )
   => Theory mode s task t
-  -> BoundMove
+  -> Maybe BoundMove
   -> Bool          -- ^ is the task carved?
   -> ST s Lit      -- ^ how to obtain (and intern) the bound literal
   -> Int           -- ^ the constrained task
   -> [ Int ]       -- ^ the responsible subset
   -> ST s ( Maybe SAT.Conflict )
 assertMovedBound t mv iCarved getLit i subset = case mv of
-  Unmoved     -> pure Nothing
-  MovedExact  -> do lit <- getLit; reason <- boundPropReason t lit i subset; assertBatch t lit reason
-  MovedJumped -> do
+  Nothing          -> pure Nothing
+  Just MovedExact  -> do lit <- getLit; reason <- boundPropReason t lit i subset; assertBatch t lit reason
+  Just MovedJumped -> do
     lit <- getLit
     -- A jump over an instance gap is ground (sound); a jump on a carved task
     -- may cross a non-ground carved gap, so explain it coarsely.
