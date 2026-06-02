@@ -20,7 +20,7 @@ module Main ( main ) where
 
 -- base
 import Control.Exception
-  ( evaluate )
+  ( SomeException, evaluate, try )
 import Control.Monad
   ( forM, forM_ )
 import Data.Word
@@ -185,10 +185,61 @@ sizeSweeps = do
   sweep "infeasible bin-packing fragmentation (overload-free; search-hard)"
     [ ( "copies=" ++ show c ++ " (" ++ show ( 5 * c ) ++ " songs)"
       , Instances.infeasibleRehearsalInstance c )
-    | c <- [ 1, 2 ] -- c=3 takes minutes
+    | c <- [ 1, 2, 3 ]
     ]
   detailReport "infeasible bin-packing fragmentation, copies=2"
     ( Instances.infeasibleRehearsalInstance 2 )
+
+  budgetSweep "budget sensitivity — infeasible (search-hard)"
+    [ Just 0, Just 4, Just 8, Just 16, Just 32, Just 64 ]
+    (  [ ( "pigeonhole slots=" ++ show m, Instances.intervalPigeonholeInstance m 2 )
+       | m <- [ 5, 6 ] ]
+    ++ [ ( "bin-packing copies=" ++ show c, Instances.infeasibleRehearsalInstance c )
+       | c <- [ 1, 2, 3 ] ]
+    ++ [ ( "oversized " ++ show n ++ "-bin (heterog.)", Instances.fragmentationInstance items n )
+       | ( n, items ) <- [ ( 3, [ 6, 7, 8, 9 ] )
+                         , ( 4, [ 6, 7, 8, 9, 10 ] )
+                         , ( 5, [ 6, 6, 7, 7, 8, 9 ] )
+                         , ( 6, [ 6, 6, 7, 7, 8, 8, 9 ] )
+                         ] ]
+    )
+  budgetSweep "budget sensitivity — feasible (must not regress)"
+    [ Nothing, Just 64, Just 16, Just 8, Just 0 ]
+    (  [ ( "rehearsal d=5 s=20 sd=" ++ show sd, Instances.rehearsalInstance 0.9 0.6 5 20 8 sd )
+       | sd <- [ 7, 11 ] ]
+    ++ [ ( "tight-feasible d=6 s=24 sd=" ++ show sd, Instances.rehearsalInstance 1.0 0.4 6 24 8 sd )
+       | sd <- [ 1, 2, 3, 5, 9 ] ]
+    ++ [ ( "clique n=12", Instances.tightCliqueInstance 12 2 ) ]
+    )
+
+budgetSweep :: String -> [ Maybe Int ] -> [ ( String, Instance ) ] -> IO ()
+budgetSweep title budgets sizes = do
+  printf "%s:\n" title
+  printf "  %-26s" ( "size" :: String )
+  forM_ budgets \ b -> printf " %-13s" ( budgetLabel b )
+  putStrLn "  verdict"
+  forM_ sizes \ ( lbl, inst ) -> do
+    _ <- evaluate ( force inst )
+    cells <- forM budgets \ b -> do
+      r <- try @SomeException
+             ( measureOff ( defaultSearchOptions { optTheoryDecideBudget = b } ) inst )
+      pure $ case r of
+        Left  _            -> ( "CRASH", "CRASH" :: String )
+        Right ( time, res ) ->
+          ( verdict res, printf "%s/%dc" ( fmtNs time ) ( numConflicts ( stats res ) ) )
+    let verdicts = map fst cells
+        tag = case verdicts of
+          []         -> "?"
+          ( v0 : _ ) | all ( == v0 ) verdicts -> v0
+                     | otherwise              -> "DISAGREE " ++ show verdicts
+    printf "  %-26s" lbl
+    forM_ cells \ ( _, c ) -> printf " %-13s" c
+    printf "  %s\n" tag
+  putStrLn ""
+  where
+    budgetLabel Nothing  = "none(struct)"
+    budgetLabel ( Just 0 ) = "0(VSIDS)"
+    budgetLabel ( Just k ) = "b=" ++ show k
 
 -- | Run the default configuration over a family of sizes, printing the
 -- search-tree node counts (and the tight\/coarse conflict split) per size.

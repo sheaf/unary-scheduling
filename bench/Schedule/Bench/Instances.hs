@@ -20,6 +20,7 @@ module Schedule.Bench.Instances
   , tightCliqueInstance
   , intervalPigeonholeInstance
   , infeasibleRehearsalInstance
+  , fragmentationInstance
   )
   where
 
@@ -282,24 +283,41 @@ intervalPigeonholeInstance numSlots dur =
            ( Endpoint ( EarliestTime ( Time ( BenchTime lo ) ) )           Inclusive )
            ( Endpoint ( LatestTime   ( Time ( BenchTime ( lo + dur ) ) ) ) Inclusive )
 
+-- | A bin-packing fragmentation instance: the given /item sizes/ must each be
+-- placed whole into one of @numBins@ length-10 days (a task cannot straddle a
+-- day boundary), and no two items may overlap within a day. Infeasible exactly
+-- when the multiset of items does not pack into the days. The wide inter-day gap
+-- (@dayGap >= dayLen@) keeps the convex envelope loose, so global energetic
+-- overload never fires and the infeasibility can only be found by search.
+--
+-- The item sizes are arbitrary, so heterogeneous (non-symmetric) infeasible
+-- instances are expressible — see 'infeasibleRehearsalInstance' for the
+-- symmetric copy-of-a-gadget special case.
+fragmentationInstance
+  :: [ Int ]   -- ^ item sizes
+  -> Int       -- ^ number of length-10 days (bins)
+  -> Instance
+fragmentationInstance itemSizes numBins =
+  [ multiDayTask [ 0 .. numBins - 1 ] dayLen dayGap sz
+      ( Text.pack ( "frag" ++ show idx ++ "_" ++ show sz ) )
+  | ( idx, sz ) <- zip [ 0 :: Int .. ] itemSizes
+  ]
+  where
+    dayLen, dayGap :: Int
+    dayLen = 10
+    dayGap = 10   -- >= dayLen: convex envelope dwarfs windowed capacity
+
 -- | A multi-day rehearsal that is infeasible but that requires genuine search
--- to prove so.
+-- to prove so: @numCopies@ symmetric copies of the five-song fragmentation
+-- gadget @[8,7,6,5,4]@ (total 30 per copy, needing four length-10 days) sharing
+-- @3 * numCopies@ days.
 infeasibleRehearsalInstance
   :: Int   -- ^ number of copies of the five-song fragmentation gadget (@>= 1@)
   -> Instance
 infeasibleRehearsalInstance numCopies =
-  [ multiDayTask [ 0 .. numBins - 1 ] dayLen dayGap sz
-      ( Text.pack ( "bp" ++ show c ++ "_" ++ show sz ) )
-  | c  <- [ 0 .. numCopies - 1 ]
-  , sz <- itemSizes
-  ]
-  where
-    itemSizes :: [ Int ]
-    itemSizes = [ 8, 7, 6, 5, 4 ]   -- per copy: total 30, but needs four length-10 days
-    numBins, dayLen, dayGap :: Int
-    numBins = 3 * numCopies
-    dayLen  = 10
-    dayGap  = 10                    -- >= dayLen: convex envelope dwarfs windowed capacity
+  fragmentationInstance
+    ( concat ( replicate numCopies [ 8, 7, 6, 5, 4 ] ) )
+    ( 3 * numCopies )
 
 -- | An instance that's deliberately overloaded: @n@ tasks each of
 -- duration @dur@ over a window of @floor (n * dur / 2)@ — total demand

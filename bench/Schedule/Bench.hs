@@ -107,10 +107,9 @@ benchmarks =
                ( intervalPigeonholeInstance m 2 )
       | m <- [ 3, 4, 5, 6 ]
       ]
-    -- Capped at 2 for runtime: copies=3's search is exponential (minutes).
   , bgroup "infeasible: bin-packing fragmentation (overload-free; search-hard)"
       [ triple ( "copies=" ++ show c ++ " (" ++ show ( 5 * c ) ++ " songs, " ++ show ( 3 * c ) ++ " days)" )
                ( infeasibleRehearsalInstance c )
-      | c <- [ 1, 2 ]
+      | c <- [ 1, 2, 3 ]
       ]
   ]

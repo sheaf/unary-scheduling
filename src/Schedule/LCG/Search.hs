@@ -96,6 +96,11 @@ data SearchOptions = SearchOptions
     --
     -- Ensures we prioritise structural decisions to avoid VSIDS hijacking.
     optTheoryDecide   :: !Bool
+  , -- | Conflict budget for the structural heuristic.
+    --
+    -- TODO: this is a temporary stopgap until proper restart-based alteration
+    -- and conflict directed re-ordering/conflict-ordering search are implemented.
+    optTheoryDecideBudget :: !( Maybe Int )
   }
 
 defaultSearchOptions :: SearchOptions
@@ -105,6 +110,7 @@ defaultSearchOptions = SearchOptions
   , optBoundAtoms     = True
   , optBoundDecisions = True
   , optTheoryDecide   = True
+  , optTheoryDecideBudget = Just 16 -- TODO: revisit
   }
 
 -------------------------------------------------------------------------------
@@ -167,7 +173,8 @@ lcgSearch opts props givenTasks = runST do
   -- Allocate scheduler state and theory in one go.
   tis    <- initialTaskData @taskData @task @t givenTasks
   theory <- newTheory @mode tis props ( optPropRounds opts )
-              ( optBoundAtoms opts ) ( optBoundDecisions opts ) ( optTheoryDecide opts )
+              ( optBoundAtoms opts ) ( optBoundDecisions opts )
+              ( optTheoryDecide opts ) ( optTheoryDecideBudget opts )
 
   -- Drive the DPLL(T) loop. Its first iteration runs the propagators on
   -- the starting state, seeding any unconditional inferences before the

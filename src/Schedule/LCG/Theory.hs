@@ -196,6 +196,13 @@ data Theory mode s task t = Theory
   , -- | Whether 'theoryDecide' proposes structural day-assignment decisions
     -- ahead of VSIDS. Only meaningful together with 'useBoundDecisions'.
     useTheoryDecide :: !Bool
+  , -- | Conflict budget for 'theoryDecide': once the cumulative conflict count
+    -- reaches this many, 'theoryDecide' abstains for the rest of the search so
+    -- VSIDS takes over the decision stream. 'Nothing' never hands off. See
+    -- 'Schedule.LCG.Search.optTheoryDecideBudget'.
+    --
+    -- TODO: render this obsolete.
+    theoryDecideBudget :: !( Maybe Int )
   , -- | Per gappy task, its day-assignment decision atoms in ascending threshold
     -- order (the positive literal @start ≤ boundary@), as seeded by
     -- 'seedDecisionBounds'. Read by 'theoryDecide' for first-fail day branching;
@@ -251,8 +258,9 @@ newTheory
   -> Bool                         -- ^ channel out tight bound reasons (learning)?
   -> Bool                         -- ^ branch on day-assignment bound atoms?
   -> Bool                         -- ^ use the structural day-assignment decision heuristic?
+  -> Maybe Int                    -- ^ conflict budget after which 'theoryDecide' hands off to VSIDS
   -> ST s ( Theory mode s task t )
-newTheory tis props rounds boundAtomsOn boundDecisionsOn theoryDecideOn = do
+newTheory tis props rounds boundAtomsOn boundDecisionsOn theoryDecideOn theoryDecideBudgetN = do
   s     <- SAT.newSolver
   let nT  = Boxed.Vector.length ( taskNames tis )
       !nA = ( nT * ( nT - 1 ) ) `shiftR` 1
@@ -289,6 +297,7 @@ newTheory tis props rounds boundAtomsOn boundDecisionsOn theoryDecideOn = do
         , useBoundAtoms   = boundAtomsOn
         , useBoundDecisions = boundDecisionsOn
         , useTheoryDecide = theoryDecideOn
+        , theoryDecideBudget = theoryDecideBudgetN
         , decisionBounds  = db
         , theoryHead      = th
         , levelMarks      = lms
@@ -415,11 +424,17 @@ theoryDecide
 theoryDecide t
   | not ( useTheoryDecide t ) = pure Nothing
   | otherwise = do
-      dbs  <- readMutVar ( decisionBounds t )
-      best <- foldM considerTask Nothing ( IntMap.toList dbs )
-      case best of
-        Just ( _, _, lit ) -> pure ( Just lit )
-        Nothing            -> criticalPair t
+      overBudget <- case theoryDecideBudget t of
+        Nothing -> pure False
+        Just k  -> ( >= k ) <$> SAT.numConflicts ( solver t )
+      if overBudget
+      then pure Nothing   -- hand off to VSIDS: the structural dive has turned into a refutation.
+      else do
+        dbs  <- readMutVar ( decisionBounds t )
+        best <- foldM considerTask Nothing ( IntMap.toList dbs )
+        case best of
+          Just ( _, _, lit ) -> pure ( Just lit )
+          Nothing            -> criticalPair t
   where
     -- Keep the most-constrained candidate (fewest remaining intervals).
     considerTask
