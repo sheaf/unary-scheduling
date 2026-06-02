@@ -84,6 +84,7 @@ module SAT.Solver
   , trailAt
   , litValue
   , decide
+  , decideVar
   , propagate
   , analyse
   , cancelUntil
@@ -1465,6 +1466,27 @@ decide s = do
   where
     isUnassigned :: Var -> m Bool
     isUnassigned v = ( LUndef == ) <$> valueOf s v
+
+-- | Branch on a /specific/ variable, returning the literal with its saved phase
+-- (defaulting to positive). 'Nothing' if the variable is already assigned.
+--
+-- Unlike 'decide', this neither consults the VSIDS heap nor counts the decision
+-- (the caller is expected to count it via 'countDecision'), so a theory
+-- heuristic can propose any variable — e.g. one chosen by conflict-ordering —
+-- while still honouring phase saving. The variable need not be removed from the
+-- VSIDS heap: 'decide' filters out already-assigned variables, and 'cancelUntil'
+-- reinserts it once it becomes unassigned again.
+decideVar
+  :: forall m
+  .  PrimMonad m
+  => Solver ( PrimState m ) -> Var -> m ( Maybe Lit )
+decideVar s v = do
+  val <- valueOf s v
+  case val of
+    LUndef -> do
+      pol <- Growable.read ( phase s ) ( varIndex v )
+      pure ( Just ( mkLit v pol ) )
+    _ -> pure Nothing
 
 -------------------------------------------------------------------------------
 -- Search driver.

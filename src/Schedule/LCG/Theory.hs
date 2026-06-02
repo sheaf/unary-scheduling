@@ -41,6 +41,9 @@ module Schedule.LCG.Theory
   , theoryPropagate
     -- * Structural decision heuristic
   , theoryDecide
+    -- * Conflict-ordering search
+  , noteDecision
+  , recordConflict
     -- * Inspection
   , numPrecedenceDecisions
 #ifdef DEBUG
@@ -119,7 +122,7 @@ import qualified Data.Vector.Primitive.Mutable as Primitive
 
 -- unary-scheduling
 import SAT.Base
-  ( Var, Lit, LBool(..)
+  ( Var(..), Lit, LBool(..)
   , Polarity(Positive, Negative)
   , negateLit, litVar, varIndex
   )
@@ -204,13 +207,21 @@ data Theory mode s task t = Theory
   , -- | Whether 'theoryDecide' proposes structural day-assignment decisions
     -- ahead of VSIDS. Only meaningful together with 'useBoundDecisions'.
     useTheoryDecide :: !Bool
-  , -- | Conflict budget for 'theoryDecide': once the cumulative conflict count
-    -- reaches this many, 'theoryDecide' abstains for the rest of the search so
-    -- VSIDS takes over the decision stream. 'Nothing' never hands off. See
-    -- 'Schedule.LCG.Search.optTheoryDecideBudget'.
-    --
-    -- TODO: render this obsolete.
-    theoryDecideBudget :: !( Maybe Int )
+  , -- | Whether 'theoryDecide' applies /conflict-ordering search/ ahead of its
+    -- structural choice: revisit the decision variable most recently found
+    -- to be a conflict culprit before resuming the base order.
+    useConflictOrdering :: !Bool
+  , -- | Monotone conflict counter ticked by 'recordConflict'; supplies the
+    -- recency stamp for conflict-ordering.
+    conflictClock :: !( MutVar s Int )
+  , -- | Per decision variable (by 'varIndex'), the 'conflictClock' value at which
+    -- it was last a conflict culprit. Higher = more recent. Entries persist
+    -- across restarts (recency is global); 'conflictOrderingPick' skips those
+    -- whose variable is currently assigned.
+    conflictStamps :: !( MutVar s ( IntMap Int ) )
+  , -- | The variable of the most recent branching decision (its culprit on the
+    -- next conflict, by last-conflict reasoning).
+    lastDecision :: !( MutVar s ( Maybe Var ) )
   , -- | Per gappy task, its day-assignment decision atoms in ascending threshold
     -- order (the positive literal @start ≤ boundary@), as seeded by
     -- 'seedDecisionBounds'. Read by 'theoryDecide' for first-fail day branching;
@@ -266,9 +277,9 @@ newTheory
   -> Bool                         -- ^ channel out tight bound reasons (learning)?
   -> Bool                         -- ^ branch on day-assignment bound atoms?
   -> Bool                         -- ^ use the structural day-assignment decision heuristic?
-  -> Maybe Int                    -- ^ conflict budget after which 'theoryDecide' hands off to VSIDS
+  -> Bool                         -- ^ use conflict-ordering search in 'theoryDecide'?
   -> ST s ( Theory mode s task t )
-newTheory tis props rounds boundAtomsOn boundDecisionsOn theoryDecideOn theoryDecideBudgetN = do
+newTheory tis props rounds boundAtomsOn boundDecisionsOn theoryDecideOn conflictOrderingOn = do
   s     <- SAT.newSolver
   let nT  = Boxed.Vector.length ( taskNames tis )
       !nA = ( nT * ( nT - 1 ) ) `shiftR` 1
@@ -289,6 +300,9 @@ newTheory tis props rounds boundAtomsOn boundDecisionsOn theoryDecideOn theoryDe
   cv    <- newMutVar IntSet.empty
   tpc   <- newMutVar 0
   db    <- newMutVar mempty
+  cclk  <- newMutVar 0
+  cstmp <- newMutVar mempty
+  ldec  <- newMutVar Nothing
   -- Snapshot ground availabilities now, before any propagation mutates them.
   gav   <- Boxed.Vector.generateM nT \ i ->
              taskAvailability <$> Boxed.MVector.unsafeRead ( taskAvails tis ) i
@@ -305,7 +319,10 @@ newTheory tis props rounds boundAtomsOn boundDecisionsOn theoryDecideOn theoryDe
         , useBoundAtoms   = boundAtomsOn
         , useBoundDecisions = boundDecisionsOn
         , useTheoryDecide = theoryDecideOn
-        , theoryDecideBudget = theoryDecideBudgetN
+        , useConflictOrdering = conflictOrderingOn
+        , conflictClock   = cclk
+        , conflictStamps  = cstmp
+        , lastDecision    = ldec
         , decisionBounds  = db
         , theoryHead      = th
         , levelMarks      = lms
@@ -432,17 +449,17 @@ theoryDecide
 theoryDecide t
   | not ( useTheoryDecide t ) = pure Nothing
   | otherwise = do
-      overBudget <- case theoryDecideBudget t of
-        Nothing -> pure False
-        Just k  -> ( >= k ) <$> SAT.numConflicts ( solver t )
-      if overBudget
-      then pure Nothing   -- hand off to VSIDS: the structural dive has turned into a refutation.
-      else do
-        dbs  <- readMutVar ( decisionBounds t )
-        best <- foldM considerTask Nothing ( IntMap.toList dbs )
-        case best of
-          Just ( _, _, lit ) -> pure ( Just lit )
-          Nothing            -> criticalPair t
+      -- Conflict-ordering first: revisit the most recent unsettled culprit.
+      mbCos <- if useConflictOrdering t then conflictOrderingPick t else pure Nothing
+      case mbCos of
+        Just lit -> pure ( Just lit )
+        Nothing  -> do
+          -- Base order: day-assignment first-fail, then critical-pair sequencing.
+          dbs  <- readMutVar ( decisionBounds t )
+          best <- foldM considerTask Nothing ( IntMap.toList dbs )
+          case best of
+            Just ( _, _, lit ) -> pure ( Just lit )
+            Nothing            -> criticalPair t
   where
     -- Keep the most-constrained candidate (fewest remaining intervals).
     considerTask
@@ -469,6 +486,55 @@ theoryDecide t
       case v of
         LUndef -> pure ( Just l )
         _      -> firstUndecided ls
+
+-------------------------------------------------------------------------------
+-- Conflict-ordering search (Gay, Hartert & Schaus, CP 2015).
+
+-- | Record the variable just branched on, so the next conflict can blame it.
+--
+-- No-op unless conflict-ordering is enabled.
+noteDecision :: Theory mode s task t -> Lit -> ST s ()
+noteDecision t lit =
+  when ( useConflictOrdering t ) $
+    writeMutVar ( lastDecision t ) ( Just ( litVar lit ) )
+
+-- | Record that a conflict just occurred: stamp the most recent decision
+-- variable (the conflict's culprit, by last-conflict reasoning) with a fresh
+-- 'conflictClock' tick, so 'conflictOrderingPick' will revisit it first once it
+-- is unassigned again.
+--
+-- No-op unless conflict-ordering is enabled.
+recordConflict :: Theory mode s task t -> ST s ()
+recordConflict t =
+  when ( useConflictOrdering t ) $ do
+    mbV <- readMutVar ( lastDecision t )
+    case mbV of
+      Nothing -> pure ()
+      Just v  -> do
+        clk <- readMutVar ( conflictClock t )
+        let !clk' = clk + 1
+        writeMutVar ( conflictClock t ) clk'
+        modifyMutVar' ( conflictStamps t ) ( IntMap.insert ( varIndex v ) clk' )
+
+-- | The most-recently-stamped currently unassigned decision variable.
+conflictOrderingPick
+  :: forall mode s task t. Theory mode s task t -> ST s ( Maybe Lit )
+conflictOrderingPick t = do
+  stamps <- readMutVar ( conflictStamps t )
+  fmap snd <$> foldM step Nothing ( IntMap.toList stamps )
+  where
+    -- Track the @(clock, literal)@ of the best unassigned culprit so far. Only
+    -- probe a variable's assignment (via 'decideVar') when its stamp could beat
+    -- the incumbent.
+    step :: Maybe ( Int, Lit ) -> ( Int, Int ) -> ST s ( Maybe ( Int, Lit ) )
+    step best ( vi, clk ) =
+      case best of
+        Just ( bclk, _ ) | clk <= bclk -> pure best
+        _ -> do
+          mbLit <- SAT.decideVar ( solver t ) ( Var vi )
+          pure $ case mbLit of
+            Just lit -> Just ( clk, lit )
+            Nothing  -> best
 
 {-# INLINABLE criticalPair #-}
 
@@ -1490,12 +1556,7 @@ literalsAsConflict label s body = do
     longer   -> Just . SAT.ConflictClause <$> SAT.recordTheoryClause s longer
 
 #ifdef DEBUG
--- | DEBUG check on a theory conflict body: verify it mentions at least one
--- literal at the current decision level — the precondition 'SAT.analyse' relies
--- on for 1-UIP. A violation means a theory rule reported a conflict that was
--- already inconsistent at a strictly lower level (so it should have fired
--- earlier, when that level was current). Panic with the rule @label@ and the
--- body's per-literal value\/level, so the culprit rule is immediately named.
+-- | Verify a conflict mentions at least one literal at the current decision level.
 --
 -- An empty body is a genuine ground-level inconsistency (handled by 'markFalse',
 -- never passed to 'analyse') and is exempt.

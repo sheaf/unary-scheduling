@@ -52,14 +52,16 @@ import qualified Schedule.Bench.Instances as Instances
 -------------------------------------------------------------------------------
 -- Configuration under test.
 
--- | The fixed instance for the A\/B matrix. The multi-day rehearsal target is
--- where day-assignment decisions are designed to help and where we currently
--- trail Z3, so it is the most informative instance for the role comparison.
+-- | The fixed instance for the A\/B matrix. A near-boundary feasible rehearsal
+-- that /forces conflicts/ (≈38 under the pure structural dive), so the
+-- decision-strategy knobs (restart alternation, conflict-ordering) actually
+-- diverge — a slacker instance solves at 0 conflicts and makes every structural
+-- configuration identical.
 theInstance :: Instance
-theInstance = Instances.rehearsalInstance 0.9 0.6 8 20 8 7
+theInstance = Instances.rehearsalInstance 1.0 0.4 6 24 8 9
 
 instanceLabel :: String
-instanceLabel = "rehearsalInstance util=0.9 avail=0.6 days=8 songs=20 maxDur=8 seed=7"
+instanceLabel = "rehearsalInstance util=1.0 avail=0.4 days=6 songs=24 maxDur=8 seed=9 (forces conflicts)"
 
 -- | Timing iterations (per-run statistics are deterministic and measured once;
 -- only the wall-clock minimum is repeated).
@@ -73,14 +75,14 @@ data Cfg = Cfg
   , cfgOpts  :: !SearchOptions
   }
 
+-- | Decision-strategy configurations.
 abConfigs :: [ Cfg ]
 abConfigs =
-  [ -- Too slow
-    -- Cfg "precedence-only" base { optBoundAtoms = False, optBoundDecisions = False, optTheoryDecide = False }
-    Cfg "+learning"       base { optBoundAtoms = True , optBoundDecisions = False, optTheoryDecide = False }
-  , Cfg "+day (VSIDS)"    base { optBoundAtoms = False, optBoundDecisions = True , optTheoryDecide = False }
-  , Cfg "+both (VSIDS)"   base { optBoundAtoms = True , optBoundDecisions = True , optTheoryDecide = False }
-  , Cfg "+both +struct"   base { optBoundAtoms = True , optBoundDecisions = True , optTheoryDecide = True  }
+  [ Cfg "struct (no restart)" base { optRestartUnit = 0, optAlternateSearch = False, optConflictOrdering = False }
+  , Cfg "+restart+alt"        base { optAlternateSearch = True , optConflictOrdering = False }
+  , Cfg "+COS (no alt)"       base { optAlternateSearch = False, optConflictOrdering = True }
+  , Cfg "default (alt+COS)"   base
+  , Cfg "VSIDS only"          base { optTheoryDecide = False }
   ]
   where
     base = defaultSearchOptions
@@ -143,9 +145,9 @@ abMatrix = do
       cfgLabel ( fmtNs t ) ( verdict res )
       ( numDecisions st ) ( numConflicts st ) ( numLearnts st ) ( numTheoryPropagations st )
   putStrLn ""
-  putStrLn "default-config (+both +struct) instrumentation:"
+  putStrLn "default-config (alt+COS) instrumentation:"
   -- One instrumented solve, just for the detailed report (cheap on this config).
-  case [ cfgOpts c | c <- abConfigs, cfgLabel c == "+both +struct" ] of
+  case [ cfgOpts c | c <- abConfigs, cfgLabel c == "default (alt+COS)" ] of
     ( dfltOpts : _ ) -> do
       rep <- evaluate ( force ( lcgSearch @MonitoringOn dfltOpts basicPropagators theInstance ) )
       putStr ( renderReport ( monitorReport rep ) )
@@ -190,12 +192,13 @@ sizeSweeps = do
   detailReport "infeasible bin-packing fragmentation, copies=2"
     ( Instances.infeasibleRehearsalInstance 2 )
 
-  budgetSweep "budget sensitivity — infeasible (search-hard)"
-    [ Just 0, Just 4, Just 8, Just 16, Just 32, Just 64 ]
+  -- The no-restart structural baseline ('structOpts') is the old behaviour; it
+  -- blows up on bin-packing copies=3 (~minutes), so that column is omitted there.
+  strategySweep "decision strategy — infeasible (search-hard)"
     (  [ ( "pigeonhole slots=" ++ show m, Instances.intervalPigeonholeInstance m 2 )
        | m <- [ 5, 6 ] ]
     ++ [ ( "bin-packing copies=" ++ show c, Instances.infeasibleRehearsalInstance c )
-       | c <- [ 1, 2, 3 ] ]
+       | c <- [ 1, 2 ] ]
     ++ [ ( "oversized " ++ show n ++ "-bin (heterog.)", Instances.fragmentationInstance items n )
        | ( n, items ) <- [ ( 3, [ 6, 7, 8, 9 ] )
                          , ( 4, [ 6, 7, 8, 9, 10 ] )
@@ -203,8 +206,7 @@ sizeSweeps = do
                          , ( 6, [ 6, 6, 7, 7, 8, 8, 9 ] )
                          ] ]
     )
-  budgetSweep "budget sensitivity — feasible (must not regress)"
-    [ Nothing, Just 64, Just 16, Just 8, Just 0 ]
+  strategySweep "decision strategy — feasible (must not regress)"
     (  [ ( "rehearsal d=5 s=20 sd=" ++ show sd, Instances.rehearsalInstance 0.9 0.6 5 20 8 sd )
        | sd <- [ 7, 11 ] ]
     ++ [ ( "tight-feasible d=6 s=24 sd=" ++ show sd, Instances.rehearsalInstance 1.0 0.4 6 24 8 sd )
@@ -212,19 +214,30 @@ sizeSweeps = do
     ++ [ ( "clique n=12", Instances.tightCliqueInstance 12 2 ) ]
     )
 
-budgetSweep :: String -> [ Maybe Int ] -> [ ( String, Instance ) ] -> IO ()
-budgetSweep title budgets sizes = do
+strategyConfigs :: [ ( String, SearchOptions ) ]
+strategyConfigs =
+  [ ( "struct(no-rs)", defaultSearchOptions { optRestartUnit = 0, optAlternateSearch = False, optConflictOrdering = False } )
+  , ( "alt(no-COS)",   defaultSearchOptions { optConflictOrdering = False } )
+  , ( "default",       defaultSearchOptions )
+  , ( "VSIDS",         defaultSearchOptions { optTheoryDecide = False } )
+  ]
+
+-- | Run every 'strategyConfigs' column on each instance, holding propagators and
+-- learning fixed, printing @time/conflicts@ per cell. The trailing tag is the
+-- verdict, with @DISAGREE@ if the columns do not all agree (a correctness red
+-- flag), or @CRASH@ for a column that threw.
+strategySweep :: String -> [ ( String, Instance ) ] -> IO ()
+strategySweep title sizes = do
   printf "%s:\n" title
   printf "  %-26s" ( "size" :: String )
-  forM_ budgets \ b -> printf " %-13s" ( budgetLabel b )
+  forM_ strategyConfigs \ ( lbl, _ ) -> printf " %-15s" lbl
   putStrLn "  verdict"
   forM_ sizes \ ( lbl, inst ) -> do
     _ <- evaluate ( force inst )
-    cells <- forM budgets \ b -> do
-      r <- try @SomeException
-             ( measureOff ( defaultSearchOptions { optTheoryDecideBudget = b } ) inst )
+    cells <- forM strategyConfigs \ ( _, opts ) -> do
+      r <- try @SomeException ( measureOff opts inst )
       pure $ case r of
-        Left  _            -> ( "CRASH", "CRASH" :: String )
+        Left  _             -> ( "CRASH", "CRASH" :: String )
         Right ( time, res ) ->
           ( verdict res, printf "%s/%dc" ( fmtNs time ) ( numConflicts ( stats res ) ) )
     let verdicts = map fst cells
@@ -233,13 +246,9 @@ budgetSweep title budgets sizes = do
           ( v0 : _ ) | all ( == v0 ) verdicts -> v0
                      | otherwise              -> "DISAGREE " ++ show verdicts
     printf "  %-26s" lbl
-    forM_ cells \ ( _, c ) -> printf " %-13s" c
+    forM_ cells \ ( _, c ) -> printf " %-15s" c
     printf "  %s\n" tag
   putStrLn ""
-  where
-    budgetLabel Nothing  = "none(struct)"
-    budgetLabel ( Just 0 ) = "0(VSIDS)"
-    budgetLabel ( Just k ) = "b=" ++ show k
 
 -- | Run the default configuration over a family of sizes, printing the
 -- search-tree node counts (and the tight\/coarse conflict split) per size.
