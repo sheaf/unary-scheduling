@@ -80,7 +80,8 @@ common common
   ghc-options:
     -O2
     -fspecialise-aggressively
-    -fexpose-all-unfoldings
+    -fexpose-overloaded-unfoldings
+    -fpolymorphic-specialisation
     -Wall
     -Wcompat
     -fwarn-missing-local-signatures
@@ -312,7 +313,6 @@ benchmark unary-scheduling-sat-bench
          >= 0.3   && < 0.5
 
   ghc-options:
-    -O2
     -threaded
 
 flag inspect-dumps
@@ -342,9 +342,6 @@ executable lcg-inspect
       unary-scheduling
     , random
          >= 1.2   && < 1.4
-
-  ghc-options:
-    -O2
 
   if flag(inspect-dumps)
     ghc-options:

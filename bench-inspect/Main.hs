@@ -27,6 +27,8 @@ import Data.Word
   ( Word64 )
 import GHC.Clock
   ( getMonotonicTimeNSec )
+import System.Environment
+  ( getArgs )
 import Text.Printf
   ( printf )
 
@@ -124,12 +126,39 @@ measureOff opts inst = do
 
 main :: IO ()
 main = do
-  _ <- evaluate ( force theInstance )
-  printf "=== unary-scheduling LCG inspection harness ===\n\n"
+  args <- getArgs
+  case args of
+    -- Focused profiling entry point: solve a single named anchor instance once,
+    -- on the real (uninstrumented) default-config path, so a cost-centre profile
+    -- is attributable to that one workload. Usage: lcg-inspect prof <name>.
+    ( "prof" : rest ) -> mapM_ profRun ( if null rest then [ "d6s24", "copies2" ] else rest )
+    _ -> do
+      _ <- evaluate ( force theInstance )
+      printf "=== unary-scheduling LCG inspection harness ===\n\n"
 
-  abMatrix
-  putStrLn ""
-  sizeSweeps
+      abMatrix
+      putStrLn ""
+      sizeSweeps
+
+-- | Select among some representative instances for a profiling run.
+profInstance :: String -> Instance
+profInstance "d6s24"   = Instances.rehearsalInstance 1.0 0.4 6 24 8 9
+profInstance "copies2" = Instances.infeasibleRehearsalInstance 2
+profInstance other     = error ( "lcg-inspect prof: unknown instance " ++ show other )
+
+-- | Solve one anchor instance once, on the uninstrumented default path, forcing
+-- the result. Prints the node counts so the profile can be read against them.
+profRun :: String -> IO ()
+profRun name = do
+  let inst = profInstance name
+  _   <- evaluate ( force inst )
+  t0  <- getMonotonicTimeNSec
+  res <- evaluate ( force ( lcgSearch @MonitoringOff defaultSearchOptions basicPropagators inst ) )
+  t1  <- getMonotonicTimeNSec
+  let st = stats res
+  printf "%-8s %-11s %-11s dec=%d conf=%d learnt=%d tprop=%d\n"
+    name ( fmtNs ( t1 - t0 ) ) ( verdict res )
+    ( numDecisions st ) ( numConflicts st ) ( numLearnts st ) ( numTheoryPropagations st )
 
 -- | The bound-atom role A\/B matrix on 'theInstance'.
 abMatrix :: IO ()

@@ -262,7 +262,6 @@ data Theory mode s task t = Theory
     monitor         :: !( Monitor mode s )
   }
 
-{-# INLINABLE newTheory #-}
 {-# SPECIALISE newTheory @MonitoringOff #-}
 
 -- | Allocate a fresh 'Theory' for the given scheduler state and propagators.
@@ -430,8 +429,6 @@ numPrecedenceDecisions t = do
 -------------------------------------------------------------------------------
 -- Structural decision heuristic.
 
-{-# INLINABLE theoryDecide #-}
-
 -- | Propose the next branching literal from a CP search strategy, or 'Nothing'
 -- to defer to the SAT decision logic.
 --
@@ -536,8 +533,6 @@ conflictOrderingPick t = do
             Just lit -> Just ( clk, lit )
             Nothing  -> best
 
-{-# INLINABLE criticalPair #-}
-
 -- | Settle the most resource-critical unordered task pair.
 --
 -- The most /contended/ disjunction is the pair minimising the larger of the two
@@ -606,7 +601,6 @@ criticalPair t = do
 -------------------------------------------------------------------------------
 -- One round of theory propagation.
 
-{-# INLINABLE theoryPropagate #-}
 {-# SPECIALISE theoryPropagate @MonitoringOff #-}
 
 -- | Channel new SAT trail literals into the scheduler (precedences into the
@@ -633,7 +627,6 @@ theoryPropagate t = do
 -------------------------------------------------------------------------------
 -- (1) Channel SAT trail literals into the scheduler.
 
-{-# INLINABLE channelPending #-}
 {-# SPECIALISE channelPending @MonitoringOff #-}
 
 -- | Drain @[theoryHead, trailSize)@ into the scheduler. A precedence literal
@@ -719,9 +712,7 @@ checkMatrixTrailInvariant t ctx = iterPairs 0 1
           iterPairs i ( j + 1 )
 #endif
 
-{-# INLINABLE channelLit #-}
 {-# SPECIALISE channelLit @MonitoringOff #-}
-
 -- | Channel a single SAT precedence assignment into the ordering matrix.
 --
 -- TODO: in the LCG path the ordering matrix has two writers — propagator
@@ -862,9 +853,7 @@ data ChannelOutcome
 -------------------------------------------------------------------------------
 -- (2) Run the unary-scheduling propagators.
 
-{-# INLINABLE runPropagators #-}
 {-# SPECIALISE runPropagators @MonitoringOff #-}
-
 -- | Run 'propagationLoop' to a fixpoint, then promote its inferences to the
 -- SAT trail: detected precedences become precedence literals and est\/lct
 -- tightenings become bound literals, each carrying a local clausal reason.
@@ -1515,9 +1504,7 @@ snapshotReason t propLit = do
   bound <- SAT.trailSize ( solver t )
   pure ( LazyReason ( snapshotBody t bound ( Just propLit ) ) )
 
-{-# INLINABLE snapshotConflict #-}
 {-# SPECIALISE snapshotConflict @MonitoringOff #-}
-
 -- | Capture a snapshot of the active trail (optionally appending @propLit@)
 -- and materialise it eagerly as a coarse 'SAT.Conflict', recording its
 -- @label@ (the conflict source) for instrumentation.
@@ -1543,9 +1530,9 @@ literalsAsConflict
   -> SAT.Solver s
   -> [ Lit ]
   -> ST s ( Maybe SAT.Conflict )
-literalsAsConflict label s body = do
+literalsAsConflict _label s body = do
 #ifdef DEBUG
-  debugAssertCurrentLevelLit label s body
+  debugAssertCurrentLevelLit _label s body
 #endif
   case body of
     []       -> SAT.markFalse s *> pure Nothing

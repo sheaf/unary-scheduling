@@ -369,7 +369,6 @@ seedMatrixWatchers propagators dirty = DMap.fromList
     matrixWatchers :: [ Text ]
     matrixWatchers = [ "predecessor", "successor" ]
 
-{-# INLINABLE propagationLoop #-}
 {-# SPECIALISE propagationLoop @MonitoringOff NoMonitoring #-}
 
 -- | Run the given propagators to a fixpoint (event-driven).

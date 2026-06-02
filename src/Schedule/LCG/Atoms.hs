@@ -224,12 +224,16 @@ internStartUpper ba allocVar task thr = do
 -- @A_thr ⟹ A_above@. Query /after/ interning @thr@ (its own entry is excluded
 -- by the strict lookups).
 boundNeighbours
-  :: Ord t
+  :: forall t s
+  .  Ord t
   => BoundAtoms s t -> Int -> Endpoint ( LatestTime t ) -> ST s ( Maybe Lit, Maybe Lit )
 boundNeighbours ba task thr = do
   fwd <- readMutVar ( boundFwd ba )
-  let perTask  = IntMap.findWithDefault Map.empty task fwd
-      toLit ( _, v ) = mkLit v Positive
+  let
+    perTask :: Map ( Endpoint ( LatestTime t ) ) Var
+    perTask  = IntMap.findWithDefault Map.empty task fwd
+    toLit :: ( x, Var ) -> Lit
+    toLit ( _, v ) = mkLit v Positive
   pure ( toLit <$> Map.lookupLT thr perTask
        , toLit <$> Map.lookupGT thr perTask )
 

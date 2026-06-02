@@ -187,7 +187,6 @@ data SearchStats = SearchStats
 -------------------------------------------------------------------------------
 -- Search driver.
 
-{-# INLINABLE lcgSearch #-}
 {-# SPECIALISE lcgSearch @MonitoringOff #-}
 
 -- | Run the DPLL(T) search over the given task data with the given
@@ -268,7 +267,6 @@ data WindowResult
   | -- | The window's conflict budget was spent; restart and open the next.
     Restart
 
-{-# INLINABLE driveLoop #-}
 {-# SPECIALISE driveLoop @MonitoringOff #-}
 
 -- | The DPLL(T) loop proper, run as a sequence of Luby restart windows that

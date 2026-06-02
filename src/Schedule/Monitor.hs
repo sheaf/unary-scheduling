@@ -129,8 +129,9 @@ instance MonitorMode MonitoringOn where
       <*> newMutVar 0
   tickPropagator mon name productive =
     modifyMutVar' ( onPerProp mon )
-      ( Map.insertWith addPair name ( 1, if productive then 1 else 0 ) )
+      ( Map.insertWith (addPair) name ( 1, if productive then 1 else 0 ) )
     where
+      addPair :: ( Int, Int ) -> ( Int, Int ) -> ( Int, Int )
       addPair ( i1, p1 ) ( i2, p2 ) = ( i1 + i2, p1 + p2 )
   tickRound          mon   = modifyMutVar' ( onRounds mon )          ( + 1 )
   tickChannelCall    mon   = modifyMutVar' ( onChannelCalls mon )    ( + 1 )
@@ -139,6 +140,7 @@ instance MonitorMode MonitoringOn where
     modifyMutVar' ( onConflicts mon )
       ( Map.insertWith addPair label ( if tight then ( 1, 0 ) else ( 0, 1 ) ) )
     where
+      addPair :: ( Int, Int ) -> ( Int, Int ) -> ( Int, Int )
       addPair ( t1, c1 ) ( t2, c2 ) = ( t1 + t2, c1 + c2 )
   recordReasonLen    mon n = do
     modifyMutVar' ( onReasonCount mon )    ( + 1 )
