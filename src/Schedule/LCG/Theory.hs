@@ -43,6 +43,10 @@ module Schedule.LCG.Theory
   , theoryDecide
     -- * Inspection
   , numPrecedenceDecisions
+#ifdef DEBUG
+    -- * Debug audits
+  , debugAuditPropagationFixpoint
+#endif
   )
   where
 
@@ -66,7 +70,11 @@ import Data.Traversable
 import Data.IntMap.Strict
   ( IntMap )
 import qualified Data.IntMap.Strict as IntMap
-  ( toList, lookup, insert )
+  ( toList, lookup, insert
+#ifdef DEBUG
+  , keysSet, filter
+#endif
+  )
 import Data.IntSet
   ( IntSet )
 import qualified Data.IntSet as IntSet
@@ -818,7 +826,7 @@ runPropagators t = do
         Nothing -> seedAllOf ( propagators t )
                      ( IntSet.fromList [ 0 .. numTasks ( atoms t ) - 1 ] )
         Just precDirty
-          | IntSet.null bDirty -> seedMatrixWatchers precDirty
+          | IntSet.null bDirty -> seedMatrixWatchers ( propagators t ) precDirty
           | otherwise          -> seedAllOf ( propagators t ) ( precDirty <> bDirty )
   writeMutVar ( dirtySeed t )  ( Just IntSet.empty )
   writeMutVar ( boundDirty t ) IntSet.empty
@@ -853,6 +861,39 @@ runPropagators t = do
             pure Nothing
           Left infeasible ->
             buildInfeasibleConflict t ( boundReasons cts ) carvedSet infeasible
+
+#ifdef DEBUG
+-- | Check that propagators have indeed run to a fixpoint when they claim to.
+-- Catches bugs to do with propagators not properly waking.
+debugAuditPropagationFixpoint
+  :: forall mode s task t
+  .  ( Num t, Measurable t, Bounded t, Show t, Show task, MonitorMode mode )
+  => Theory mode s task t -> ST s ()
+debugAuditPropagationFixpoint t = do
+  let allTasks = IntSet.fromList [ 0 .. numTasks ( atoms t ) - 1 ]
+  ( eRes, updates ) <- runSchedule ( tasks t )
+    ( propagationLoop ( monitor t ) ( maxPropRounds t ) ( schedTrail t )
+        ( propagators t ) ( seedAllOf ( propagators t ) allTasks ) )
+  let movedTasks =
+        IntMap.keysSet $
+          IntMap.filter ( \ ( e, l ) -> isJust e || isJust l ) ( tightenedBounds updates )
+  case eRes of
+    Right () | IntSet.null movedTasks -> pure ()
+    _ -> do
+      SAT.DecisionLevel lvl <- SAT.currentLevel ( solver t )
+      dump                  <- SAT.dumpSolverState ( solver t )
+      let finding = case eRes of
+            Left inf -> "an entailed conflict was not surfaced: " <> show inf
+            Right () -> "a bound tightening was not applied for tasks "
+                     <> show ( IntSet.toList movedTasks )
+      error $ unlines
+        [ "Schedule.LCG.Theory.debugAuditPropagationFixpoint:"
+        , "  - Propagation claimed a fixpoint at level " <> show lvl <> ","
+        , "    but a fresh full sweep found more work:\n"
+        , "      " <> finding
+        , dump
+        ]
+#endif
 
 -- | Unwrap one round of the 'ScheduleMonad' against the theory's mutable
 -- state, returning both the success/failure and the accumulated
@@ -1196,7 +1237,7 @@ assertTheoryLit t lit reason = do
       body <- forceLazyReason reason
       tickConflict ( monitor t ) "derived-edge" True
       recordReasonLen ( monitor t ) ( length body )
-      literalsAsConflict ( solver t ) body
+      literalsAsConflict "derived-edge" ( solver t ) body
 
 -- | Like 'assertTheoryLit', but for the end-of-pass batch (bound tightenings
 -- and detected precedences) whose lazy reasons may cite literals asserted
@@ -1242,7 +1283,7 @@ buildInfeasibleConflict t brs carvedSet inf
           Just lits -> do
             tickConflict ( monitor t ) "overload" True
             recordReasonLen ( monitor t ) ( length lits )
-            literalsAsConflict ( solver t ) ( map negateLit lits )
+            literalsAsConflict "overload" ( solver t ) ( map negateLit lits )
           -- A culprit's actual bound is not a reified, on-trail atom: fall back.
           Nothing   -> snapshotConflict t "overload" Nothing
       EmptyDomain { emptiedTask = i, enforcedEarliest = lo, enforcedLatest = hi }
@@ -1292,7 +1333,7 @@ emptyDomainConflict t brs i lo hi label carverLits = do
           let body = negateLit lowerLit : negateLit upperLit : map negateLit carverLits
           tickConflict ( monitor t ) label True
           recordReasonLen ( monitor t ) ( length body )
-          literalsAsConflict ( solver t ) body
+          literalsAsConflict label ( solver t ) body
 
 -- | Tight conflict for a /carved/ emptied task @i@. Its emptiness rests on the
 -- interior holes carved by other tasks' compulsory parts @[lst_c, ect_c]@, which
@@ -1426,17 +1467,56 @@ snapshotConflict t label mbPropLit = do
   body  <- snapshotBody t bound mbPropLit
   tickConflict ( monitor t ) label False
   recordReasonLen ( monitor t ) ( length body )
-  literalsAsConflict ( solver t ) body
+  literalsAsConflict label ( solver t ) body
 
--- | Materialise a list of literals as a SAT 'Conflict' value.
+-- | Materialise a list of literals as a SAT 'Conflict' value. The @label@
+-- names the theory rule that produced the conflict; it is carried only for the
+-- DEBUG-gated soundness check in 'debugAssertCurrentLevelLit'.
 literalsAsConflict
-  :: SAT.Solver s
+  :: Text          -- ^ conflict-source label (for DEBUG diagnostics)
+  -> SAT.Solver s
   -> [ Lit ]
   -> ST s ( Maybe SAT.Conflict )
-literalsAsConflict s = \ case
-  []       -> SAT.markFalse s *> pure Nothing
-  -- TODO: a unit conflict is encoded as 'ConflictBinary x x' (a fake 2-lit
-  -- clause); this only works because 'analyse' dedups via the 'seen' marker.
-  [ x ]    -> pure ( Just ( SAT.ConflictBinary x x ) )
-  [ a, b ] -> pure ( Just ( SAT.ConflictBinary a b ) )
-  longer   -> Just . SAT.ConflictClause <$> SAT.recordTheoryClause s longer
+literalsAsConflict label s body = do
+#ifdef DEBUG
+  debugAssertCurrentLevelLit label s body
+#endif
+  case body of
+    []       -> SAT.markFalse s *> pure Nothing
+    -- TODO: a unit conflict is encoded as 'ConflictBinary x x' (a fake 2-lit
+    -- clause); this only works because 'analyse' dedups via the 'seen' marker.
+    [ x ]    -> pure ( Just ( SAT.ConflictBinary x x ) )
+    [ a, b ] -> pure ( Just ( SAT.ConflictBinary a b ) )
+    longer   -> Just . SAT.ConflictClause <$> SAT.recordTheoryClause s longer
+
+#ifdef DEBUG
+-- | DEBUG check on a theory conflict body: verify it mentions at least one
+-- literal at the current decision level — the precondition 'SAT.analyse' relies
+-- on for 1-UIP. A violation means a theory rule reported a conflict that was
+-- already inconsistent at a strictly lower level (so it should have fired
+-- earlier, when that level was current). Panic with the rule @label@ and the
+-- body's per-literal value\/level, so the culprit rule is immediately named.
+--
+-- An empty body is a genuine ground-level inconsistency (handled by 'markFalse',
+-- never passed to 'analyse') and is exempt.
+debugAssertCurrentLevelLit
+  :: forall s. Text -> SAT.Solver s -> [ Lit ] -> ST s ()
+debugAssertCurrentLevelLit _     _ []   = pure ()
+debugAssertCurrentLevelLit label s body = do
+  cur   <- SAT.currentLevel s
+  descs <- traverse ( describe cur ) body
+  when ( not ( any fst descs ) ) $
+    error $ "Schedule.LCG.Theory.literalsAsConflict: conflict " <> show label
+         <> " has no literal at the current level (" <> show cur <> ")\n"
+         <> unlines ( map snd descs )
+  where
+    describe :: SAT.DecisionLevel -> Lit -> ST s ( Bool, String )
+    describe cur l = do
+      v <- SAT.litValue s l
+      case v of
+        LUndef -> pure ( False, "    " <> show l <> "  assign=LUndef  lvl=UNASSIGNED" )
+        _      -> do
+          lvl <- SAT.levelOfAssignedVar s ( litVar l )
+          pure ( lvl == cur
+               , "    " <> show l <> "  assign=" <> show v <> "  lvl=" <> show lvl )
+#endif

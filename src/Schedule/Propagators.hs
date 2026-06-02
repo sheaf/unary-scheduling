@@ -348,14 +348,26 @@ seedAllOf propagators dirty = DMap.fromList
 
 -- | Seed for 'propagationLoop' that wakes /only/ the matrix-watching
 -- propagators ('predecessorPropagator', 'successorPropagator') over the
--- given task set. Other propagators wake automatically via
--- 'broadcastModifications' if these emit bound-tightening constraints
--- inside the loop.
-seedMatrixWatchers :: IntSet -> Modifications
-seedMatrixWatchers dirty = DMap.fromList
-  [ Coarse "predecessor" :=> Identity dirty
-  , Coarse "successor"   :=> Identity dirty
+-- given task set.
+--
+-- Other propagators wake automatically via 'broadcastModifications' if
+-- these emit bound-tightening constraints inside the loop.
+seedMatrixWatchers :: [ Propagator task t ] -> IntSet -> Modifications
+seedMatrixWatchers propagators dirty = DMap.fromList
+  [ case prop of
+      Propagator { wakeOn } ->
+        wakeOn :=> Identity
+          ( if notifieeName wakeOn `elem` matrixWatchers
+            then fullValue  wakeOn dirty
+            else emptyValue wakeOn
+              -- NB: these empty values are crucial, as 'broadcastModifications'
+              -- can only update subscription keys that are already present.
+          )
+  | prop <- propagators
   ]
+  where
+    matrixWatchers :: [ Text ]
+    matrixWatchers = [ "predecessor", "successor" ]
 
 {-# INLINABLE propagationLoop #-}
 {-# SPECIALISE propagationLoop @MonitoringOff NoMonitoring #-}

@@ -1,4 +1,5 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
+{-# LANGUAGE CPP                 #-}
 {-# LANGUAGE OverloadedStrings   #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeAbstractions    #-}
@@ -272,6 +273,11 @@ driveLoop solver theory = step
     -- the VSIDS heuristic ('SAT.decide') picks the literal.
     decideStep :: ST s SAT.Verdict
     decideStep = do
+#ifdef DEBUG
+      -- Propagation has claimed a fixpoint with no conflict; before branching,
+      -- assert a fresh full sweep agrees (no stranded propagator left work undone).
+      debugAuditPropagationFixpoint theory
+#endif
       mbTheory <- theoryDecide theory
       mbLit <- case mbTheory of
         -- A theory-proposed branch is still a decision: count it so that

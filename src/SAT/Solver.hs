@@ -605,6 +605,42 @@ showReason ( Clause.RBinary l ) = "RBinary " ++ show l
 showReason ( Clause.RClause r ) = "RClause " ++ show r
 showReason ( Clause.RLazy l )   = "RLazy " ++ show l
 
+-- | Render a conflict source (for panic messages).
+describeConflict
+  :: forall m
+  .  PrimMonad m
+  => Solver ( PrimState m ) -> Conflict -> m String
+describeConflict s = \case
+    ConflictClause cref -> do
+      c <- clauseAt s cref
+      let n = clauseSize c
+          go :: Int -> m [ String ]
+          go k
+            | k >= n    = pure []
+            | otherwise = do
+                l    <- clauseLit c k
+                line <- describeLit l
+                rest <- go ( k + 1 )
+                pure ( line : rest )
+      ls <- go 0
+      pure $ "ConflictClause " ++ show cref ++ " (size=" ++ show n ++ "):\n"
+          ++ unlines ls
+    ConflictBinary l1 l2 -> do
+      d1 <- describeLit l1
+      d2 <- describeLit l2
+      pure $ "ConflictBinary:\n" ++ unlines [ d1, d2 ]
+  where
+    describeLit :: Lit -> m String
+    describeLit l = do
+      let vi = varIndex ( litVar l )
+      val <- Growable.read ( assigns s ) vi
+      lvl <- Growable.read ( level s )   vi
+      rsn <- Growable.read ( reason s )  vi
+      pure $ "    " ++ show l
+          ++ "  assign=" ++ show val
+          ++ "  lvl=" ++ ( case lvl of UnassignedLevel -> "UNASSIGNED"; DecisionLevel d -> show d )
+          ++ "  reason=" ++ showReason rsn
+
 trailSize :: PrimMonad m => Solver ( PrimState m ) -> m TrailPos
 trailSize s = TrailPos <$> Growable.length ( trail s )
 
@@ -1088,8 +1124,16 @@ analyse s conflict0 = do
   -- literal at 'curLevel'. Failing this points at a BCP / level-bookkeeping
   -- bug; panic loudly rather than walking the trail past its head.
   postVisitPC <- readMutVar ( analyzePathC s )
-  when ( postVisitPC == 0 ) $
-    error "SAT.Solver.analyse: conflict at level > 0 has no current-level literals"
+  when ( postVisitPC == 0 ) $ do
+    conflictDesc <- describeConflict s conflict0
+    stateDump    <- dumpSolverState s
+    error $ unlines
+      [ "SAT.Solver.analyse: conflict at level > 0 has no current-level literals."
+      , "  currentLevel=" ++ show ( unDecisionLevel curLevel )
+      , "  conflict source:"
+      , conflictDesc
+      , stateDump
+      ]
 
   initTrail <- trailSize s
   uipLit <- walkUIP s visit visitLit ( initTrail - 1 )
