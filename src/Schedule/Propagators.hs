@@ -412,7 +412,7 @@ propagationLoop mon maxRounds trail propagators seed = do
           -- No subscription has pending work: fixpoint reached.
           Nothing -> pure ()
           Just ( Propagator { wakeOn, notifyTarget, runPropagator } ) -> do
-            runPropagator
+            withPropagatorTiming mon ( notifieeName wakeOn ) runPropagator
             -- Consume this propagator's pending set (local propagators also clear
             -- their own; clearing again here is harmless and covers the globals).
             modify' ( over ( field' @"tasksModified" ) ( clearPending wakeOn ) )

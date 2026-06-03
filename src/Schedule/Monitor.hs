@@ -16,6 +16,10 @@ import Data.Kind
   ( Type, Constraint )
 import Data.List
   ( sortOn )
+import Data.Word
+  ( Word64 )
+import GHC.Clock
+  ( getMonotonicTimeNSec )
 import GHC.Generics
   ( Generic )
 import Text.Printf
@@ -32,7 +36,7 @@ import Control.DeepSeq
 
 -- primitive
 import Control.Monad.Primitive
-  ( PrimMonad(PrimState) )
+  ( PrimMonad(PrimState), unsafeIOToPrim )
 import Data.Primitive.MutVar
   ( MutVar, newMutVar, readMutVar, modifyMutVar' )
 
@@ -66,6 +70,15 @@ class MonitorMode mode where
   -- that invocation was /productive/ (emitted at least one applied constraint).
   tickPropagator :: PrimMonad m => Monitor mode ( PrimState m ) -> Text -> Bool -> m ()
 
+  -- | Run a propagator action, accumulating its wall-clock time against the
+  -- named propagator.
+  withPropagatorTiming :: PrimMonad m => Monitor mode ( PrimState m ) -> Text -> m a -> m a
+
+  -- | Like 'withPropagatorTiming', but accumulates against a named /search phase/
+  -- (BCP, channel-in, propagators, channel-out, conflict analysis, decide), to
+  -- localise where search time goes.
+  withPhaseTiming :: PrimMonad m => Monitor mode ( PrimState m ) -> Text -> m a -> m a
+
   -- | Record one productive round of the propagation fixpoint loop.
   tickRound :: PrimMonad m => Monitor mode ( PrimState m ) -> m ()
 
@@ -84,6 +97,12 @@ class MonitorMode mode where
   -- | Record the length (number of literals) of a materialised reason clause.
   recordReasonLen :: PrimMonad m => Monitor mode ( PrimState m ) -> Int -> m ()
 
+  -- | Record the /kind/ of a theory-propagation reason as it is built, keyed by
+  -- a source label (e.g. @"tight"@, @"snapshot-unreified"@,
+  -- @"snapshot-carved-jump"@). Localises which reasons fall back to the coarse
+  -- trail snapshot, the expensive 1-UIP path.
+  tickReasonKind :: PrimMonad m => Monitor mode ( PrimState m ) -> Text -> m ()
+
   -- | Snapshot the accumulated counters into an immutable 'MonitorReport'.
   readReport :: PrimMonad m => Monitor mode ( PrimState m ) -> m MonitorReport
 
@@ -93,6 +112,10 @@ instance MonitorMode MonitoringOff where
   {-# INLINE newMonitor #-}
   tickPropagator     _ _ _ = pure ()
   {-# INLINE tickPropagator #-}
+  withPropagatorTiming _ _ act = act
+  {-# INLINE withPropagatorTiming #-}
+  withPhaseTiming    _ _ act = act
+  {-# INLINE withPhaseTiming #-}
   tickRound          _     = pure ()
   {-# INLINE tickRound #-}
   tickChannelCall    _     = pure ()
@@ -103,12 +126,16 @@ instance MonitorMode MonitoringOff where
   {-# INLINE tickConflict #-}
   recordReasonLen    _ _   = pure ()
   {-# INLINE recordReasonLen #-}
+  tickReasonKind     _ _   = pure ()
+  {-# INLINE tickReasonKind #-}
   readReport         _     = pure emptyReport
   {-# INLINE readReport #-}
 
 instance MonitorMode MonitoringOn where
   data Monitor MonitoringOn s = Monitor
     { onPerProp         :: !( MutVar s ( Map Text ( Int, Int ) ) )
+    , onPerPropTime     :: !( MutVar s ( Map Text Word64 ) )
+    , onPhaseTime       :: !( MutVar s ( Map Text Word64 ) )
     , onRounds          :: !( MutVar s Int )
     , onChannelCalls    :: !( MutVar s Int )
     , onDerivedEdges    :: !( MutVar s Int )
@@ -116,10 +143,13 @@ instance MonitorMode MonitoringOn where
     , onReasonCount     :: !( MutVar s Int )
     , onReasonTotalLen  :: !( MutVar s Int )
     , onReasonMaxLen    :: !( MutVar s Int )
+    , onReasonKinds     :: !( MutVar s ( Map Text Int ) )
     }
   newMonitor =
     Monitor
       <$> newMutVar Map.empty
+      <*> newMutVar Map.empty
+      <*> newMutVar Map.empty
       <*> newMutVar 0
       <*> newMutVar 0
       <*> newMutVar 0
@@ -127,12 +157,25 @@ instance MonitorMode MonitoringOn where
       <*> newMutVar 0
       <*> newMutVar 0
       <*> newMutVar 0
+      <*> newMutVar Map.empty
   tickPropagator mon name productive =
     modifyMutVar' ( onPerProp mon )
       ( Map.insertWith (addPair) name ( 1, if productive then 1 else 0 ) )
     where
       addPair :: ( Int, Int ) -> ( Int, Int ) -> ( Int, Int )
       addPair ( i1, p1 ) ( i2, p2 ) = ( i1 + i2, p1 + p2 )
+  withPropagatorTiming mon name act = do
+    t0  <- unsafeIOToPrim getMonotonicTimeNSec
+    res <- act
+    t1  <- unsafeIOToPrim getMonotonicTimeNSec
+    modifyMutVar' ( onPerPropTime mon ) ( Map.insertWith (+) name ( t1 - t0 ) )
+    pure res
+  withPhaseTiming mon name act = do
+    t0  <- unsafeIOToPrim getMonotonicTimeNSec
+    res <- act
+    t1  <- unsafeIOToPrim getMonotonicTimeNSec
+    modifyMutVar' ( onPhaseTime mon ) ( Map.insertWith (+) name ( t1 - t0 ) )
+    pure res
   tickRound          mon   = modifyMutVar' ( onRounds mon )          ( + 1 )
   tickChannelCall    mon   = modifyMutVar' ( onChannelCalls mon )    ( + 1 )
   tickDerivedEdges   mon n = modifyMutVar' ( onDerivedEdges mon )    ( + n )
@@ -146,9 +189,13 @@ instance MonitorMode MonitoringOn where
     modifyMutVar' ( onReasonCount mon )    ( + 1 )
     modifyMutVar' ( onReasonTotalLen mon ) ( + n )
     modifyMutVar' ( onReasonMaxLen mon )   ( max n )
+  tickReasonKind     mon label =
+    modifyMutVar' ( onReasonKinds mon ) ( Map.insertWith (+) label 1 )
   readReport mon =
     MonitorReport
       <$> readMutVar ( onPerProp mon )
+      <*> readMutVar ( onPerPropTime mon )
+      <*> readMutVar ( onPhaseTime mon )
       <*> readMutVar ( onRounds mon )
       <*> readMutVar ( onChannelCalls mon )
       <*> readMutVar ( onDerivedEdges mon )
@@ -156,6 +203,7 @@ instance MonitorMode MonitoringOn where
       <*> readMutVar ( onReasonCount mon )
       <*> readMutVar ( onReasonTotalLen mon )
       <*> readMutVar ( onReasonMaxLen mon )
+      <*> readMutVar ( onReasonKinds mon )
 
 -------------------------------------------------------------------------------
 -- Report.
@@ -165,6 +213,11 @@ data MonitorReport = MonitorReport
   { -- | Per-propagator @(invocations, productive invocations)@, keyed by the
     -- propagator's subscription name.
     perPropagator   :: !( Map Text ( Int, Int ) )
+  , -- | Per-propagator cumulative wall-clock time (nanoseconds), keyed by the
+    -- propagator's subscription name.
+    perPropagatorTime :: !( Map Text Word64 )
+  , -- | Per-search-phase cumulative wall-clock time (nanoseconds).
+    phaseTime       :: !( Map Text Word64 )
   , -- | Productive rounds of the propagation fixpoint loop.
     rounds          :: !Int
   , -- | Precedence literals drained into the ordering matrix.
@@ -185,6 +238,9 @@ data MonitorReport = MonitorReport
     reasonTotalLen  :: !Int
   , -- | Largest recorded reason-clause length.
     reasonMaxLen    :: !Int
+  , -- | Theory-propagation reasons by kind (@tight@ vs the coarse @snapshot-*@
+    -- fallbacks), as tallied by 'tickReasonKind'.
+    reasonKinds     :: !( Map Text Int )
   }
   deriving stock    ( Show, Generic )
   deriving anyclass NFData
@@ -193,6 +249,8 @@ data MonitorReport = MonitorReport
 emptyReport :: MonitorReport
 emptyReport = MonitorReport
   { perPropagator   = Map.empty
+  , perPropagatorTime = Map.empty
+  , phaseTime       = Map.empty
   , rounds          = 0
   , channelCalls    = 0
   , derivedEdges      = 0
@@ -200,6 +258,7 @@ emptyReport = MonitorReport
   , reasonCount     = 0
   , reasonTotalLen  = 0
   , reasonMaxLen    = 0
+  , reasonKinds     = Map.empty
   }
 
 -- | A human-readable multi-line rendering of a 'MonitorReport'.
@@ -216,11 +275,28 @@ renderReport r = unlines $
       ( reasonMaxLen r )
   , "conflicts by source (tight / coarse):"
   ] ++ conflictLines ++
-  [ "per-propagator (invocations / productive):"
+  [ "propagation reasons by kind:"
+  ] ++ reasonKindLines ++
+  [ "search phases (total ms):"
+  ] ++ phaseLines ++
+  [ "per-propagator (invocations / productive / total ms):"
   ] ++ propLines
   where
     line :: String -> Int -> String
     line name n = printf "  %-22s %d" name n
+    phaseLines
+      | Map.null ( phaseTime r ) = [ "  (none)" ]
+      | otherwise =
+          [ printf "  %-22s %.2f" ( Text.unpack name ) ( fromIntegral ns / 1e6 :: Double )
+          -- Most-time-consuming first.
+          | ( name, ns ) <- sortOn ( negate . snd ) ( Map.toList ( phaseTime r ) )
+          ]
+    reasonKindLines
+      | Map.null ( reasonKinds r ) = [ "  (none)" ]
+      | otherwise =
+          [ printf "  %-22s %d" ( Text.unpack label ) n
+          | ( label, n ) <- sortOn ( negate . snd ) ( Map.toList ( reasonKinds r ) )
+          ]
     conflictLines
       | Map.null ( conflictBreakdown r ) = [ "  (none)" ]
       | otherwise =
@@ -233,7 +309,10 @@ renderReport r = unlines $
     propLines
       | Map.null ( perPropagator r ) = [ "  (none)" ]
       | otherwise =
-          [ printf "  %-22s %d / %d" ( Text.unpack name ) inv prod
-          -- Most-invoked first.
-          | ( name, ( inv, prod ) ) <- sortOn ( negate . fst . snd ) ( Map.toList ( perPropagator r ) )
+          [ printf "  %-22s %d / %d / %.2f" ( Text.unpack name ) inv prod
+              ( fromIntegral ( Map.findWithDefault 0 name ( perPropagatorTime r ) ) / 1e6 :: Double )
+          -- Most-time-consuming first.
+          | ( name, ( inv, prod ) ) <-
+              sortOn ( negate . flip ( Map.findWithDefault 0 ) ( perPropagatorTime r ) . fst )
+                ( Map.toList ( perPropagator r ) )
           ]

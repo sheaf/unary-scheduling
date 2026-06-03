@@ -619,7 +619,7 @@ theoryPropagate
   => Theory mode s task t
   -> ST s ( Maybe SAT.Conflict )
 theoryPropagate t = do
-  channelOutcome <- channelPending t
+  channelOutcome <- withPhaseTiming ( monitor t ) "channel-in" ( channelPending t )
   case channelOutcome of
     Just c  -> pure ( Just c )
     Nothing -> runPropagators t
@@ -885,8 +885,9 @@ runPropagators t = do
           | otherwise          -> seedAllOf ( propagators t ) ( precDirty <> bDirty )
   writeMutVar ( dirtySeed t )  ( Just IntSet.empty )
   writeMutVar ( boundDirty t ) IntSet.empty
-  ( eRes, finalUpdates ) <- runSchedule ( tasks t )
-    ( propagationLoop ( monitor t ) ( maxPropRounds t ) ( schedTrail t ) ( propagators t ) seed )
+  ( eRes, finalUpdates ) <- withPhaseTiming ( monitor t ) "propagators" $
+    runSchedule ( tasks t )
+      ( propagationLoop ( monitor t ) ( maxPropRounds t ) ( schedTrail t ) ( propagators t ) seed )
   -- TODO: 'propagationLoop' doesn't properly report 'GiveUp', which means we
   -- currently conflate "fixpoint, consistent" with "gave up early".
   let cts = taskConstraints finalUpdates
@@ -898,13 +899,15 @@ runPropagators t = do
   -- (the state sits below 'ExceptT'), so we can channel out the precedences and
   -- bound tightenings derived so far before turning the infeasibility into a
   -- conflict.
-  mbConf1 <- assertEmittedPrecedences t ( precedences cts )
+  mbConf1 <- withPhaseTiming ( monitor t ) "assert-prec" $
+    assertEmittedPrecedences t ( precedences cts )
   case mbConf1 of
     Just c  -> pure ( Just c )
     Nothing -> do
       mbConf2 <-
         if useBoundAtoms t
-        then channelOutBounds t ( tightenedBounds finalUpdates ) ( boundReasons cts ) carvedSet
+        then withPhaseTiming ( monitor t ) "channel-out" $
+               channelOutBounds t ( tightenedBounds finalUpdates ) ( boundReasons cts ) carvedSet
         else pure Nothing
       case mbConf2 of
         Just c  -> pure ( Just c )
@@ -1139,7 +1142,7 @@ precEdgeLit t i p = do
 -- always-valid full snapshot instead.
 boundReasonOrSnapshot
   :: forall mode s task t
-  .  ( Num t, Measurable t, Bounded t )
+  .  ( Num t, Measurable t, Bounded t, MonitorMode mode )
   => Theory mode s task t
   -> Lit       -- ^ the propagated literal
   -> [ Int ]   -- ^ subset whose bound atoms are cited
@@ -1148,8 +1151,12 @@ boundReasonOrSnapshot
 boundReasonOrSnapshot t propLit subset extra = do
   mbBounds <- checkedBoundLits t subset
   case mbBounds of
-    Nothing     -> snapshotReason t propLit
-    Just bounds -> pure ( LazyReason ( pure ( propLit : map negateLit ( bounds ++ extra ) ) ) )
+    Nothing     -> do
+      tickReasonKind ( monitor t ) "snapshot-unreified"
+      snapshotReason t propLit
+    Just bounds -> do
+      tickReasonKind ( monitor t ) "tight"
+      pure ( LazyReason ( pure ( propLit : map negateLit ( bounds ++ extra ) ) ) )
 
 -- | The local clausal reason for a bound tightening on task @i@: the
 -- responsible subset's current bound atoms, plus any precedence literals
@@ -1158,7 +1165,7 @@ boundReasonOrSnapshot t propLit subset extra = do
 -- the energetic ones).
 boundPropReason
   :: forall mode s task t
-  .  ( Num t, Measurable t, Bounded t )
+  .  ( Num t, Measurable t, Bounded t, MonitorMode mode )
   => Theory mode s task t
   -> Lit       -- ^ the propagated bound literal
   -> Int       -- ^ the constrained task
@@ -1245,7 +1252,10 @@ assertMovedBound t mv iCarved getLit i subset = case mv of
     lit <- getLit
     -- A jump over an instance gap is ground (sound); a jump on a carved task
     -- may cross a non-ground carved gap, so explain it coarsely.
-    reason <- if iCarved then snapshotReason t lit else boundPropReason t lit i subset
+    reason <-
+      if iCarved
+      then tickReasonKind ( monitor t ) "snapshot-carved-jump" *> snapshotReason t lit
+      else boundPropReason t lit i subset
     assertBatch t lit reason
 
 -------------------------------------------------------------------------------

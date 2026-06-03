@@ -180,6 +180,10 @@ data SearchStats = SearchStats
   , numDecisions :: !Int
   , numLearnts   :: !Int
   , numTheoryPropagations :: !Int
+  , -- | Lazy reasons forced by 1-UIP.
+    numLazyForces    :: !Int
+    -- | Total literals returned by lazy reasons forced by 1-UIP.
+  , numLazyForceLits :: !Int
   }
   deriving stock    ( Show, Generic )
   deriving anyclass NFData
@@ -237,11 +241,15 @@ lcgSearch opts props givenTasks = runST do
   dc <- SAT.numDecisions ( solver theory )
   lc <- SAT.numLearnts   ( solver theory )
   tp <- readMutVar ( theoryPropCount theory )
+  lf <- SAT.numLazyForces    ( solver theory )
+  ll <- SAT.numLazyForceLits ( solver theory )
   let !stats0 = SearchStats
         { numConflicts          = cc
         , numDecisions          = dc
         , numLearnts            = lc
         , numTheoryPropagations = tp
+        , numLazyForces         = lf
+        , numLazyForceLits      = ll
         }
   report <- readReport ( monitor theory )
   pure SearchResult
@@ -329,7 +337,7 @@ driveLoop restartUnit alternate solver theory =
           then pure ( Solved SAT.Unsat )
           else do
             -- 1. Binary Constraint Propagation
-            mbConf <- SAT.propagate solver
+            mbConf <- withPhaseTiming ( monitor theory ) "BCP" ( SAT.propagate solver )
             case mbConf of
               Just c  -> onConflict confs c
               Nothing -> do
@@ -361,14 +369,15 @@ driveLoop restartUnit alternate solver theory =
           -- assert a fresh full sweep agrees (no stranded propagator left work undone).
           debugAuditPropagationFixpoint theory
 #endif
-          mbTheory <- case mode of
-            Structural -> theoryDecide theory
-            Activity   -> pure Nothing
-          mbLit <- case mbTheory of
-            -- A theory-proposed branch is still a decision: count it so that
-            -- 'numDecisions' reflects the full search-tree size.
-            Just lit -> SAT.countDecision solver *> pure ( Just lit )
-            Nothing  -> SAT.decide solver
+          mbLit <- withPhaseTiming ( monitor theory ) "decide" do
+            mbTheory <- case mode of
+              Structural -> theoryDecide theory
+              Activity   -> pure Nothing
+            case mbTheory of
+              -- A theory-proposed branch is still a decision: count it so that
+              -- 'numDecisions' reflects the full search-tree size.
+              Just lit -> SAT.countDecision solver *> pure ( Just lit )
+              Nothing  -> SAT.decide solver
           case mbLit of
             Nothing  -> pure ( Solved SAT.Sat )
             Just lit -> do
@@ -391,7 +400,8 @@ driveLoop restartUnit alternate solver theory =
             -- Stamp the culprit for conflict-ordering (no-op when off), then
             -- analyse/backjump/install/decay.
             recordConflict theory
-            SAT.resolveConflict solver c ( popToLevel theory )
+            withPhaseTiming ( monitor theory ) "analysis"
+              ( SAT.resolveConflict solver c ( popToLevel theory ) )
             if restartEnabled && confs + 1 >= limit
             then pure Restart
             else step ( confs + 1 )

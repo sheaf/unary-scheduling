@@ -68,6 +68,8 @@ module SAT.Solver
   , numConflicts
   , numDecisions
   , numLearnts
+  , numLazyForces
+  , numLazyForceLits
 
     -- * Lower-level driver primitives
     --
@@ -377,6 +379,17 @@ data Solver s = Solver
     confCount :: !( MutVar s Int )
   , -- | Total decisions taken.
     decCount  :: !( MutVar s Int )
+  , -- | Number of lazy reasons forced by 1-UIP ('walkUIP' crossing a
+    -- theory-propagated literal).
+    --
+    -- Instrumentation only.
+    lazyForceCount :: !( MutVar s Int )
+  , -- | Total literals returned by forced lazy reasons. A large
+    -- @lazyForceLits \/ lazyForceCount@ ratio means resolution is crossing
+    -- coarse (trail-snapshot) reasons, the expensive 1-UIP path.
+    --
+    -- Instrumentation only.
+    lazyForceLits :: !( MutVar s Int )
   , -- | Flips to 'False' as soon as a top-level inconsistency is detected;
     -- from then on the solver is permanently UNSAT.
     okFlag    :: !( MutVar s Bool )
@@ -430,6 +443,8 @@ newSolver = do
   qh    <- newMutVar 0
   cc    <- newMutVar 0
   dc    <- newMutVar 0
+  lfc   <- newMutVar 0
+  lfl   <- newMutVar 0
   ok    <- newMutVar True
   -- Scratch space for 'analyse'.
   -- Reset at the start of each 'analyse' call and grown on demand.
@@ -463,6 +478,8 @@ newSolver = do
     , lazyReasons        = lzs
     , confCount          = cc
     , decCount           = dc
+    , lazyForceCount     = lfc
+    , lazyForceLits      = lfl
     , okFlag             = ok
     , analyzePathC       = apc
     , analyzeTouched     = ato
@@ -648,6 +665,12 @@ trailSize s = TrailPos <$> Growable.length ( trail s )
 numConflicts, numDecisions :: PrimMonad m => Solver ( PrimState m ) -> m Int
 numConflicts = readMutVar . confCount
 numDecisions = readMutVar . decCount
+
+numLazyForces, numLazyForceLits :: PrimMonad m => Solver ( PrimState m ) -> m Int
+-- | Count of lazy reasons forced by 1-UIP.
+numLazyForces    = readMutVar . lazyForceCount
+-- | Count of total literals returned by lazy reasons forced by 1-UIP.
+numLazyForceLits = readMutVar . lazyForceLits
 
 numLearnts :: PrimMonad m => Solver ( PrimState m ) -> m Int
 numLearnts = Growable.length . learnts
@@ -1355,6 +1378,8 @@ walkUIP s visit visitLit ( TrailPos start ) = go start
                   -- Theory-propagated literal: force the deferred reason
                   -- closure to recover the supporting clause's literals.
                   ls <- forceLazy s lref
+                  modifyMutVar' ( lazyForceCount s ) ( + 1 )
+                  modifyMutVar' ( lazyForceLits  s ) ( + length ls )
                   visitLits vi ls
                   go ( idx - 1 )
 

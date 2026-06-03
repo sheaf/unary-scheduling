@@ -29,6 +29,8 @@ import GHC.Clock
   ( getMonotonicTimeNSec )
 import System.Environment
   ( getArgs )
+import System.Timeout
+  ( timeout )
 import Text.Printf
   ( printf )
 
@@ -44,7 +46,13 @@ import Schedule.LCG.Search
 import Schedule.Monitor
   ( Monitoring(..), MonitorReport(..), renderReport )
 import Schedule.Propagators
-  ( basicPropagators )
+  ( Propagator, basicPropagators
+  , prunePropagator, timetablePropagator, overloadPropagator
+  , detectablePrecedencesPropagator, detectableSuccedencesPropagator
+  , notLastPropagator, notFirstPropagator
+  , edgeLastPropagator, edgeFirstPropagator
+  , predecessorPropagator, successorPropagator
+  )
 
 -- bench:unary-scheduling
 import Schedule.Bench.Instances
@@ -85,6 +93,8 @@ abConfigs =
   , Cfg "+COS (no alt)"       base { optAlternateSearch = False, optConflictOrdering = True }
   , Cfg "default (alt+COS)"   base
   , Cfg "VSIDS only"          base { optTheoryDecide = False }
+  , Cfg "BA off (coarse)"     base { optBoundAtoms = False }
+  , Cfg "BA decisions off"    base { optBoundDecisions = False }
   ]
   where
     base = defaultSearchOptions
@@ -132,6 +142,8 @@ main = do
     -- on the real (uninstrumented) default-config path, so a cost-centre profile
     -- is attributable to that one workload. Usage: lcg-inspect prof <name>.
     ( "prof" : rest ) -> mapM_ profRun ( if null rest then [ "d6s24", "copies2" ] else rest )
+    ( "exp" : _ )     -> propagatorSubsetExperiment
+    ( "opts" : _ )    -> optionToggleExperiment
     _ -> do
       _ <- evaluate ( force theInstance )
       printf "=== unary-scheduling LCG inspection harness ===\n\n"
@@ -160,6 +172,129 @@ profRun name = do
     name ( fmtNs ( t1 - t0 ) ) ( verdict res )
     ( numDecisions st ) ( numConflicts st ) ( numLearnts st ) ( numTheoryPropagations st )
 
+-- | Measure how much each (group of) expensive global propagator earns its
+-- keep.
+propagatorSubsetExperiment :: IO ()
+propagatorSubsetExperiment = do
+  printf "Propagator-subset experiment (verdict must not change vs full; per-solve timeout 8s):\n\n"
+  forM_ instances \ ( iname, inst ) -> do
+    _ <- evaluate ( force inst )
+    printf "%s:\n" iname
+    printf "  %-12s %-11s %6s %6s %7s %-10s\n"
+      ( "config" :: String ) ( "time" :: String )
+      ( "dec" :: String ) ( "conf" :: String ) ( "tprop" :: String ) ( "verdict" :: String )
+    forM_ subsets \ ( label, props ) -> do
+      t0  <- getMonotonicTimeNSec
+      mbRes <- timeout 8_000_000 ( evaluate ( force ( lcgSearch @MonitoringOff defaultSearchOptions props inst ) ) )
+      t1  <- getMonotonicTimeNSec
+      case mbRes of
+        Nothing  -> printf "  %-12s %-11s %6s %6s %7s %-10s\n" label ( "TIMEOUT" :: String ) ( "-" :: String ) ( "-" :: String ) ( "-" :: String ) ( "-" :: String )
+        Just res -> do
+          let st = stats res
+          printf "  %-12s %-11s %6d %6d %7d %-10s\n"
+            label ( fmtNs ( t1 - t0 ) )
+            ( numDecisions st ) ( numConflicts st ) ( numTheoryPropagations st )
+            ( verdict res )
+    putStrLn ""
+  where
+    instances :: [ ( String, Instance ) ]
+    instances =
+      -- Feasible rehearsal, slack (0.9 / 0.6), several sizes & seeds.
+      [ ( "reh slack 3x9",    Instances.rehearsalInstance 0.9 0.6 3 9  8 42 )
+      , ( "reh slack 5x15",   Instances.rehearsalInstance 0.9 0.6 5 15 8 42 )
+      , ( "reh slack 5x20",   Instances.rehearsalInstance 0.9 0.6 5 20 8 42 )
+      , ( "reh slack 5x20/7", Instances.rehearsalInstance 0.9 0.6 5 20 8 7  )
+      -- Feasible rehearsal, tight (1.0 / 0.4), forces backtracking.
+      , ( "reh tight 4x16/5", Instances.rehearsalInstance 1.0 0.4 4 16 8 5  )
+      , ( "reh tight 5x20/3", Instances.rehearsalInstance 1.0 0.4 5 20 8 3  )
+      , ( "reh tight 6x24/9", profInstance "d6s24" )
+      , ( "reh tight 6x24/1", Instances.rehearsalInstance 1.0 0.4 6 24 8 1  )
+      -- Feasible staggered windows.
+      , ( "windows n=12",     Instances.randomWindowedInstance 0.7 4 12 3 42 )
+      , ( "windows n=16",     Instances.randomWindowedInstance 0.7 4 16 3 42 )
+      -- Feasible disjunctive cliques.
+      , ( "clique n=8",       Instances.tightCliqueInstance 8  2 )
+      , ( "clique n=12",      Instances.tightCliqueInstance 12 2 )
+      , ( "clique n=16",      Instances.tightCliqueInstance 16 2 )
+      -- Infeasible: interval pigeonhole.
+      , ( "pigeonhole m=4",   Instances.intervalPigeonholeInstance 4 2 )
+      , ( "pigeonhole m=5",   Instances.intervalPigeonholeInstance 5 2 )
+      , ( "pigeonhole m=6",   Instances.intervalPigeonholeInstance 6 2 )
+      -- Infeasible: bin-packing fragmentation (symmetric copies).
+      , ( "bin copies1",      Instances.infeasibleRehearsalInstance 1 )
+      , ( "bin copies2",      profInstance "copies2" )
+      , ( "bin copies3",      Instances.infeasibleRehearsalInstance 3 )
+      -- Infeasible: heterogeneous (asymmetric) fragmentation.
+      , ( "frag [6789]/3",    Instances.fragmentationInstance [ 6, 7, 8, 9 ] 3 )
+      , ( "frag [678910]/4",  Instances.fragmentationInstance [ 6, 7, 8, 9, 10 ] 4 )
+      , ( "frag [667789]/5",  Instances.fragmentationInstance [ 6, 6, 7, 7, 8, 9 ] 5 )
+      -- Infeasible: resource overload.
+      , ( "overload n=12",    Instances.overloadedInstance 12 3 )
+      , ( "overload n=16",    Instances.overloadedInstance 16 3 )
+      ]
+    -- The local + completeness propagators that every subset keeps.
+    base :: [ Propagator () BenchTime ]
+    base = [ prunePropagator, timetablePropagator, overloadPropagator
+           , predecessorPropagator, successorPropagator ]
+    detect = [ detectablePrecedencesPropagator, detectableSuccedencesPropagator ]
+    notext = [ notLastPropagator, notFirstPropagator ]
+    edge   = [ edgeLastPropagator, edgeFirstPropagator ]
+    subsets :: [ ( String, [ Propagator () BenchTime ] ) ]
+    subsets =
+      [ ( "full",        basicPropagators )
+      , ( "no-detect",   base ++ notext ++ edge )
+      , ( "no-edge",     base ++ detect ++ notext )
+      , ( "no-notExtr",  base ++ detect ++ edge )
+      , ( "base-only",   base )
+      ]
+
+-- | Sweep the search-option toggles across the representative instance families,
+-- to tell an instance-specific win from a broad one (guards against tuning to a
+-- single hand-picked instance). Columns: default, day-assignment branching off,
+-- channel-out learning off.
+optionToggleExperiment :: IO ()
+optionToggleExperiment = do
+  printf "Option-toggle sweep (time / dec / conf / tprop; verdict must not change):\n\n"
+  printf "  %-22s %-22s %-22s %-22s\n"
+    ( "instance" :: String ) ( "default" :: String )
+    ( "no-day-decisions" :: String ) ( "no-channel-out" :: String )
+  forM_ optInstances \ ( iname, inst ) -> do
+    _ <- evaluate ( force inst )
+    cells <- forM optConfigs \ ( _, opts ) -> do
+      ( t, res ) <- measureOff opts inst
+      let st = stats res
+      pure ( verdict res
+           , printf "%s/%d/%d/%d" ( fmtNs t )
+               ( numDecisions st ) ( numConflicts st ) ( numTheoryPropagations st ) :: String )
+    let verdicts = map fst cells
+        tag = case verdicts of
+          ( v0 : _ ) | all ( == v0 ) verdicts -> ""
+          _                                    -> "  DISAGREE " ++ show verdicts
+    printf "  %-22s" iname
+    forM_ cells \ ( _, c ) -> printf " %-22s" c
+    printf "%s\n" tag
+  where
+    optConfigs :: [ ( String, SearchOptions ) ]
+    optConfigs =
+      [ ( "default",          defaultSearchOptions )
+      , ( "no-day-decisions", defaultSearchOptions { optBoundDecisions = False } )
+      , ( "no-channel-out",   defaultSearchOptions { optBoundAtoms     = False } )
+      ]
+    optInstances :: [ ( String, Instance ) ]
+    optInstances =
+      [ ( "reh tight 4x16/5",  Instances.rehearsalInstance 1.0 0.4 4 16 8 5 )
+      , ( "reh tight 5x20/3",  Instances.rehearsalInstance 1.0 0.4 5 20 8 3 )
+      , ( "reh tight 6x24/9",  Instances.rehearsalInstance 1.0 0.4 6 24 8 9 )
+      , ( "reh tight 6x24/1",  Instances.rehearsalInstance 1.0 0.4 6 24 8 1 )
+      , ( "reh slack 5x20",    Instances.rehearsalInstance 0.9 0.6 5 20 8 42 )
+      , ( "reh slack 5x20/7",  Instances.rehearsalInstance 0.9 0.6 5 20 8 7 )
+      , ( "windows n=16",      Instances.randomWindowedInstance 0.7 4 16 3 42 )
+      , ( "clique n=16",       Instances.tightCliqueInstance 16 2 )
+      , ( "pigeonhole m=6",    Instances.intervalPigeonholeInstance 6 2 )
+      , ( "bin copies2",       Instances.infeasibleRehearsalInstance 2 )
+      , ( "bin copies3",       Instances.infeasibleRehearsalInstance 3 )
+      ]
+
 -- | The bound-atom role A\/B matrix on 'theInstance'.
 abMatrix :: IO ()
 abMatrix = do
@@ -178,8 +313,21 @@ abMatrix = do
   -- One instrumented solve, just for the detailed report (cheap on this config).
   case [ cfgOpts c | c <- abConfigs, cfgLabel c == "default (alt+COS)" ] of
     ( dfltOpts : _ ) -> do
+      t0  <- getMonotonicTimeNSec
       rep <- evaluate ( force ( lcgSearch @MonitoringOn dfltOpts basicPropagators theInstance ) )
+      t1  <- getMonotonicTimeNSec
       putStr ( renderReport ( monitorReport rep ) )
+      let propSum = sum ( perPropagatorTime ( monitorReport rep ) )
+          st      = stats rep
+          forces  = numLazyForces st
+          lits    = numLazyForceLits st
+      printf "  instrumented total %s  (propagator compute %.2f ms = %.0f%%)\n"
+        ( fmtNs ( t1 - t0 ) )
+        ( fromIntegral propSum / 1e6 :: Double )
+        ( 100 * fromIntegral propSum / fromIntegral ( t1 - t0 ) :: Double )
+      printf "  1-UIP lazy-reason forces %d, total lits %d (mean %.1f lits/force)\n"
+        forces lits
+        ( if forces == 0 then 0 else fromIntegral lits / fromIntegral forces :: Double )
     [] -> pure ()
 
 -------------------------------------------------------------------------------
