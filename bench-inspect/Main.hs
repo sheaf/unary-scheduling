@@ -6,11 +6,7 @@
 -- search and reports /search-tree size/ (decisions, conflicts, learnt clauses,
 -- theory propagations) alongside wall-clock time. Two views:
 --
---   * an A\/B matrix over the four combinations of the bound-atom roles
---     (channel-out learning × day-assignment decisions) on one fixed instance,
---     so each role's net effect — including learning held against a coarse
---     baseline — is isolated; plus the full conflict\/reason breakdown for the
---     default configuration;
+--   * an A\/B matrix over different parameter choices
 --
 --   * a size sweep over the benchmark instance families, reporting the node
 --     counts (not just time) that show whether the cost is the search tree.
@@ -93,7 +89,6 @@ abConfigs =
   , Cfg "+COS (no alt)"       base { optAlternateSearch = False, optConflictOrdering = True }
   , Cfg "default (alt+COS)"   base
   , Cfg "VSIDS only"          base { optTheoryDecide = False }
-  , Cfg "BA off (coarse)"     base { optBoundAtoms = False }
   , Cfg "BA decisions off"    base { optBoundDecisions = False }
   ]
   where
@@ -233,17 +228,17 @@ propagatorSubsetExperiment = do
       , ( "overload n=16",    Instances.overloadedInstance 16 3 )
       ]
     -- The local + completeness propagators that every subset keeps.
-    base :: [ Propagator () BenchTime ]
+    base, detect, notExt, edge :: [ Propagator () BenchTime ]
     base = [ prunePropagator, timetablePropagator, overloadPropagator
            , predecessorPropagator, successorPropagator ]
     detect = [ detectablePrecedencesPropagator, detectableSuccedencesPropagator ]
-    notext = [ notLastPropagator, notFirstPropagator ]
+    notExt = [ notLastPropagator, notFirstPropagator ]
     edge   = [ edgeLastPropagator, edgeFirstPropagator ]
     subsets :: [ ( String, [ Propagator () BenchTime ] ) ]
     subsets =
       [ ( "full",        basicPropagators )
-      , ( "no-detect",   base ++ notext ++ edge )
-      , ( "no-edge",     base ++ detect ++ notext )
+      , ( "no-detect",   base ++ notExt ++ edge )
+      , ( "no-edge",     base ++ detect ++ notExt )
       , ( "no-notExtr",  base ++ detect ++ edge )
       , ( "base-only",   base )
       ]
@@ -255,9 +250,9 @@ propagatorSubsetExperiment = do
 optionToggleExperiment :: IO ()
 optionToggleExperiment = do
   printf "Option-toggle sweep (time / dec / conf / tprop; verdict must not change):\n\n"
-  printf "  %-22s %-22s %-22s %-22s\n"
+  printf "  %-22s %-22s %-22s\n"
     ( "instance" :: String ) ( "default" :: String )
-    ( "no-day-decisions" :: String ) ( "no-channel-out" :: String )
+    ( "no-day-decisions" :: String )
   forM_ optInstances \ ( iname, inst ) -> do
     _ <- evaluate ( force inst )
     cells <- forM optConfigs \ ( _, opts ) -> do
@@ -278,7 +273,6 @@ optionToggleExperiment = do
     optConfigs =
       [ ( "default",          defaultSearchOptions )
       , ( "no-day-decisions", defaultSearchOptions { optBoundDecisions = False } )
-      , ( "no-channel-out",   defaultSearchOptions { optBoundAtoms     = False } )
       ]
     optInstances :: [ ( String, Instance ) ]
     optInstances =
@@ -366,8 +360,8 @@ sizeSweeps = do
       , Instances.infeasibleRehearsalInstance c )
     | c <- [ 1, 2, 3 ]
     ]
-  detailReport "infeasible bin-packing fragmentation, copies=2"
-    ( Instances.infeasibleRehearsalInstance 2 )
+  detailReport "infeasible bin-packing fragmentation, copies=4"
+    ( Instances.infeasibleRehearsalInstance 4 )
 
   -- The no-restart structural baseline ('structOpts') is the old behaviour; it
   -- blows up on bin-packing copies=3 (~minutes), so that column is omitted there.
@@ -428,41 +422,34 @@ strategySweep title sizes = do
   putStrLn ""
 
 -- | Run the default configuration over a family of sizes, printing the
--- search-tree node counts (and the tight\/coarse conflict split) per size.
+-- search-tree node counts.
 sweep :: String -> [ ( String, Instance ) ] -> IO ()
 sweep title sizes = do
   printf "%s:\n" title
-  printf "  %-16s %-11s %6s %6s %7s %7s %11s %8s %-9s\n"
+  printf "  %-16s %-11s %6s %6s %7s %7s %8s %-9s\n"
     ( "size" :: String ) ( "time" :: String )
     ( "dec" :: String ) ( "conf" :: String ) ( "learnt" :: String ) ( "tprop" :: String )
-    ( "tight/coarse" :: String ) ( "meanLen" :: String ) ( "verdict" :: String )
+    ( "meanLen" :: String ) ( "verdict" :: String )
   forM_ sizes \ ( lbl, inst ) -> do
     _ <- evaluate ( force inst )
     ( t, res ) <- measure defaultSearchOptions inst
-    let st        = stats res
-        rep       = monitorReport res
-        ( tight, coarse ) = conflictTotals rep
-    printf "  %-16s %-11s %6d %6d %7d %7d %5d/%-5d %8.1f %-9s\n"
+    let st           = stats res
+        rep          = monitorReport res
+    printf "  %-16s %-11s %6d %6d %7d %7d %8.1f %-9s\n"
       lbl ( fmtNs t )
       ( numDecisions st ) ( numConflicts st ) ( numLearnts st ) ( numTheoryPropagations st )
-      tight coarse ( meanReasonLen rep ) ( verdict res )
+      ( meanReasonLen rep ) ( verdict res )
   putStrLn ""
 
 -- | Print the detailed monitor report (conflict sources, reason lengths,
 -- per-propagator) for one instance under the default configuration — to see
--- /which/ source the conflicts come from, not just the tight\/coarse split.
+-- /which/ source the conflicts come from.
 detailReport :: String -> Instance -> IO ()
 detailReport label inst = do
   printf "%s (default config):\n" label
   rep <- evaluate ( force ( lcgSearch @MonitoringOn defaultSearchOptions basicPropagators inst ) )
   putStr ( renderReport ( monitorReport rep ) )
   putStrLn ""
-
--- | Sum the @(tight, coarse)@ conflict counts across all sources.
-conflictTotals :: MonitorReport -> ( Int, Int )
-conflictTotals rep =
-  foldr ( \ ( a, b ) ( accA, accB ) -> ( a + accA, b + accB ) )
-        ( 0, 0 ) ( conflictBreakdown rep )
 
 meanReasonLen :: MonitorReport -> Double
 meanReasonLen rep

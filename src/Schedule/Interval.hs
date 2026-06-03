@@ -266,16 +266,12 @@ class Ord t => Measurable t where
   canonicalLatest :: Endpoint ( LatestTime t ) -> Endpoint ( LatestTime t )
   canonicalLatest = id
 
+  -- | Normalise a latest-/start/ bound @start ≤ l@ to a canonical clusivity.
+  canonicalStartUpper :: Endpoint ( LatestTime t ) -> Endpoint ( LatestTime t )
+  canonicalStartUpper = id
+
   -- | The latest-/completion/ bound that enforces a latest-/start/ bound @l@ for
-  -- a task of the given duration: @start ≤ l@ is equivalent to
-  -- @completion ≤ completionFromLatestStart dur l@. Channelling a latest-start
-  -- atom into a task's domain applies 'cutAfter' to this completion bound.
-  --
-  -- This is the inverse of 'latestStartFromCompletion'. It is domain-specific
-  -- because relating a (closed-canonical) start bound to a (half-open,
-  -- 'Exclusive'-canonical) completion bound shifts by the duration /and/ moves
-  -- between the two clusivity conventions (which on a discrete domain is a unit
-  -- step).
+  -- a task of the given duration; inverse of'latestStartFromCompletion'.
   completionFromLatestStart :: Delta t -> Endpoint ( LatestTime t ) -> Endpoint ( LatestTime t )
 
 instance Measurable Double where
@@ -308,6 +304,11 @@ instance Measurable Int where
   canonicalLatest ( Endpoint ( LatestTime ( Time e ) ) Inclusive ) =
     Endpoint ( LatestTime ( Time ( e + 1 ) ) ) Exclusive
   canonicalLatest e = e
+
+  -- @start < v@ ≡ @start ≤ v - 1@: collapse to the 'Inclusive' form.
+  canonicalStartUpper ( Endpoint ( LatestTime ( Time v ) ) Exclusive ) =
+    Endpoint ( LatestTime ( Time ( v - 1 ) ) ) Inclusive
+  canonicalStartUpper e = e
 
   -- @start ≤ v@ (Inclusive)  ⟹  occupies through @v + dur - 1@  ⟹  end @≤ v + dur@.
   -- @start < v@ (Exclusive) ≡ @start ≤ v - 1@  ⟹  end @≤ v - 1 + dur@.

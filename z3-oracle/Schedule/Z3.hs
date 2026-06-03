@@ -191,7 +191,7 @@ verifyAgainstZ3 propagators namedTasks = do
               o <- readOrdering orderings a b
               when ( o == Unknown ) ( addEdge trail a b )
             let allTasks = IntSet.fromList [ 0 .. Boxed.Vector.length taskNames - 1 ]
-            propagationLoop NoMonitoring 1000 trail propagators ( seedAllOf propagators allTasks )
+            propagationLoop NoMonitoring 1000 trail propagators Nothing ( seedAllOf propagators allTasks )
         -- Tasks whose Z3 start time no longer lies within the tightened window.
         violators :: [ Int ]
         violators =

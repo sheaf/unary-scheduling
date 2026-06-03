@@ -74,7 +74,7 @@ import SAT.Base
   , mkLit, Polarity(..)
   )
 import Schedule.Interval
-  ( Endpoint )
+  ( Endpoint, Measurable(canonicalStartUpper) )
 import Schedule.Ordering
   ( upperTriangular )
 import Schedule.Time
@@ -202,13 +202,16 @@ newBoundAtoms firstIx = do
 -- bound @start ≥ e@ is the /negative/ literal of the atom at threshold
 -- @'estLowerToStartUpper' e@.
 internStartUpper
-  :: Ord t
+  :: Measurable t
   => BoundAtoms s t
   -> ST s Var                    -- ^ fresh auxiliary (non-decision) variable allocator
   -> Int                         -- ^ task index
   -> Endpoint ( LatestTime t )   -- ^ latest-start threshold @l@
   -> ST s ( Lit, Bool )
-internStartUpper ba allocVar task thr = do
+internStartUpper ba allocVar task thr0 = do
+  -- Canonicalise the threshold's clusivity so endpoints denoting the same cut
+  -- map to a single atom (see 'canonicalStartUpper').
+  let thr = canonicalStartUpper thr0
   fwd <- readMutVar ( boundFwd ba )
   let perTask = IntMap.findWithDefault Map.empty task fwd
   case Map.lookup thr perTask of
@@ -225,9 +228,11 @@ internStartUpper ba allocVar task thr = do
 -- by the strict lookups).
 boundNeighbours
   :: forall t s
-  .  Ord t
+  .  Measurable t
   => BoundAtoms s t -> Int -> Endpoint ( LatestTime t ) -> ST s ( Maybe Lit, Maybe Lit )
-boundNeighbours ba task thr = do
+boundNeighbours ba task thr0 = do
+  -- Always canonicalise: avoids having two different atoms for the same bound.
+  let thr = canonicalStartUpper thr0
   fwd <- readMutVar ( boundFwd ba )
   let
     perTask :: Map ( Endpoint ( LatestTime t ) ) Var

@@ -84,12 +84,6 @@ data SearchOptions = SearchOptions
     --
     -- TODO: currently IGNORED by 'lcgSearch'.
     optSolver     :: !SAT.SolverOptions
-  , -- | Channel propagator bound tightenings /out/ to bound atoms with tight
-    -- local clausal reasons, and explain overloads\/emptied domains from those
-    -- atoms (\"lazy clause generation\" proper). 'False' gives a coarse-reason
-    -- baseline where every theory reason is the full trail snapshot. See
-    -- "Schedule.LCG.Theory".
-    optBoundAtoms :: !Bool
   , -- | Branch on /day-assignment/: seed, for each gappy task, a decision bound
     -- atom at every internal availability-gap boundary (\"does this task start
     -- by the end of day @j@?\"), prioritised so the search commits a task to a
@@ -142,7 +136,6 @@ defaultSearchOptions :: SearchOptions
 defaultSearchOptions = SearchOptions
   { optPropRounds     = 1000
   , optSolver         = SAT.defaultOptions
-  , optBoundAtoms     = True
   , optBoundDecisions = True
   , optTheoryDecide   = True
   , optRestartUnit    = 100
@@ -213,7 +206,7 @@ lcgSearch opts props givenTasks = runST do
   -- Allocate scheduler state and theory in one go.
   tis    <- initialTaskData @taskData @task @t givenTasks
   theory <- newTheory @mode tis props ( optPropRounds opts )
-              ( optBoundAtoms opts ) ( optBoundDecisions opts )
+              ( optBoundDecisions opts )
               ( optTheoryDecide opts ) ( optConflictOrdering opts )
 
   -- Drive the DPLL(T) loop. Its first iteration runs the propagators on

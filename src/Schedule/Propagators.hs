@@ -7,6 +7,7 @@ module Schedule.Propagators
     Propagator(..), basicPropagators
   , coarsen
   , propagateConstraints, propagationLoop
+  , PassChanneller(..)
     -- * Constructing the initial 'Modifications' seed for 'propagationLoop'.
   , seedAllOf, seedMatrixWatchers
     -- * Local constraint propagators.
@@ -31,6 +32,8 @@ module Schedule.Propagators
 -- base
 import Control.Monad
   ( when, unless, void )
+import Control.Monad.ST
+  ( ST )
 import Data.Coerce
   ( coerce )
 import Data.Functor.Identity
@@ -52,7 +55,7 @@ import Data.Act
 import Data.IntMap.Strict
   ( IntMap )
 import qualified Data.IntMap.Strict as IntMap
-  ( unionWith, keysSet, filter )
+  ( unionWith )
 import Data.IntSet
   ( IntSet )
 import qualified Data.IntSet as IntSet
@@ -98,7 +101,7 @@ import Control.Monad.State.Strict
 
 -- primitive
 import Control.Monad.Primitive
-  ( PrimMonad(PrimState) )
+  ( PrimMonad(PrimState), stToPrim )
 
 -- text
 import Data.Text
@@ -331,8 +334,8 @@ propagateConstraints taskData maxLoopIterations propagators =
     run trail = do
       TaskInfos { taskNames } <- ask
       let allTasks = IntSet.fromList [ 0 .. Boxed.Vector.length taskNames - 1 ]
-      -- The non-LCG fixpoint path is never instrumented.
-      propagationLoop NoMonitoring maxLoopIterations trail propagators
+      -- The non-LCG fixpoint path is never instrumented and does no channelling.
+      propagationLoop NoMonitoring maxLoopIterations trail propagators Nothing
         ( seedAllOf propagators allTasks )
 
 -- | Seed for 'propagationLoop' that puts the given dirty task set into
@@ -369,9 +372,20 @@ seedMatrixWatchers propagators dirty = DMap.fromList
     matrixWatchers :: [ Text ]
     matrixWatchers = [ "predecessor", "successor" ]
 
+-- | A per-pass channeller: a hook the propagation loop invokes around each
+-- propagator pass, to promote that pass's inferences (bound tightenings and
+-- precedences) to an external store (the SAT trail).
+data PassChanneller s task t = PassChanneller
+  { onCapture :: Constraints t -> ST s ()
+    -- ^ Runs /before/ a pass (e.g. to snapshot inference-time antecedents)
+  , onChannel :: Constraints t -> IntMap Applied -> ST s Bool
+    -- ^ Runs /after/ a pass. Returning 'True' signals a conflict (stopping the loop).
+  }
+
 {-# SPECIALISE propagationLoop @MonitoringOff NoMonitoring #-}
 
--- | Run the given propagators to a fixpoint (event-driven).
+-- | Run the given propagators to a fixpoint (event-driven), channelling each
+-- pass's inferences via the optional 'PassChanneller'.
 propagationLoop
   :: forall mode s task t
   .  ( Num t, Measurable t, Bounded t
@@ -383,14 +397,15 @@ propagationLoop
   -> Int
   -> Trail s task t
   -> [ Propagator task t ]
+  -> Maybe ( PassChanneller s task t )  -- ^ optional per-pass channeller (for LCG)
   -> Modifications          -- ^ initial 'Modifications' used to kick off subscribed propagators
   -> ScheduleMonad s task t ()
-propagationLoop mon maxRounds trail propagators seed = do
+propagationLoop mon maxRounds trail propagators mbChan seed = do
   modify' ( set ( field' @"tasksModified" ) seed )
   -- Apply any constraints already posted (e.g. by a search decision) before the
   -- first propagator runs, so it sees the tightened domains.
-  _ <- applyEmitted TellEveryone
-  drive maxRounds
+  ( _, stop0 ) <- applyEmitted TellEveryone
+  if stop0 then pure () else drive maxRounds
   where
 
     -- The first propagator with pending work, in list order (so earlier
@@ -416,55 +431,55 @@ propagationLoop mon maxRounds trail propagators seed = do
             -- Consume this propagator's pending set (local propagators also clear
             -- their own; clearing again here is harmless and covers the globals).
             modify' ( over ( field' @"tasksModified" ) ( clearPending wakeOn ) )
-            applied <- applyEmitted notifyTarget
+            ( applied, stop ) <- applyEmitted notifyTarget
             tickPropagator mon ( notifieeName wakeOn ) applied
             -- Only a round that actually applied constraints counts against the
             -- safety bound, matching the previous loop's iteration counting.
             when applied ( tickRound mon )
-            drive ( if applied then rounds - 1 else rounds )
+            if stop
+            then pure ()   -- channelling surfaced a conflict
+            else drive ( if applied then rounds - 1 else rounds )
 
-    -- Apply any emitted constraints, broadcasting the resulting task changes to
-    -- the subscriptions that should react. Returns whether anything was applied.
-    applyEmitted :: BroadcastTarget -> ScheduleMonad s task t Bool
+    -- Apply this pass's emitted constraints, channelling them via the optional
+    -- channeller, and broadcast the resulting task changes. Returns
+    -- @(appliedAnything, stop)@: 'stop' is set when channelling produced a
+    -- conflict.
+    applyEmitted :: BroadcastTarget -> ScheduleMonad s task t ( Bool, Bool )
     applyEmitted toNotify = do
       cts <- view ( field' @"taskConstraints" ) <$> get
       if null ( constraints cts )
       then
-        pure False
+        pure ( False, False )
       else do
+        -- Capture the pass's inference-time antecedents before it mutates the
+        -- domains (so the reasons cite the bounds the propagator actually read,
+        -- which are already on the trail).
+        for_ mbChan \ chan -> stToPrim ( onCapture chan cts )
         applied <- applyConstraints trail cts
+        -- Channel the pass to the SAT trail with those pre-pass reasons.
+        stop <- case mbChan of
+          Nothing   -> pure False
+          Just chan -> stToPrim ( onChannel chan cts applied )
         let
-          -- How each task's bounds moved (exact vs jumped, or not at all), for
-          -- the LCG layer.
+          -- How each task's bounds moved (exact vs jumped, or not at all).
           moves :: IntMap ( Maybe BoundMove, Maybe BoundMove )
           moves = fmap ( \ a -> ( estMove a, lctMove a ) ) applied
           -- Whether each bound moved at all, for waking subscriptions.
           bools :: IntMap ( Bool, Bool )
           bools = fmap ( \ ( e, l ) -> ( isJust e, isJust l ) ) moves
-          -- Tasks whose interior was carved this pass.
-          carved :: IntSet
-          carved = IntMap.keysSet ( IntMap.filter wasCarved applied )
-        -- NB: this resets 'constraints' but deliberately NOT 'precedences' /
-        -- 'boundReasons': the LCG layer ('Schedule.LCG.Theory.runPropagators')
-        -- reads the accumulated precedence map and per-bound responsible
-        -- subsets at the end of the loop to channel precedences and bound
-        -- literals onto the SAT trail. The cost of re-applying the precedences
-        -- via 'addIncidentEdges' each round is near-free — the
-        -- 'modify'Ordering' equality guard skips (and so does not re-trail)
-        -- the idempotent re-adds. TODO: once channeling is the sole matrix
-        -- owner ("one matrix owner"), 'applyConstraints' need not touch the
-        -- matrix here at all.
         modify'
-          -- Reset constraints: they have been applied.
-          $ set  ( field' @"taskConstraints" . field' @"constraints" ) mempty
-          -- Accumulate how each task's bounds moved (exact vs jumped).
+          -- Reset this pass's emitted inferences: they have been applied and
+          -- channelled. (Justifications are kept for the non-LCG audit log.)
+          $ set  ( field' @"taskConstraints" . field' @"constraints" )  mempty
+          . set  ( field' @"taskConstraints" . field' @"precedences" )  mempty
+          . set  ( field' @"taskConstraints" . field' @"boundReasons" ) mempty
+          -- Accumulate how each task's bounds moved (read only by the DEBUG
+          -- fixpoint audit).
           . over ( field' @"tightenedBounds" ) ( IntMap.unionWith (<>) moves )
-          -- Remember which tasks were carved.
-          . over ( field' @"carvedTasks" ) ( carved <> )
           -- Broadcast which tasks have been newly modified to the subscriptions
           -- of the propagators that should wake on them.
           . over ( field' @"tasksModified" ) ( broadcastModifications toNotify bools )
-        pure True
+        pure ( True, stop )
 
 -- | The \"all tasks pending\" value for a subscription (seeding the initial run).
 fullValue :: Notifiee n -> IntSet -> n

@@ -73,7 +73,7 @@ import Data.Traversable
 import Data.IntMap.Strict
   ( IntMap )
 import qualified Data.IntMap.Strict as IntMap
-  ( toList, lookup, insert
+  ( empty, toList, lookup, insert, findWithDefault
 #ifdef DEBUG
   , keysSet, filter
 #endif
@@ -98,8 +98,6 @@ import Control.Monad.Trans.State.Strict
   ( runStateT )
 
 -- primitive
-import Control.Monad.Primitive
-  ( PrimMonad(PrimState) )
 import Data.Primitive.MutVar
   ( MutVar, newMutVar, readMutVar, writeMutVar, modifyMutVar' )
 
@@ -129,9 +127,11 @@ import SAT.Base
 import SAT.Clause
   ( Reason(..), LazyReason(..), forceLazyReason )
 import qualified SAT.Solver as SAT
+import Data.Lattice
+  ( BoundedLattice(top, bottom) )
 import Schedule.Constraint
   ( Constraints(..), Infeasible(..)
-  , BoundMove(..)
+  , BoundMove(..), Applied(..)
   , constrainToAfter, constrainToBefore
   )
 import Schedule.Interval
@@ -157,12 +157,16 @@ import Schedule.Ordering
   , Order(..), readOrdering
   )
 import Schedule.Propagators
-  ( Propagator, propagationLoop, seedAllOf, seedMatrixWatchers )
+  ( Propagator, propagationLoop, seedAllOf, seedMatrixWatchers
+  , PassChanneller(..)
+  )
 import Schedule.Task
   ( MutableTaskInfos, TaskInfos(..), Task(..)
   , est, ect, lst, lct )
 import Schedule.Time
-  ( EarliestTime, LatestTime, Delta, HandedTime(handedTime) )
+  ( EarliestTime, LatestTime, Delta, HandedTime(handedTime)
+  , Handedness(Earliest, Latest)
+  )
 import Schedule.Trail
   ( Trail, newTrail, currentMark, undoTo, orderingCellWriter )
 
@@ -194,15 +198,8 @@ data Theory mode s task t = Theory
     propagators    :: ![ Propagator task t ]
   , -- | Maximum propagator-round iterations per theory step.
     maxPropRounds  :: !Int
-  , -- | Whether to channel propagator bound tightenings /out/ to bound atoms with
-    -- tight local reasons (and to reason overloads\/emptied domains from them).
-    -- 'False' gives a coarse-reason baseline (for A\/B comparison): no initial
-    -- bounds are seeded and no bounds are channelled out, so 'checkedBoundLits'
-    -- always misses and every reason is the coarse trail snapshot.
-    useBoundAtoms  :: !Bool
   , -- | Whether to branch on day-assignment by seeding a /decision/ bound atom
     -- at each task's internal availability-gap boundaries (see 'seedDecisionBounds').
-    -- 'False' gives a precedence-only baseline (for A\/B comparison).
     useBoundDecisions :: !Bool
   , -- | Whether 'theoryDecide' proposes structural day-assignment decisions
     -- ahead of VSIDS. Only meaningful together with 'useBoundDecisions'.
@@ -248,12 +245,13 @@ data Theory mode s task t = Theory
     -- since the last 'runPropagators'. These wake /all/ propagators (a domain
     -- change can feed any of them), unlike the matrix-only 'dirtySeed'.
     boundDirty     :: !( MutVar s IntSet )
-  , -- | Tasks /carved/ (an @Inside@\/@Outside@ tightening applied), accumulated
-    -- across the whole search. A bound that jumps over a gap on a carved task is
-    -- not soundly explained by the energetic antecedents (the gap is not ground),
-    -- so such a bound literal gets a coarse reason. Monotone: never reset, so it
-    -- stays sound after backjumps (only ever more conservative).
-    carved         :: !( MutVar s IntSet )
+  , -- | Inference-time antecedent snapshot of the propagation pass currently
+    -- being applied (see 'capturePass'). Written before each pass is applied and
+    -- read when channelling it (or when a pass empties a domain).
+    passCapture    :: !( MutVar s ( PassCapture t ) )
+  , -- | Conflict produced while channelling a propagation pass to the SAT trail,
+    -- if any. Set by 'channelPass', read by 'runPropagators' after the loop.
+    pendingConflict :: !( MutVar s ( Maybe SAT.Conflict ) )
   , -- | Cumulative count of theory propagations: literals the theory has
     -- promoted onto the SAT trail (derived transitive edges, propagator
     -- precedences, and channelled-out bound tightenings). For instrumentation.
@@ -273,12 +271,11 @@ newTheory
   => MutableTaskInfos s task t
   -> [ Propagator task t ]
   -> Int                          -- ^ propagator-round cap per theory step
-  -> Bool                         -- ^ channel out tight bound reasons (learning)?
   -> Bool                         -- ^ branch on day-assignment bound atoms?
   -> Bool                         -- ^ use the structural day-assignment decision heuristic?
   -> Bool                         -- ^ use conflict-ordering search in 'theoryDecide'?
   -> ST s ( Theory mode s task t )
-newTheory tis props rounds boundAtomsOn boundDecisionsOn theoryDecideOn conflictOrderingOn = do
+newTheory tis props rounds boundDecisionsOn theoryDecideOn conflictOrderingOn = do
   s     <- SAT.newSolver
   let nT  = Boxed.Vector.length ( taskNames tis )
       !nA = ( nT * ( nT - 1 ) ) `shiftR` 1
@@ -296,7 +293,8 @@ newTheory tis props rounds boundAtomsOn boundDecisionsOn theoryDecideOn conflict
   lms   <- Growable.new 16
   ds    <- newMutVar Nothing
   bd    <- newMutVar IntSet.empty
-  cv    <- newMutVar IntSet.empty
+  pcap  <- newMutVar emptyPassCapture
+  pconf <- newMutVar Nothing
   tpc   <- newMutVar 0
   db    <- newMutVar mempty
   cclk  <- newMutVar 0
@@ -315,7 +313,6 @@ newTheory tis props rounds boundAtomsOn boundDecisionsOn theoryDecideOn conflict
         , schedTrail      = trail
         , propagators     = props
         , maxPropRounds   = rounds
-        , useBoundAtoms   = boundAtomsOn
         , useBoundDecisions = boundDecisionsOn
         , useTheoryDecide = theoryDecideOn
         , useConflictOrdering = conflictOrderingOn
@@ -327,12 +324,13 @@ newTheory tis props rounds boundAtomsOn boundDecisionsOn theoryDecideOn conflict
         , levelMarks      = lms
         , dirtySeed       = ds
         , boundDirty      = bd
-        , carved          = cv
+        , passCapture     = pcap
+        , pendingConflict = pconf
         , theoryPropCount = tpc
         , monitor         = mon
         }
-  when boundAtomsOn      ( seedInitialBounds  t nT )
-  when boundDecisionsOn  ( seedDecisionBounds t nT )
+  seedInitialBounds t nT
+  when boundDecisionsOn ( seedDecisionBounds t nT )
   pure t
 
 -- | Create initial inner-boundary bound atoms for decision making.
@@ -753,9 +751,9 @@ channelLit t predTask succTask = do
   case result of
     Right ()                      -> pure Nothing
     Left ( LiftedCycle _info )    ->
-      -- A matrix cycle: explained coarsely by the active precedence snapshot.
-      -- TODO: reconstruct the cycle's precedence chain for a tight reason.
-      snapshotConflict t "cycle" Nothing
+      -- A matrix cycle: the new edge @predTask ≺ succTask@ closes a path
+      -- @succTask ≺ … ≺ predTask@ of true precedence literals into a cycle.
+      reconstructCycle t predTask succTask
     Left ( LiftedConflict c )     -> pure ( Just c )
   where
     onNewEdge
@@ -804,7 +802,9 @@ channelBound
 channelBound t task l pol = do
   let tis = tasks t
   before <- readTask t task
-  let dur = taskDuration before
+  let dur  = taskDuration before
+      est0 = est before
+      lct0 = lct before
   moved <- case pol of
     -- @start ≤ l@ ⟹ completion ≤ the equivalent completion bound.
     Positive ->
@@ -814,17 +814,35 @@ channelBound t task l pol = do
       constrainToAfter  ( schedTrail t ) tis task ( startUpperToEstLower l )
   after <- readTask t task
   if null ( intervals ( taskAvailability after ) )
-  then
-    -- A channelled-in (decided) bound that empties the domain. With the
-    -- monotonicity clauses, a cross of an existing bound is normally caught as a
-    -- native BCP conflict before reaching here; this is the fallback, explained
-    -- by the coarse trail snapshot rather than continuing on an empty domain.
-    snapshotConflict t "empty-domain-in" Nothing
+  then do
+    -- A channelled-in (decided) bound crossed an existing bound, emptying the
+    -- domain. With the monotonicity clauses this is normally caught as a native
+    -- BCP conflict first; here we build the tight crossing conflict. The
+    -- enforced bounds pit the channelled bound against the surviving one
+    -- (@est0@\/@lct0@); 'emptyDomainConflict' cites both crossing bound atoms
+    -- (each already on the trail) plus any carvers. The current state is the
+    -- previous round's fixpoint, captured by 'currentCapture'.
+    let ( lo, hi ) = case pol of
+          Positive -> ( est0, completionFromLatestStart dur l )
+          Negative -> ( startUpperToEstLower l, lct0 )
+    cap <- currentCapture t
+    emptyDomainConflict t cap task lo hi
   else do
     -- Wake every propagator on this task next round, but only if the domain
     -- actually moved: a no-op re-drain must not re-trigger the full sweep.
     when ( isJust moved ) ( markBoundDirty t task )
-    pure Nothing
+    -- Citability invariant: a channel-in /jump/ over a gap leaves the new
+    -- canonical @est@\/@lst@ at a threshold whose atom is not the channelled-in
+    -- one, so reify and assert it here with a tight reason (the channelled-in
+    -- literal, plus carvers for any non-ground gap skipped). An /exact/ move
+    -- lands on the channelled-in atom itself.
+    case moved of
+      Just MovedJumped -> do
+        ( channelAtom, _ ) <- internBoundAtomWith t ( SAT.newAuxVar ( solver t ) ) task l
+        let channelledLit = case pol of { Positive -> channelAtom; Negative -> negateLit channelAtom }
+            side          = case pol of { Positive -> Latest;      Negative -> Earliest }
+        assertChannelInJump t side task [ channelledLit ]
+      _ -> pure Nothing
 
 -- | Add a pair of task indices to the precedence-dirty set so the next
 -- 'runPropagators' call wakes the matrix-watching propagators on them. While
@@ -885,40 +903,33 @@ runPropagators t = do
           | otherwise          -> seedAllOf ( propagators t ) ( precDirty <> bDirty )
   writeMutVar ( dirtySeed t )  ( Just IntSet.empty )
   writeMutVar ( boundDirty t ) IntSet.empty
-  ( eRes, finalUpdates ) <- withPhaseTiming ( monitor t ) "propagators" $
+  writeMutVar ( pendingConflict t ) Nothing
+  -- The propagation loop channels each pass's inferences as it applies them,
+  -- via 'passChanneller': bound tightenings and precedences reach the SAT trail
+  -- with tight reasons built from the pass's inference-time (pre-pass)
+  -- antecedents, captured before the pass mutates anything. A channel conflict
+  -- is stashed in 'pendingConflict'.
+  ( eRes, _finalUpdates ) <- withPhaseTiming ( monitor t ) "propagators" $
     runSchedule ( tasks t )
-      ( propagationLoop ( monitor t ) ( maxPropRounds t ) ( schedTrail t ) ( propagators t ) seed )
+      ( propagationLoop ( monitor t ) ( maxPropRounds t ) ( schedTrail t )
+          ( propagators t ) ( Just ( passChanneller t ) ) seed )
   -- TODO: 'propagationLoop' doesn't properly report 'GiveUp', which means we
   -- currently conflate "fixpoint, consistent" with "gave up early".
-  let cts = taskConstraints finalUpdates
-  -- Accumulate the tasks carved this pass; a later bound that jumps over a
-  -- carved gap on such a task gets a coarse reason.
-  modifyMutVar' ( carved t ) ( <> carvedTasks finalUpdates )
-  carvedSet <- readMutVar ( carved t )
-  -- The accumulated 'TaskUpdates' is preserved even when a propagator threw
-  -- (the state sits below 'ExceptT'), so we can channel out the precedences and
-  -- bound tightenings derived so far before turning the infeasibility into a
-  -- conflict.
-  mbConf1 <- withPhaseTiming ( monitor t ) "assert-prec" $
-    assertEmittedPrecedences t ( precedences cts )
-  case mbConf1 of
+  mbChannelConf <- readMutVar ( pendingConflict t )
+  case mbChannelConf of
     Just c  -> pure ( Just c )
-    Nothing -> do
-      mbConf2 <-
-        if useBoundAtoms t
-        then withPhaseTiming ( monitor t ) "channel-out" $
-               channelOutBounds t ( tightenedBounds finalUpdates ) ( boundReasons cts ) carvedSet
-        else pure Nothing
-      case mbConf2 of
-        Just c  -> pure ( Just c )
-        Nothing -> case eRes of
-          Right () -> do
+    Nothing -> case eRes of
+      Right () -> do
 #ifdef DEBUG
-            checkMatrixTrailInvariant t "runPropagators (end, no conflict)"
+        checkMatrixTrailInvariant t "runPropagators (end, no conflict)"
+        debugAssertCitability t "runPropagators (end, no conflict)"
 #endif
-            pure Nothing
-          Left infeasible ->
-            buildInfeasibleConflict t ( boundReasons cts ) carvedSet infeasible
+        pure Nothing
+      Left infeasible ->
+        -- A propagator emptied a domain (or overloaded the resource). Its
+        -- inference-time antecedents were captured by the throwing pass and are
+        -- in 'passCapture'.
+        buildInfeasibleConflict t infeasible
 
 #ifdef DEBUG
 -- | Check that propagators have indeed run to a fixpoint when they claim to.
@@ -931,7 +942,7 @@ debugAuditPropagationFixpoint t = do
   let allTasks = IntSet.fromList [ 0 .. numTasks ( atoms t ) - 1 ]
   ( eRes, updates ) <- runSchedule ( tasks t )
     ( propagationLoop ( monitor t ) ( maxPropRounds t ) ( schedTrail t )
-        ( propagators t ) ( seedAllOf ( propagators t ) allTasks ) )
+        ( propagators t ) Nothing ( seedAllOf ( propagators t ) allTasks ) )
   let movedTasks =
         IntMap.keysSet $
           IntMap.filter ( \ ( e, l ) -> isJust e || isJust l ) ( tightenedBounds updates )
@@ -971,15 +982,16 @@ runSchedule tis action =
 
 -- | Assert each propagator-detected precedence as a theory propagation. The
 -- precedence @p ≺ i@ is an energetic consequence of the responsible subset's
--- bounds, so its reason cites those tasks' current bound atoms (falling back to
--- a coarse trail snapshot when those bounds are not reified — see the header).
+-- bounds, so its reason cites those tasks' pre-pass bound atoms (from @cap@),
+-- all already on the trail.
 assertEmittedPrecedences
   :: forall mode s task t
   .  ( Num t, Measurable t, Bounded t, MonitorMode mode )
   => Theory mode s task t
+  -> PassCapture t
   -> IntMap ( IntSet, IntSet )
   -> ST s ( Maybe SAT.Conflict )
-assertEmittedPrecedences t precsMap = goEntries ( IntMap.toList precsMap )
+assertEmittedPrecedences t cap precsMap = goEntries ( IntMap.toList precsMap )
   where
     goEntries :: [ ( Int, ( IntSet, IntSet ) ) ] -> ST s ( Maybe SAT.Conflict )
     goEntries [] = pure Nothing
@@ -998,21 +1010,23 @@ assertEmittedPrecedences t precsMap = goEntries ( IntMap.toList precsMap )
     goEdges :: [ ( Int, Int, [ Int ] ) ] -> ST s ( Maybe SAT.Conflict )
     goEdges [] = pure Nothing
     goEdges ( ( a, b, why ) : rest ) = do
-      mb <- assertOnePrecedence t a b why
+      mb <- assertOnePrecedence t cap a b why
       case mb of
         Just c  -> pure ( Just c )
         Nothing -> goEdges rest
 
--- | Assert @a ≺ b@ with a reason built from the bound atoms of @reasonTasks@
--- (coarse snapshot fallback when those bounds are not reified on the trail).
+-- | Assert @a ≺ b@ with a tight reason built from the pre-pass bound atoms of
+-- @reasonTasks@ — the energetic antecedents the propagator read to detect the
+-- precedence, all already on the trail.
 assertOnePrecedence
   :: forall mode s task t
   .  ( Num t, Measurable t, Bounded t, MonitorMode mode )
   => Theory mode s task t
+  -> PassCapture t
   -> Int -> Int
   -> [ Int ]   -- ^ tasks whose bounds justify the precedence
   -> ST s ( Maybe SAT.Conflict )
-assertOnePrecedence t a b reasonTasks = do
+assertOnePrecedence t cap a b reasonTasks = do
   ok <- SAT.isOk ( solver t )
   if not ok then pure Nothing
   else do
@@ -1025,7 +1039,8 @@ assertOnePrecedence t a b reasonTasks = do
       error "Schedule.LCG.Theory.assertOnePrecedence: self-precedence"
 #endif
     let lit = precLit ( atoms t ) a b
-    reason <- boundReasonOrSnapshot t lit reasonTasks []
+    bounds <- capSubsetLits t cap reasonTasks
+    reason <- boundReasonLits lit bounds
     assertBatch t lit reason
 
 -------------------------------------------------------------------------------
@@ -1068,57 +1083,85 @@ internDecisionBoundAtom t i thr = do
   when isNew ( SAT.bumpVarActivity ( solver t ) ( litVar lit ) )
   pure lit
 
--- | The literal asserting task @i@'s current lower bound @start_i ≥ est_i@. On
--- the single latest-start axis this is the /negative/ literal of the atom at
--- threshold @'estLowerToStartUpper' est_i@. Interns the atom (with its
--- monotonicity links) if needed.
-currentEstLit
+-- | The literal asserting the /lower/ bound @start_i ≥ e@ for the given earliest
+-- start @e@: the /negative/ literal of the atom at threshold
+-- @'estLowerToStartUpper' e@. Interns the atom (with its monotonicity links) if
+-- needed. Interning at a value @e@ already on the trail returns the asserted
+-- atom.
+--
+-- See also 'lctLitAt'.
+estLitAt
   :: ( Measurable t, Bounded t )
-  => Theory mode s task t -> Int -> ST s Lit
-currentEstLit t i = do
-  task <- readTask t i
+  => Theory mode s task t -> Int -> Endpoint ( EarliestTime t ) -> ST s Lit
+estLitAt t i e = do
   ( lit, _ ) <- internBoundAtomWith t ( SAT.newAuxVar ( solver t ) ) i
-                  ( estLowerToStartUpper ( est task ) )
+                  ( estLowerToStartUpper e )
   pure ( negateLit lit )
 
--- | The literal asserting task @i@'s current upper bound @start_i ≤ lst_i@: the
--- /positive/ literal of the atom at the latest-start threshold. The threshold is
--- taken via 'latestStartFromCompletion' from the latest /completion/ @lct_i@, so
--- it is the canonical /Inclusive/ latest start (\"start ≤ lst, lst attainable\").
--- Using the raw @lst task@ — which inherits the @Exclusive@ clusivity of the
--- completion convention — would collide on a single variable with the
--- @Exclusive@ lower-bound atom of a zero-slack task; the clusivity conversion is
--- exactly what keeps the two distinct on one axis. Interns the atom if needed.
+-- | The literal asserting the /upper/ bound @start_i ≤ lst@ for the given latest
+-- completion @l@: the /positive/ literal of the atom at the latest-start
+-- threshold.
+--
+-- See also 'estLitAt'.
+lctLitAt
+  :: ( Num t, Measurable t, Bounded t )
+  => Theory mode s task t -> Int -> Endpoint ( LatestTime t ) -> ST s Lit
+lctLitAt t i l = do
+  task <- readTask t i
+  fst <$> internBoundAtomWith t ( SAT.newAuxVar ( solver t ) ) i
+            ( latestStartFromCompletion ( taskDuration task ) l )
+
+-- | The literal asserting task @i@'s /current/ (domain) lower bound
+-- @start_i ≥ est_i@.
+currentEstLit
+  :: ( Num t, Measurable t, Bounded t )
+  => Theory mode s task t -> Int -> ST s Lit
+currentEstLit t i = readTask t i >>= estLitAt t i . est
+
+-- | The literal asserting task @i@'s /current/ (domain) upper bound
+-- @start_i ≤ lst_i@.
 currentLctLit
   :: ( Num t, Measurable t, Bounded t )
   => Theory mode s task t -> Int -> ST s Lit
-currentLctLit t i = do
-  task <- readTask t i
-  fst <$> internBoundAtomWith t ( SAT.newAuxVar ( solver t ) ) i
-            ( latestStartFromCompletion ( taskDuration task ) ( lct task ) )
+currentLctLit t i = readTask t i >>= lctLitAt t i . lct
+
+-- | The current bound literal of task @i@ on the given side, interning its atom
+-- if needed: the lower bound @start ≥ est@ at 'Earliest' handedness, the upper
+-- bound @start ≤ lst@ at 'Latest'.
+sideLit
+  :: ( Num t, Measurable t, Bounded t )
+  => Theory mode s task t -> Handedness -> Int -> ST s Lit
+sideLit t Earliest i = currentEstLit t i
+sideLit t Latest   i = currentLctLit t i
 
 -- | The current lower- and upper-bound literals of every task in the list
--- (two per task), but only if every one is currently /true/ on the trail —
--- i.e. each task's actual @est@\/@lst@ is a reified, asserted bound atom.
+-- (two per task: @start ≥ est@ and @start ≤ lst@), interning their atoms.
 --
--- Returns 'Nothing' as soon as some task's bound atom is unasserted (an
--- interior-hole or channelled-in bound that was not promoted to an atom), so
--- the caller can fall back to a coarse but always-valid reason rather than
--- cite a literal that is not on the trail.
-checkedBoundLits
+-- /Citability invariant:/ each is already asserted true on the trail. A
+-- propagator only ever reads a task's current @est@\/@lst@ to make an
+-- inference, and every bound that is set — by 'seedInitialBounds', by
+-- 'channelBound' (channel-in), or by 'channelOutBounds' (channel-out) — reifies
+-- and asserts its atom at the new threshold, jumps included. So citing these is
+-- sound, and the lazy reason capturing them resolves against on-trail literals
+-- when 1-UIP forces it.
+boundLits
   :: ( Num t, Measurable t, Bounded t )
-  => Theory mode s task t -> [ Int ] -> ST s ( Maybe [ Lit ] )
-checkedBoundLits t = go []
+  => Theory mode s task t -> [ Int ] -> ST s [ Lit ]
+boundLits t = fmap concat . traverse one
   where
-    go acc [] = pure ( Just ( reverse acc ) )
-    go acc ( i : is ) = do
-      e  <- currentEstLit t i
-      ev <- SAT.litValue ( solver t ) e
-      l  <- currentLctLit t i
-      lv <- SAT.litValue ( solver t ) l
-      if ev == LTrue && lv == LTrue
-      then go ( l : e : acc ) is
-      else pure Nothing
+    one i = do
+      e <- currentEstLit t i
+      l <- currentLctLit t i
+      pure [ e, l ]
+
+-- | Assemble a tight lazy reason for a theory propagation: the @propLit@,
+-- resolved against the negations of its @antecedents@ (all currently true on
+-- the trail). The closure captures the literals directly (interned atoms are
+-- stable), so forcing it during 1-UIP yields the supporting clause.
+boundReasonLits
+  :: Lit -> [ Lit ] -> ST s ( LazyReason s )
+boundReasonLits propLit antecedents = do
+  pure ( LazyReason ( pure ( propLit : map negateLit antecedents ) ) )
 
 -- | The precedence literal between @i@ and @p@ that the matrix currently holds
 -- (true on the trail), or 'Nothing' if they are unordered.
@@ -1132,131 +1175,292 @@ precEdgeLit t i p = do
     GreaterThan -> Just ( precLit ( atoms t ) i p )  -- i ≺ p
     _           -> Nothing
 
--- | Build a local clausal reason for a theory propagation: cite the @subset@'s
--- current bound atoms together with @extra@ (already-true literals, e.g.
--- precedence edges). Falls back to a coarse snapshot reason when any subset
--- bound atom is /not/ currently asserted — which happens when a task's actual
--- @est@\/@lst@ landed on an interior hole or was channelled in from a learnt
--- clause, so its exact bound is not a reified, on-trail atom. Citing an
--- unasserted literal would be unsound (and would crash 1-UIP), so we take the
--- always-valid full snapshot instead.
-boundReasonOrSnapshot
-  :: forall mode s task t
-  .  ( Num t, Measurable t, Bounded t, MonitorMode mode )
-  => Theory mode s task t
-  -> Lit       -- ^ the propagated literal
-  -> [ Int ]   -- ^ subset whose bound atoms are cited
-  -> [ Lit ]   -- ^ extra antecedents already known true (e.g. precedence edges)
-  -> ST s ( LazyReason s )
-boundReasonOrSnapshot t propLit subset extra = do
-  mbBounds <- checkedBoundLits t subset
-  case mbBounds of
-    Nothing     -> do
-      tickReasonKind ( monitor t ) "snapshot-unreified"
-      snapshotReason t propLit
-    Just bounds -> do
-      tickReasonKind ( monitor t ) "tight"
-      pure ( LazyReason ( pure ( propLit : map negateLit ( bounds ++ extra ) ) ) )
+-------------------------------------------------------------------------------
+-- Compulsory parts and carver reconstruction.
 
--- | The local clausal reason for a bound tightening on task @i@: the
--- responsible subset's current bound atoms, plus any precedence literals
--- between @i@ and the subset that the matrix currently holds (which makes the
--- precedence-matrix inferences sound and is a harmless, true antecedent for
--- the energetic ones).
-boundPropReason
+-- | A task's compulsory part @[lst, ect]@: the interval it necessarily occupies
+-- under its current bounds (the construction 'timetable' carves with). Empty
+-- when the task is not yet fixed enough to have one.
+compulsoryPart :: ( Num t, Measurable t, Bounded t ) => Task task t -> Interval t
+compulsoryPart taskC =
+  Interval ( flipClusivity ( coerce ( lst taskC ) ) )
+           ( flipClusivity ( coerce ( ect taskC ) ) )
+
+-- | The window of @i@'s /ground/ availability that a bound jump on @side@
+-- skipped, given the new (post-jump) bound: the span strictly below the new
+-- earliest start ('Earliest'), or strictly above the new latest start
+-- ('Latest'). The carvers covering this span explain the jump.
+jumpWindow
+  :: ( Num t, Measurable t, Bounded t )
+  => Theory mode s task t -> Handedness -> Int
+  -> Endpoint ( EarliestTime t )   -- ^ new earliest start (for 'Earliest')
+  -> Endpoint ( LatestTime t )     -- ^ new latest start  (for 'Latest')
+  -> Intervals t
+jumpWindow t side i newEst newLst =
+  case side of
+    Earliest -> cutAfter  ( estLowerToStartUpper newEst ) ground
+    Latest   -> cutBefore ( startUpperToEstLower newLst ) ground
+  where
+    ground = groundAvail t Boxed.Vector.! i
+
+-- | Walk every task @c ≠ i@, removing its (non-empty) compulsory part — looked
+-- up via @compOf@ — from the given window of @i@'s /ground/ availability; return
+-- the residual together with the carvers whose compulsory part actually shrank
+-- it.
+--
+-- Ground gaps and prune-removed short slots are absent from the residual to
+-- begin with, so they contribute no carver — they are ground facts (the
+-- instance availability and @i@'s own duration). Only @timetable@ carvings
+-- attribute to a (cited) carver, which is exactly the non-ground removals.
+collectCarversWith
+  :: ( Num t, Measurable t, Bounded t )
+  => ( Int -> ST s ( Interval t ) )   -- ^ compulsory part of a task
+  -> Int                              -- ^ number of tasks
+  -> Int                              -- ^ the carved task @i@ (excluded)
+  -> Intervals t                      -- ^ window of @i@'s ground availability
+  -> ST s ( Intervals t, [ Int ] )
+collectCarversWith compOf n i window0 = go ( n - 1 ) window0 []
+  where
+    go c acc used
+      | c < 0     = pure ( acc, used )
+      | c == i    = go ( c - 1 ) acc used
+      | otherwise = do
+          comp <- compOf c
+          if isEmpty comp
+          then go ( c - 1 ) acc used
+          else
+            let acc' = remove acc comp
+            in if acc' == acc
+               then go ( c - 1 ) acc  used          -- did not shrink: skip
+               else go ( c - 1 ) acc' ( c : used )
+
+-- | Carver bound literals (current state) justifying that the bound on @side@
+-- /jumped/ to @i@'s current bound: the tasks whose /current/ compulsory parts
+-- removed @i@'s ground availability across the skipped span. Used by the
+-- channel-in path, where the current domain is the previous round's fixpoint and
+-- every cited bound is already on the trail.
+jumpCarverLits
+  :: ( Num t, Measurable t, Bounded t )
+  => Theory mode s task t -> Handedness -> Int -> ST s [ Lit ]
+jumpCarverLits t side i = do
+  task <- readTask t i
+  let window = jumpWindow t side i ( est task )
+                 ( latestStartFromCompletion ( taskDuration task ) ( lct task ) )
+  ( _residual, carvers ) <-
+    collectCarversWith ( fmap compulsoryPart . readTask t ) ( numTasks ( atoms t ) ) i window
+  boundLits t carvers
+
+-- | Reify and assert task @i@'s current bound on @side@ after a /channel-in/
+-- jump, with a tight reason: the @base@ antecedents (the channelled-in literal)
+-- plus the carvers of the skipped span.
+--
+-- Only jumps need this: an /exact/ channel-in move lands the canonical
+-- @est@\/@lst@ atom on the channelled-in atom itself (the registry canonicalises
+-- both thresholds, see 'Schedule.Interval.canonicalStartUpper'), so it is already
+-- on the trail. A jump lands on a further threshold whose atom must be asserted.
+-- The current state is the previous round's fixpoint, so every cited literal is
+-- already on the trail.
+assertChannelInJump
   :: forall mode s task t
   .  ( Num t, Measurable t, Bounded t, MonitorMode mode )
-  => Theory mode s task t
-  -> Lit       -- ^ the propagated bound literal
-  -> Int       -- ^ the constrained task
-  -> [ Int ]   -- ^ the responsible subset
-  -> ST s ( LazyReason s )
-boundPropReason t propLit i subset = do
-  precLits <- catMaybes <$> traverse ( precEdgeLit t i ) subset
-  boundReasonOrSnapshot t propLit subset precLits
+  => Theory mode s task t -> Handedness -> Int -> [ Lit ] -> ST s ( Maybe SAT.Conflict )
+assertChannelInJump t side i base = do
+  lit     <- sideLit t side i
+  carvers <- jumpCarverLits t side i
+  reason  <- boundReasonLits lit ( base ++ carvers )
+  assertBatch t lit reason
 
 -------------------------------------------------------------------------------
--- Channel est/lct tightenings out as bound literals.
+-- Per-pass channelling (capture / channel).
+--
+-- A propagation /pass/ (one propagator's emitted constraints) is channelled to
+-- the SAT trail right after it is applied. Reasons cite the antecedents the
+-- propagator read — the /pre-pass/ bounds and matrix edges, captured by
+-- 'capturePass' before 'Schedule.Constraint.applyConstraints' mutates anything.
+-- Pre-pass antecedents were asserted by earlier passes (or seeded), so they sit
+-- strictly earlier on the trail than this pass's freshly-asserted bounds; the
+-- implication graph stays acyclic and 1-UIP resolves correctly.
 
--- | For each task whose earliest start \/ latest completion moved this pass,
--- assert the matching bound literal with a local clausal reason. Tasks whose
--- domain emptied are skipped (handled by the infeasibility conflict).
-channelOutBounds
+-- | Inference-time snapshot of a propagation pass, taken before it is applied.
+data PassCapture t = PassCapture
+  { -- | Per task, its pre-pass @(est, lct, compulsory part)@. The bounds are
+    -- re-interned (as on-trail atoms) when cited; the compulsory part drives
+    -- carver reconstruction for jumps.
+    capBounds  :: !( IntMap ( Endpoint ( EarliestTime t ), Endpoint ( LatestTime t ), Interval t ) )
+  , -- | Per constrained task, the matrix precedence edges between it and its
+    -- est-side responsible subset (pre-pass; empty for energetically-detected
+    -- precedences whose edge is only created this pass).
+    capEstPrec :: !( IntMap [ Lit ] )
+  , -- | As 'capEstPrec', for the lct-side subset.
+    capLctPrec :: !( IntMap [ Lit ] )
+  , -- | The pass's responsible subsets (@boundReasons@), so a domain emptied by
+    -- the pass can cite the same energetic antecedents for its crossing bounds.
+    capBR      :: !( IntMap ( IntSet, IntSet ) )
+  }
+
+emptyPassCapture :: PassCapture t
+emptyPassCapture = PassCapture IntMap.empty IntMap.empty IntMap.empty IntMap.empty
+
+-- | The captured pre-pass compulsory part of a task (empty when absent).
+capCompOf :: ( Num t, Measurable t, Bounded t ) => PassCapture t -> Int -> Interval t
+capCompOf cap c = case IntMap.lookup c ( capBounds cap ) of
+  Just ( _, _, comp ) -> comp
+  Nothing             -> Interval top bottom   -- empty (no compulsory part)
+
+-- | Snapshot every non-empty task's current @(est, lct, compulsory part)@. The
+-- bounds re-intern as on-trail atoms when cited; the compulsory part drives
+-- carver reconstruction.
+snapshotBounds
+  :: forall mode s task t
+  .  ( Num t, Measurable t, Bounded t )
+  => Theory mode s task t
+  -> ST s ( IntMap ( Endpoint ( EarliestTime t ), Endpoint ( LatestTime t ), Interval t ) )
+snapshotBounds t =
+  foldM
+    ( \ acc i -> do
+        task <- readTask t i
+        pure $
+          if null ( intervals ( taskAvailability task ) )
+          then acc
+          else IntMap.insert i ( est task, lct task, compulsoryPart task ) acc
+    ) IntMap.empty [ 0 .. numTasks ( atoms t ) - 1 ]
+
+-- | A capture of the /current/ state, with no responsible subsets or precedence
+-- edges: used by the channel-in path, where the current domain is stable and on
+-- the trail, so a conflict it raises cites current atoms directly.
+currentCapture
+  :: forall mode s task t
+  .  ( Num t, Measurable t, Bounded t )
+  => Theory mode s task t -> ST s ( PassCapture t )
+currentCapture t = do
+  bnds <- snapshotBounds t
+  pure ( PassCapture bnds IntMap.empty IntMap.empty IntMap.empty )
+
+-- | Snapshot the inference-time antecedents of a pass, before it is applied.
+capturePass
+  :: forall mode s task t
+  .  ( Num t, Measurable t, Bounded t )
+  => Theory mode s task t -> Constraints t -> ST s ()
+capturePass t ( Constraints { boundReasons = brs } ) = do
+#ifdef DEBUG
+  -- Capturing a task's pre-pass bound only yields an on-trail atom if the
+  -- citability invariant held coming into this pass. Check it here so a
+  -- violation is attributed to the prior pass that left a bound unasserted,
+  -- rather than surfacing later as an undef antecedent in some reason.
+  debugAssertCitability t "capturePass (start)"
+#endif
+  bnds <- snapshotBounds t
+  ( eP, lP ) <- foldM
+    ( \ ( ep, lp ) ( i, ( estWhy, lctWhy ) ) -> do
+        eLits <- catMaybes <$> traverse ( precEdgeLit t i ) ( IntSet.toList estWhy )
+        lLits <- catMaybes <$> traverse ( precEdgeLit t i ) ( IntSet.toList lctWhy )
+        pure ( IntMap.insert i eLits ep, IntMap.insert i lLits lp )
+    ) ( IntMap.empty, IntMap.empty ) ( IntMap.toList brs )
+  writeMutVar ( passCapture t ) ( PassCapture bnds eP lP brs )
+
+-- | The pre-pass bound literals (est + lst) of a subset, interned from the
+-- captured values so they are the on-trail atoms the propagator read.
+capSubsetLits
+  :: ( Num t, Measurable t, Bounded t )
+  => Theory mode s task t -> PassCapture t -> [ Int ] -> ST s [ Lit ]
+capSubsetLits t cap = fmap concat . traverse one
+  where
+    one s = case IntMap.lookup s ( capBounds cap ) of
+      Just ( eV, lV, _ ) -> do
+        el <- estLitAt t s eV
+        ll <- lctLitAt t s lV
+        pure [ el, ll ]
+      -- A cited task absent from the snapshot had an empty pre-pass domain,
+      -- which cannot happen for a task a live inference depends on.
+      Nothing -> boundLits t [ s ]
+
+-- | Carver bound literals (pre-pass) for a jump to @newBound@: reconstruct the
+-- carvers from the /captured/ compulsory parts and cite their captured bounds.
+capCarverLits
+  :: ( Num t, Measurable t, Bounded t )
+  => Theory mode s task t -> PassCapture t -> Handedness -> Int
+  -> Endpoint ( EarliestTime t ) -> Endpoint ( LatestTime t ) -> ST s [ Lit ]
+capCarverLits t cap side i newEst newLst = do
+  let window = jumpWindow t side i newEst newLst
+      compOf c = pure $ case IntMap.lookup c ( capBounds cap ) of
+        Just ( _, _, comp ) -> comp
+        Nothing             -> Interval top bottom   -- empty (no compulsory part)
+  ( _residual, carvers ) <- collectCarversWith compOf ( numTasks ( atoms t ) ) i window
+  capSubsetLits t cap carvers
+
+-- | Channel a freshly-applied propagation pass: assert its bound tightenings,
+-- then its detected precedences, each with a tight pre-pass reason. Returns the
+-- conflict if a channelled literal contradicted the trail (which, for bounds,
+-- the domain-emptiness check rules out).
+channelPass
   :: forall mode s task t
   .  ( Num t, Measurable t, Bounded t, MonitorMode mode )
   => Theory mode s task t
-  -> IntMap ( Maybe BoundMove, Maybe BoundMove )  -- ^ per task, how @(est, lct)@ moved
-  -> IntMap ( IntSet, IntSet )        -- ^ per task, responsible subset @(est side, lct side)@
-  -> IntSet                           -- ^ carved tasks (jumps on these get coarse reasons)
+  -> Constraints t
+  -> IntMap ( Maybe BoundMove, Maybe BoundMove )  -- ^ how each task's @(est, lct)@ moved
   -> ST s ( Maybe SAT.Conflict )
-channelOutBounds t deltas brs carvedSet = goTasks ( IntMap.toList deltas )
+channelPass t cts deltas = do
+  cap <- readMutVar ( passCapture t )
+  mbB <- channelBounds cap ( IntMap.toList deltas )
+  case mbB of
+    Just c  -> pure ( Just c )
+    Nothing -> assertEmittedPrecedences t cap ( precedences cts )
   where
-    goTasks :: [ ( Int, ( Maybe BoundMove, Maybe BoundMove ) ) ] -> ST s ( Maybe SAT.Conflict )
-    goTasks [] = pure Nothing
-    goTasks ( ( i, ( estMv, lctMv ) ) : rest ) = do
+    brs = boundReasons cts
+
+    channelBounds :: PassCapture t -> [ ( Int, ( Maybe BoundMove, Maybe BoundMove ) ) ] -> ST s ( Maybe SAT.Conflict )
+    channelBounds _   [] = pure Nothing
+    channelBounds cap ( ( i, ( estMv, lctMv ) ) : rest ) = do
       ok <- SAT.isOk ( solver t )
       if not ok then pure Nothing
       else do
         task <- readTask t i
         if null ( intervals ( taskAvailability task ) )
-        then goTasks rest  -- empty domain: surfaced by the infeasibility conflict
+        then channelBounds cap rest  -- empty domain: surfaced by the infeasibility conflict
         else do
-          let ( estWhy, lctWhy ) = maybe ( IntSet.empty, IntSet.empty )
-                                         id ( IntMap.lookup i brs )
-              iCarved = IntSet.member i carvedSet
-          mb1 <- assertEstBound t i estMv estWhy iCarved
+          let ( estWhy, lctWhy ) = maybe ( IntSet.empty, IntSet.empty ) id ( IntMap.lookup i brs )
+          mb1 <- channelMove cap Earliest i estMv ( IntSet.toList estWhy ) ( capEstPrec cap )
           case mb1 of
             Just c  -> pure ( Just c )
             Nothing -> do
-              mb2 <- assertLctBound t i lctMv lctWhy iCarved
+              mb2 <- channelMove cap Latest i lctMv ( IntSet.toList lctWhy ) ( capLctPrec cap )
               case mb2 of
                 Just c  -> pure ( Just c )
-                Nothing -> goTasks rest
+                Nothing -> channelBounds cap rest
 
--- | Assert task @i@'s lower bound @start_i ≥ est_i@, reasoned from the
--- responsible subset — unless the move jumped over a gap on a carved task,
--- where the energetic antecedents do not soundly explain the jump and a coarse
--- reason is taken instead.
-assertEstBound
+    channelMove
+      :: PassCapture t -> Handedness -> Int -> Maybe BoundMove -> [ Int ] -> IntMap [ Lit ]
+      -> ST s ( Maybe SAT.Conflict )
+    channelMove _   _    _ Nothing       _      _    = pure Nothing
+    channelMove cap side i ( Just move ) subset prec = do
+      lit        <- sideLit t side i
+      subsetLits <- capSubsetLits t cap subset
+      let precLits = IntMap.findWithDefault [] i prec
+      carvers <- case move of
+        MovedExact  -> pure []
+        MovedJumped -> do
+          task <- readTask t i
+          capCarverLits t cap side i ( est task )
+            ( latestStartFromCompletion ( taskDuration task ) ( lct task ) )
+      reason <- boundReasonLits lit ( subsetLits ++ precLits ++ carvers )
+      assertBatch t lit reason
+
+-- | The per-pass channeller wiring 'capturePass' \/ 'channelPass' into
+-- 'propagationLoop'. A channel conflict is stashed in 'pendingConflict' and
+-- reported to the loop ('True') so it stops.
+passChanneller
   :: forall mode s task t
   .  ( Num t, Measurable t, Bounded t, MonitorMode mode )
-  => Theory mode s task t -> Int -> Maybe BoundMove -> IntSet -> Bool -> ST s ( Maybe SAT.Conflict )
-assertEstBound t i mv why iCarved =
-  assertMovedBound t mv iCarved ( currentEstLit t i ) i ( IntSet.toList why )
-
--- | Assert task @i@'s upper bound @start_i ≤ lst_i@. See 'assertEstBound'.
-assertLctBound
-  :: forall mode s task t
-  .  ( Num t, Measurable t, Bounded t, MonitorMode mode )
-  => Theory mode s task t -> Int -> Maybe BoundMove -> IntSet -> Bool -> ST s ( Maybe SAT.Conflict )
-assertLctBound t i mv why iCarved =
-  assertMovedBound t mv iCarved ( currentLctLit t i ) i ( IntSet.toList why )
-
--- | Shared driver for 'assertEstBound' \/ 'assertLctBound': skip an unmoved
--- bound; otherwise assert the bound literal with a tight reason, falling back
--- to a coarse snapshot only for a jumped move on a carved task.
-assertMovedBound
-  :: forall mode s task t
-  .  ( Num t, Measurable t, Bounded t, MonitorMode mode )
-  => Theory mode s task t
-  -> Maybe BoundMove
-  -> Bool          -- ^ is the task carved?
-  -> ST s Lit      -- ^ how to obtain (and intern) the bound literal
-  -> Int           -- ^ the constrained task
-  -> [ Int ]       -- ^ the responsible subset
-  -> ST s ( Maybe SAT.Conflict )
-assertMovedBound t mv iCarved getLit i subset = case mv of
-  Nothing          -> pure Nothing
-  Just MovedExact  -> do lit <- getLit; reason <- boundPropReason t lit i subset; assertBatch t lit reason
-  Just MovedJumped -> do
-    lit <- getLit
-    -- A jump over an instance gap is ground (sound); a jump on a carved task
-    -- may cross a non-ground carved gap, so explain it coarsely.
-    reason <-
-      if iCarved
-      then tickReasonKind ( monitor t ) "snapshot-carved-jump" *> snapshotReason t lit
-      else boundPropReason t lit i subset
-    assertBatch t lit reason
+  => Theory mode s task t -> PassChanneller s task t
+passChanneller t = PassChanneller
+  { onCapture = capturePass t
+  , onChannel = \ cts applied -> do
+      let deltas = fmap ( \ a -> ( estMove a, lctMove a ) ) applied
+      mbC <- channelPass t cts deltas
+      case mbC of
+        Just c  -> writeMutVar ( pendingConflict t ) ( Just c ) *> pure True
+        Nothing -> pure False
+  }
 
 -------------------------------------------------------------------------------
 -- Theory propagation primitives.
@@ -1275,10 +1479,51 @@ enqueuePropagated t lit reason = do
     -- resolves against ground-level literals, so it needs no reason clause.
     SAT.enqueueUndef ( solver t ) lit RFact
   else do
+#ifdef DEBUG
+    debugCheckReasonAntecedents t lit reason
+#endif
     -- TODO: the lazy-reason table is never reclaimed on backjump.
     lref <- SAT.recordLazyReason ( solver t ) reason
     SAT.enqueueUndef ( solver t ) lit ( RLazy lref )
   modifyMutVar' ( theoryPropCount t ) ( + 1 )
+
+#ifdef DEBUG
+-- | Verify, at enqueue time, that a theory-propagation reason is a valid unit
+-- reason for @propLit@: every other literal of the (forced) clause is currently
+-- /false/, i.e. each antecedent is true and was asserted strictly earlier on the
+-- trail. A 'LUndef' antecedent is a /future antecedent/ (cited before it is on
+-- the trail) and would corrupt 1-UIP; a 'LTrue' clause literal means a false
+-- antecedent was cited as if true. Either is a reason-construction bug.
+debugCheckReasonAntecedents
+  :: forall mode s task t
+  .  Theory mode s task t -> Lit -> LazyReason s -> ST s ()
+debugCheckReasonAntecedents t propLit reason = do
+  body <- forceLazyReason reason
+  let check []         = pure ()
+      check ( l : ls )
+        | litVar l == litVar propLit = check ls
+        | otherwise = do
+            v <- SAT.litValue ( solver t ) l
+            if v == LFalse
+            then check ls
+            else do
+              mbMeaning <- litMeaning ( atoms t ) ( boundAtoms t ) l
+              dump      <- SAT.dumpSolverState ( solver t )
+              error $ "Schedule.LCG.Theory.enqueuePropagated: reason for "
+                   <> show propLit <> " cites antecedent " <> show l <> " which is "
+                   <> show v <> " (expected the clause literal to be LFalse, i.e. the "
+                   <> "antecedent true and earlier on the trail)\n"
+                   <> "  antecedent meaning: " <> debugMeaning mbMeaning <> "\n"
+                   <> "full clause: " <> show body <> "\n" <> dump
+  check body
+
+-- | Render a decoded 'AtomMeaning' for diagnostics (the @t@-valued threshold is
+-- elided to avoid a 'Show' constraint rippling through 'enqueuePropagated').
+debugMeaning :: Maybe ( AtomMeaning t ) -> String
+debugMeaning Nothing                          = "unknown atom"
+debugMeaning ( Just ( MeansPrecedence p s ) ) = "precedence " <> show p <> " ≺ " <> show s
+debugMeaning ( Just ( MeansBound i _ pol ) )  = "bound task=" <> show i <> " pol=" <> show pol
+#endif
 
 -- | Try to assert a theory-inferred literal whose reason is /self-contained/
 -- (every cited literal is already on the trail), forcing the reason into a
@@ -1300,16 +1545,20 @@ assertTheoryLit t lit reason = do
       -- A derived transitive edge contradicted the assignment; its 3-literal
       -- reason is tight and self-contained.
       body <- forceLazyReason reason
-      tickConflict ( monitor t ) "derived-edge" True
+      tickConflict ( monitor t ) "derived-edge"
       recordReasonLen ( monitor t ) ( length body )
       literalsAsConflict "derived-edge" ( solver t ) body
 
--- | Like 'assertTheoryLit', but for the end-of-pass batch (bound tightenings
--- and detected precedences) whose lazy reasons may cite literals asserted
--- /later/ in the same batch. Those reasons are sound once forced during 1-UIP
--- (the whole batch is then on the trail), but an /immediate/ conflict here
--- could force a reason prematurely, so the rare immediate case falls back to
--- the coarse precedence snapshot.
+-- | Assert a theory-propagated literal carrying a tight lazy @reason@: enqueue
+-- it (the common case), skip it if already true, or — if it is already false —
+-- turn it directly into a conflict by forcing its reason.
+--
+-- The reason only cites antecedents already on the trail (the citability
+-- invariant), so forcing it on the immediate-conflict path is sound: the bound
+-- channel-out pass asserts every bound before precedences, so a precedence's
+-- reason resolves against on-trail bound atoms even when it conflicts at once.
+-- (Bound channel-out itself never reaches the false case — a bound that would
+-- contradict the trail empties the domain first, surfaced as 'EmptyDomain'.)
 assertBatch
   :: forall mode s task t
   .  MonitorMode mode
@@ -1322,215 +1571,150 @@ assertBatch t lit reason = do
   case val of
     LTrue  -> pure Nothing
     LUndef -> enqueuePropagated t lit reason *> pure Nothing
-    LFalse -> snapshotConflict t "batch" ( Just lit )
+    LFalse -> do
+      body <- forceLazyReason reason
+      tickConflict ( monitor t ) "bound"
+      recordReasonLen ( monitor t ) ( length body )
+      literalsAsConflict "bound" ( solver t ) body
 
 -------------------------------------------------------------------------------
 -- Conflict assembly.
 
--- | Turn a propagator-reported infeasibility into a SAT conflict.
+-- | Turn a propagator-reported infeasibility into a tight SAT conflict.
 buildInfeasibleConflict
   :: forall mode s task t
   .  ( Num t, Measurable t, Bounded t, MonitorMode mode )
   => Theory mode s task t
-  -> IntMap ( IntSet, IntSet )   -- ^ per-task responsible subsets (bound reasons)
-  -> IntSet                      -- ^ carved tasks
   -> Infeasible t
   -> ST s ( Maybe SAT.Conflict )
-buildInfeasibleConflict t brs carvedSet inf
-  | not ( useBoundAtoms t ) = case inf of
-      Overloaded    {} -> snapshotConflict t "overload"     Nothing
-      EmptyDomain   {} -> snapshotConflict t "empty-domain" Nothing
-      CycleDetected {} -> snapshotConflict t "cycle"        Nothing
-  | otherwise = case inf of
-      Overloaded { culprit } -> do
-        mbLits <- checkedBoundLits t ( IntSet.toList culprit )
-        case mbLits of
-          Just lits -> do
-            tickConflict ( monitor t ) "overload" True
-            recordReasonLen ( monitor t ) ( length lits )
-            literalsAsConflict "overload" ( solver t ) ( map negateLit lits )
-          -- A culprit's actual bound is not a reified, on-trail atom: fall back.
-          Nothing   -> snapshotConflict t "overload" Nothing
-      EmptyDomain { emptiedTask = i, enforcedEarliest = lo, enforcedLatest = hi }
-        -- A carved task's emptiness rests on non-ground interior holes (other
-        -- tasks' compulsory parts), so its tight reason must additionally cite
-        -- the carvers. If the gaps were in the ground instance, the two
-        -- crossing atoms suffice.
-        | IntSet.member i carvedSet -> carvedEmptyDomainConflict t brs i lo hi
-        | otherwise                 -> emptyDomainConflict t brs i lo hi "empty-domain" []
-      CycleDetected {} -> snapshotConflict t "cycle" Nothing
+buildInfeasibleConflict t = \ case
+  Overloaded { culprit } -> do
+    -- 'overloadCheck' reads (and never mutates) the current domains, so the
+    -- culprit's /current/ @est@\/@lst@ atoms are on the trail (channelled by
+    -- earlier passes). A conflict clause needs only that its literals are
+    -- currently false, so citing the current bounds directly is sound.
+    lits <- boundLits t ( IntSet.toList culprit )
+    tickConflict ( monitor t ) "overload"
+    recordReasonLen ( monitor t ) ( length lits )
+    literalsAsConflict "overload" ( solver t ) ( map negateLit lits )
+  EmptyDomain { emptiedTask = i, enforcedEarliest = lo, enforcedLatest = hi } -> do
+    -- The emptying pass's pre-pass antecedents are in 'passCapture'.
+    cap <- readMutVar ( passCapture t )
+    emptyDomainConflict t cap i lo hi
+  CycleDetected {} ->
+    -- The LCG path never adds precedence edges through 'Schedule.Precedence';
+    -- cycles arise only in 'channelLit' during channel-in. A propagator-reported
+    -- cycle would be a structural bug.
+    error "Schedule.LCG.Theory.buildInfeasibleConflict: unexpected CycleDetected from a propagator"
 
 -- | Tight conflict for an emptied task @i@: its enforced earliest start @lo@ and
--- latest completion @hi@ leave no slot. Cite @i@'s two crossing bound atoms
--- @[start ≥ lo]@ and @[start ≤ lst]@ (each reasoned from the squeezing
--- predecessors\/successors), together with any @carverLits@: already-true bound
--- atoms of the tasks whose compulsory parts carved @i@'s interior.
+-- latest completion @hi@ leave no slot. Assert @i@'s two crossing bound atoms
+-- @[start ≥ lo]@ and @[start ≤ lst]@ (each reasoned from its pre-pass squeezing
+-- predecessors\/successors), then emit the conflict citing them together with
+-- the carvers whose compulsory parts removed @i@'s interior across @[lo, hi]@
+-- (reconstructed from @i@'s ground availability and the pre-pass compulsory
+-- parts; empty when @[lo, hi]@ has no room in the ground instance).
+--
+-- Asserting the crossing bounds — rather than citing only the antecedents —
+-- guarantees the conflict mentions a current-level literal (the newly enforced
+-- crossing bound), which 1-UIP requires.
 emptyDomainConflict
   :: forall mode s task t
   .  ( Num t, Measurable t, Bounded t, MonitorMode mode )
   => Theory mode s task t
-  -> IntMap ( IntSet, IntSet )
+  -> PassCapture t
   -> Int
   -> Endpoint ( EarliestTime t )
   -> Endpoint ( LatestTime t )
-  -> Text          -- ^ conflict-source label
-  -> [ Lit ]       -- ^ extra carver bound atoms (already true on the trail)
   -> ST s ( Maybe SAT.Conflict )
-emptyDomainConflict t brs i lo hi label carverLits = do
-  let ( estWhy, lctWhy ) = maybe ( IntSet.empty, IntSet.empty ) id ( IntMap.lookup i brs )
+emptyDomainConflict t cap i lo hi = do
+  let ( estWhy, lctWhy ) = maybe ( IntSet.empty, IntSet.empty ) id ( IntMap.lookup i ( capBR cap ) )
   task <- readTask t i
-  let lstThr = latestStartFromCompletion ( taskDuration task ) hi
+  let dur    = taskDuration task
+      lstThr = latestStartFromCompletion dur hi
+      window = cutAfter hi ( cutBefore lo ( groundAvail t Boxed.Vector.! i ) )
+  ( residual, carvers ) <- collectCarversWith ( pure . capCompOf cap ) ( numTasks ( atoms t ) ) i window
+#ifdef DEBUG
+  -- The crossing bounds plus the carvers must genuinely leave no slot for @i@;
+  -- otherwise the reconstruction (and hence the learnt clause) is unsound. With
+  -- only @prune@\/@timetable@ removals this always holds (the others are ground).
+  let fits iv = measure iv >= dur
+  when ( any fits ( toList ( intervals residual ) ) ) $ do
+    dump <- SAT.dumpSolverState ( solver t )
+    error $ "Schedule.LCG.Theory.emptyDomainConflict: residual still admits task "
+         <> show i <> " (carver reconstruction incomplete)\n" <> dump
+#else
+  let _ = residual
+#endif
+  carverLits <- capSubsetLits t cap carvers
   ( lowerAtom, _ ) <- internBoundAtomWith t ( SAT.newAuxVar ( solver t ) ) i ( estLowerToStartUpper lo )
   ( upperLit,  _ ) <- internBoundAtomWith t ( SAT.newAuxVar ( solver t ) ) i lstThr
   let lowerLit = negateLit lowerAtom   -- start ≥ lo
-  -- Ensure both crossing bound atoms are on the trail (the emptied task was
-  -- skipped by channel-out), each with its local reason.
-  loReason <- boundPropReason t lowerLit i ( IntSet.toList estWhy )
+  -- Assert both crossing bound atoms (the emptied task was skipped by
+  -- channel-out), each with a tight pre-pass reason: the squeezing subset plus
+  -- the matrix precedence edges captured for that side.
+  estAnte <- ( ++ IntMap.findWithDefault [] i ( capEstPrec cap ) ) <$> capSubsetLits t cap ( IntSet.toList estWhy )
+  loReason <- boundReasonLits lowerLit estAnte
   mb1 <- assertBatch t lowerLit loReason
   case mb1 of
     Just c  -> pure ( Just c )
     Nothing -> do
-      hiReason <- boundPropReason t upperLit i ( IntSet.toList lctWhy )
+      lctAnte <- ( ++ IntMap.findWithDefault [] i ( capLctPrec cap ) ) <$> capSubsetLits t cap ( IntSet.toList lctWhy )
+      hiReason <- boundReasonLits upperLit lctAnte
       mb2 <- assertBatch t upperLit hiReason
       case mb2 of
         Just c  -> pure ( Just c )
         Nothing -> do
           let body = negateLit lowerLit : negateLit upperLit : map negateLit carverLits
-          tickConflict ( monitor t ) label True
+          tickConflict ( monitor t ) "empty-domain"
           recordReasonLen ( monitor t ) ( length body )
-          literalsAsConflict label ( solver t ) body
+          literalsAsConflict "empty-domain" ( solver t ) body
 
--- | Tight conflict for a /carved/ emptied task @i@. Its emptiness rests on the
--- interior holes carved by other tasks' compulsory parts @[lst_c, ect_c]@, which
--- are /not/ ground (they follow from the carvers' current bounds), so the
--- two-atom reason of 'emptyDomainConflict' alone would be unsound.
---
--- Reconstruct the carvers (tasks with a non-empty current compulsory part) and
--- /verify/, against @i@'s retained ground availability, that restricting to
--- @[lo, hi]@ and removing those compulsory parts leaves no slot long enough for
--- @i@.
---
--- Fall-back: if the residual still admits @i@, meaning that the current carvers
--- do not explain the emptiness (e.g. it arose from carvers whose bounds have since
--- moved, or the cited carver bound is not a reified on-trail atom), fall back
--- to the coarse snapshot (always sound).
-carvedEmptyDomainConflict
-  :: forall mode s task t
-  .  ( Num t, Measurable t, Bounded t, MonitorMode mode )
-  => Theory mode s task t
-  -> IntMap ( IntSet, IntSet )
-  -> Int
-  -> Endpoint ( EarliestTime t )
-  -> Endpoint ( LatestTime t )
-  -> ST s ( Maybe SAT.Conflict )
-carvedEmptyDomainConflict t brs i lo hi = do
-  task <- readTask t i
-  let dur     = taskDuration task
-      window0 = cutAfter hi ( cutBefore lo ( groundAvail t Boxed.Vector.! i ) )
-  ( residual, usedCarvers ) <- collectCarvers ( numTasks ( atoms t ) - 1 ) window0 []
-  -- Verified iff no surviving slot is long enough to hold @i@.
-  let fits iv = measure iv >= dur
-      verified = not ( any fits ( toList ( intervals residual ) ) )
-  if not verified
-  then snapshotConflict t "empty-domain (carved)" Nothing
-  else do
-    mbCarverLits <- checkedBoundLits t usedCarvers
-    case mbCarverLits of
-      Nothing         -> snapshotConflict t "empty-domain (carved)" Nothing
-      Just carverLits -> emptyDomainConflict t brs i lo hi "empty-domain (carved)" carverLits
-  where
-    -- Walk tasks @c = n .. 0@, removing each non-empty compulsory part from the
-    -- residual window and recording the carvers that actually shrank it.
-    collectCarvers :: Int -> Intervals t -> [ Int ] -> ST s ( Intervals t, [ Int ] )
-    collectCarvers c acc used
-      | c < 0     = pure ( acc, used )
-      | c == i    = collectCarvers ( c - 1 ) acc used
-      | otherwise = do
-          taskC <- readTask t c
-          let comp = compulsoryPart taskC
-          if isEmpty comp
-          then collectCarvers ( c - 1 ) acc used
-          else
-            let acc' = remove acc comp
-            in if acc' == acc
-               then collectCarvers ( c - 1 ) acc  used        -- did not shrink: skip
-               else collectCarvers ( c - 1 ) acc' ( c : used )
-
-    -- A task's compulsory part @[lst, ect]@: the interval it necessarily
-    -- occupies under its current bounds (the same construction 'timetable' carves
-    -- with). Empty when the task is not yet fixed enough to have one.
-    compulsoryPart :: Task task t -> Interval t
-    compulsoryPart taskC =
-      Interval ( flipClusivity ( coerce ( lst taskC ) ) )
-               ( flipClusivity ( coerce ( ect taskC ) ) )
-
--------------------------------------------------------------------------------
--- Coarse snapshot reasons (fallback for cycles, emptied domains, rare
--- immediate batch conflicts, and tight reasons whose bounds are not reified).
---
--- A coarse reason is the negation of every atom — precedence /and/ bound —
--- true above the ground level. It is sound because the scheduling derivations
--- are monotone in the set of true atoms (they read present edges / tightened
--- domains, never the absence of one), so the whole current assignment is a
--- valid superset antecedent. Bound atoms must be included: once a bound can be
--- channelled in from a learnt clause, the domains are no longer a pure function
--- of the precedence atoms, so a precedence-only snapshot would be unsound. The
--- snapshot is blunt; tight per-inference reasons are emitted directly above.
-
--- | Walk @trail[0, bound)@ and collect the negation of every literal at a
--- decision level strictly above ground, optionally appending @appendLast@
--- (which 1-UIP resolves on after the supporting literals).
-snapshotBody
-  :: forall mode s task t m
-  .  ( PrimMonad m, PrimState m ~ s )
-  => Theory mode s task t
-  -> SAT.TrailPos     -- ^ exclusive upper bound on the trail walk
-  -> Maybe Lit        -- ^ optional appended literal
-  -> m [ Lit ]
-snapshotBody t ( SAT.TrailPos bound ) mbAppend = loop 0 []
-  where
-    appended = case mbAppend of
-      Nothing -> []
-      Just l  -> [ l ]
-    loop !i !acc
-      | i >= bound = pure ( reverse acc ++ appended )
-      | otherwise  = do
-          lit <- SAT.trailAt ( solver t ) ( SAT.TrailPos i )
-          lvl <- SAT.levelOfAssignedVar ( solver t ) ( litVar lit )
-          if lvl <= SAT.GroundLevel
-          then loop ( i + 1 ) acc
-          else loop ( i + 1 ) ( negateLit lit : acc )
-
--- | Build a 'LazyReason' that, when forced, returns the snapshot of the trail
--- as it stood at the moment of this call (appending @propLit@, on which 1-UIP
--- resolves). The trail prefix is stable until a backjump crosses it, which
--- cannot happen before 1-UIP forces the reason, so the deferred walk is sound.
-snapshotReason
-  :: forall mode s task t
-  .  Theory mode s task t
-  -> Lit          -- ^ the propagated literal, appended to the clause body
-  -> ST s ( LazyReason s )
-snapshotReason t propLit = do
-  bound <- SAT.trailSize ( solver t )
-  pure ( LazyReason ( snapshotBody t bound ( Just propLit ) ) )
-
-{-# SPECIALISE snapshotConflict @MonitoringOff #-}
--- | Capture a snapshot of the active trail (optionally appending @propLit@)
--- and materialise it eagerly as a coarse 'SAT.Conflict', recording its
--- @label@ (the conflict source) for instrumentation.
-snapshotConflict
+-- | Tight conflict for a matrix cycle closed by the new edge @predTask ≺
+-- succTask@: a path @succTask ≺ x₁ ≺ … ≺ predTask@ of precedence literals
+-- already true on the trail. Together with the new edge (also true) they form a
+-- cycle, so the negation of their conjunction is an all-false conflict clause.
+reconstructCycle
   :: forall mode s task t
   .  MonitorMode mode
   => Theory mode s task t
-  -> Text         -- ^ conflict source label
-  -> Maybe Lit
+  -> Int          -- ^ @predTask@: tail of the new edge
+  -> Int          -- ^ @succTask@: head of the new edge
   -> ST s ( Maybe SAT.Conflict )
-snapshotConflict t label mbPropLit = do
-  bound <- SAT.trailSize ( solver t )
-  body  <- snapshotBody t bound mbPropLit
-  tickConflict ( monitor t ) label False
-  recordReasonLen ( monitor t ) ( length body )
-  literalsAsConflict label ( solver t ) body
+reconstructCycle t predTask succTask = do
+  mbPath <- findPath ( IntSet.singleton succTask ) succTask
+  case mbPath of
+    Nothing      ->
+      error "Schedule.LCG.Theory.reconstructCycle: cycle reported but no true precedence path found"
+    Just pathLits -> do
+      let body = map negateLit ( precLit ( atoms t ) predTask succTask : pathLits )
+      tickConflict ( monitor t ) "cycle"
+      recordReasonLen ( monitor t ) ( length body )
+      literalsAsConflict "cycle" ( solver t ) body
+  where
+    n = numTasks ( atoms t )
+    -- Depth-first search over the /true/ precedence edges from @x@ to
+    -- @predTask@, returning the edge literals along a path (acyclic on the
+    -- true-edge DAG, so the @visited@ set guarantees termination).
+    findPath :: IntSet -> Int -> ST s ( Maybe [ Lit ] )
+    findPath visited x
+      | x == predTask = pure ( Just [] )
+      | otherwise     = tryEdges visited x 0
+    tryEdges :: IntSet -> Int -> Int -> ST s ( Maybe [ Lit ] )
+    tryEdges visited x y
+      | y >= n                      = pure Nothing
+      | y == x                      = tryEdges visited x ( y + 1 )
+      | IntSet.member y visited     = tryEdges visited x ( y + 1 )
+      | otherwise                   = do
+          let edge = precLit ( atoms t ) x y
+          v <- SAT.litValue ( solver t ) edge
+          case v of
+            LTrue -> do
+              mb <- findPath ( IntSet.insert y visited ) y
+              case mb of
+                Just rest -> pure ( Just ( edge : rest ) )
+                Nothing   -> tryEdges visited x ( y + 1 )
+            _     -> tryEdges visited x ( y + 1 )
 
 -- | Materialise a list of literals as a SAT 'Conflict' value. The @label@
 -- names the theory rule that produced the conflict; it is carried only for the
@@ -1553,6 +1737,43 @@ literalsAsConflict _label s body = do
     longer   -> Just . SAT.ConflictClause <$> SAT.recordTheoryClause s longer
 
 #ifdef DEBUG
+-- | Verify the /citability invariant/ as a post-condition of bound channel-out:
+-- every non-empty task's current @est@ and @lst@ atoms are asserted true on the
+-- trail. This is what makes citing them in tight reasons sound — a reason built
+-- in this round is only forced (during a later 1-UIP) once channel-out is
+-- complete, at which point every bound it cites is on the trail. A violation
+-- means a bound move failed to reify\/assert its atom (a bug).
+--
+-- (The check is a post-condition, not a per-cite check: within 'channelOutBounds'
+-- a reason may cite a task whose bound is asserted later in the same pass, which
+-- is sound precisely because the reason is forced only after the pass finishes.)
+debugAssertCitability
+  :: forall mode s task t
+  .  ( Num t, Measurable t, Bounded t )
+  => Theory mode s task t -> String -> ST s ()
+debugAssertCitability t ctx = go 0
+  where
+    n = numTasks ( atoms t )
+    go i
+      | i >= n    = pure ()
+      | otherwise = do
+          task <- readTask t i
+          if null ( intervals ( taskAvailability task ) )
+          then go ( i + 1 )   -- empty domain: surfaced as an infeasibility, not channelled
+          else do
+            e <- currentEstLit t i
+            l <- currentLctLit t i
+            check i "est" e
+            check i "lst" l
+            go ( i + 1 )
+    check i which lit = do
+      v <- SAT.litValue ( solver t ) lit
+      when ( v /= LTrue ) $ do
+        dump <- SAT.dumpSolverState ( solver t )
+        error $ "Schedule.LCG.Theory.debugAssertCitability [" <> ctx <> "]: task "
+             <> show i <> "'s " <> which <> " bound atom " <> show lit <> " is " <> show v
+             <> ", not LTrue (citability invariant violated)\n" <> dump
+
 -- | Verify a conflict mentions at least one literal at the current decision level.
 --
 -- An empty body is a genuine ground-level inconsistency (handled by 'markFalse',
