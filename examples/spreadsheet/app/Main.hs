@@ -1,5 +1,9 @@
 module Main where
 
+-- code-page
+import System.IO.CodePage
+  ( withCP65001 )
+
 -- transformers
 import Control.Monad.Trans.Except
   ( runExceptT )
@@ -11,7 +15,7 @@ import Schedule.Spreadsheet
 -------------------------------------------------------------------------------
 
 main :: IO ()
-main = do
+main = withCP65001 $ do
   res <- runExceptT scheduleSpreadsheet
   case res of
     Left err -> handleError err

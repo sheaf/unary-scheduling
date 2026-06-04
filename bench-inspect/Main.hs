@@ -30,6 +30,10 @@ import System.Timeout
 import Text.Printf
   ( printf )
 
+-- code-page
+import System.IO.CodePage
+  ( withCP65001 )
+
 -- deepseq
 import Control.DeepSeq
   ( force )
@@ -136,7 +140,7 @@ measureOff opts inst = do
 -------------------------------------------------------------------------------
 
 main :: IO ()
-main = do
+main = withCP65001 do
   args <- getArgs
   case args of
     -- Focused profiling entry point: solve a single named anchor instance once,

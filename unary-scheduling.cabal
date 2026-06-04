@@ -18,6 +18,8 @@ common common
   build-depends:
       base
         >= 4.11     && < 5.0
+    , code-page
+        >= 0.2.1    && < 0.3
     , containers
         >= 0.6.2.1  && < 0.9
     , deepseq
