@@ -32,7 +32,7 @@
 --     channelled-in bound propagates along the axis.
 module Schedule.LCG.Theory
   ( -- * Theory state
-    Theory(..)
+    Theory(..), TheoryOptions(..)
   , newTheory
     -- * SAT-decision-level synchronisation
   , pushLevel
@@ -196,18 +196,8 @@ data Theory mode s task t = Theory
     schedTrail     :: !( Trail s task t )
   , -- | Scheduling propagators run on each theory round.
     propagators    :: ![ Propagator task t ]
-  , -- | Maximum propagator-round iterations per theory step.
-    maxPropRounds  :: !Int
-  , -- | Whether to branch on day-assignment by seeding a /decision/ bound atom
-    -- at each task's internal availability-gap boundaries (see 'seedDecisionBounds').
-    useBoundDecisions :: !Bool
-  , -- | Whether 'theoryDecide' proposes structural day-assignment decisions
-    -- ahead of VSIDS. Only meaningful together with 'useBoundDecisions'.
-    useTheoryDecide :: !Bool
-  , -- | Whether 'theoryDecide' applies /conflict-ordering search/ ahead of its
-    -- structural choice: revisit the decision variable most recently found
-    -- to be a conflict culprit before resuming the base order.
-    useConflictOrdering :: !Bool
+    -- | Configuration options.
+  , theoryOptions  :: !TheoryOptions
   , -- | Monotone conflict counter ticked by 'recordConflict'; supplies the
     -- recency stamp for conflict-ordering.
     conflictClock :: !( MutVar s Int )
@@ -260,8 +250,24 @@ data Theory mode s task t = Theory
     monitor         :: !( Monitor mode s )
   }
 
-{-# SPECIALISE newTheory @MonitoringOff #-}
+-- | Configuration options for the theory-side of the DPLL(T) loop.
+data TheoryOptions
+  = TheoryOptions
+  { -- | Maximum propagator-round iterations per theory step.
+    maxPropRounds  :: !Int
+  , -- | Whether to branch on day-assignment by seeding a /decision/ bound atom
+    -- at each task's internal availability-gap boundaries (see 'seedDecisionBounds').
+    useBoundDecisions :: !Bool
+  , -- | Whether 'theoryDecide' proposes structural day-assignment decisions
+    -- ahead of VSIDS. Only meaningful together with 'useBoundDecisions'.
+    useTheoryDecide :: !Bool
+  , -- | Whether 'theoryDecide' applies /conflict-ordering search/ ahead of its
+    -- structural choice: revisit the decision variable most recently found
+    -- to be a conflict culprit before resuming the base order.
+    useConflictOrdering :: !Bool
+  }
 
+{-# SPECIALISE newTheory @MonitoringOff #-}
 -- | Allocate a fresh 'Theory' for the given scheduler state and propagators.
 newTheory
   :: forall mode s task t
@@ -270,12 +276,9 @@ newTheory
      )
   => MutableTaskInfos s task t
   -> [ Propagator task t ]
-  -> Int                          -- ^ propagator-round cap per theory step
-  -> Bool                         -- ^ branch on day-assignment bound atoms?
-  -> Bool                         -- ^ use the structural day-assignment decision heuristic?
-  -> Bool                         -- ^ use conflict-ordering search in 'theoryDecide'?
+  -> TheoryOptions
   -> ST s ( Theory mode s task t )
-newTheory tis props rounds boundDecisionsOn theoryDecideOn conflictOrderingOn = do
+newTheory tis props opts = do
   s     <- SAT.newSolver
   let nT  = Boxed.Vector.length ( taskNames tis )
       !nA = ( nT * ( nT - 1 ) ) `shiftR` 1
@@ -312,10 +315,7 @@ newTheory tis props rounds boundDecisionsOn theoryDecideOn conflictOrderingOn = 
         , groundAvail     = gav
         , schedTrail      = trail
         , propagators     = props
-        , maxPropRounds   = rounds
-        , useBoundDecisions = boundDecisionsOn
-        , useTheoryDecide = theoryDecideOn
-        , useConflictOrdering = conflictOrderingOn
+        , theoryOptions   = opts
         , conflictClock   = cclk
         , conflictStamps  = cstmp
         , lastDecision    = ldec
@@ -330,7 +330,7 @@ newTheory tis props rounds boundDecisionsOn theoryDecideOn conflictOrderingOn = 
         , monitor         = mon
         }
   seedInitialBounds t nT
-  when boundDecisionsOn ( seedDecisionBounds t nT )
+  when ( useBoundDecisions opts ) ( seedDecisionBounds t nT )
   pure t
 
 -- | Create initial inner-boundary bound atoms for decision making.
@@ -442,10 +442,12 @@ theoryDecide
   => Theory mode s task t
   -> ST s ( Maybe Lit )
 theoryDecide t
-  | not ( useTheoryDecide t ) = pure Nothing
+  | not ( useTheoryDecide $ theoryOptions t ) = pure Nothing
   | otherwise = do
       -- Conflict-ordering first: revisit the most recent unsettled culprit.
-      mbCos <- if useConflictOrdering t then conflictOrderingPick t else pure Nothing
+      mbCos <- if useConflictOrdering ( theoryOptions t )
+               then conflictOrderingPick t
+               else pure Nothing
       case mbCos of
         Just lit -> pure ( Just lit )
         Nothing  -> do
@@ -490,7 +492,7 @@ theoryDecide t
 -- No-op unless conflict-ordering is enabled.
 noteDecision :: Theory mode s task t -> Lit -> ST s ()
 noteDecision t lit =
-  when ( useConflictOrdering t ) $
+  when ( useConflictOrdering $ theoryOptions t ) $
     writeMutVar ( lastDecision t ) ( Just ( litVar lit ) )
 
 -- | Record that a conflict just occurred: stamp the most recent decision
@@ -501,7 +503,7 @@ noteDecision t lit =
 -- No-op unless conflict-ordering is enabled.
 recordConflict :: Theory mode s task t -> ST s ()
 recordConflict t =
-  when ( useConflictOrdering t ) $ do
+  when ( useConflictOrdering $ theoryOptions t ) $ do
     mbV <- readMutVar ( lastDecision t )
     case mbV of
       Nothing -> pure ()
@@ -911,7 +913,7 @@ runPropagators t = do
   -- is stashed in 'pendingConflict'.
   ( eRes, _finalUpdates ) <- withPhaseTiming ( monitor t ) "propagators" $
     runSchedule ( tasks t )
-      ( propagationLoop ( monitor t ) ( maxPropRounds t ) ( schedTrail t )
+      ( propagationLoop ( monitor t ) ( maxPropRounds $ theoryOptions t ) ( schedTrail t )
           ( propagators t ) ( Just ( passChanneller t ) ) seed )
   -- TODO: 'propagationLoop' doesn't properly report 'GiveUp', which means we
   -- currently conflate "fixpoint, consistent" with "gave up early".

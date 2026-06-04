@@ -84,6 +84,8 @@ data SearchOptions = SearchOptions
     --
     -- TODO: currently IGNORED by 'lcgSearch'.
     optSolver     :: !SAT.SolverOptions
+    -- | Theory-side options.
+  , optTheoryOpts :: !TheoryOptions
   , -- | Branch on /day-assignment/: seed, for each gappy task, a decision bound
     -- atom at every internal availability-gap boundary (\"does this task start
     -- by the end of day @j@?\"), prioritised so the search commits a task to a
@@ -141,6 +143,13 @@ defaultSearchOptions = SearchOptions
   , optRestartUnit    = 100
   , optAlternateSearch = True
   , optConflictOrdering = False
+  , optTheoryOpts =
+      TheoryOptions
+        { maxPropRounds = 1000
+        , useBoundDecisions = True
+        , useTheoryDecide = True
+        , useConflictOrdering = False
+        }
   }
 
 -------------------------------------------------------------------------------
@@ -205,9 +214,7 @@ lcgSearch
 lcgSearch opts props givenTasks = runST do
   -- Allocate scheduler state and theory in one go.
   tis    <- initialTaskData @taskData @task @t givenTasks
-  theory <- newTheory @mode tis props ( optPropRounds opts )
-              ( optBoundDecisions opts )
-              ( optTheoryDecide opts ) ( optConflictOrdering opts )
+  theory <- newTheory @mode tis props ( optTheoryOpts opts )
 
   -- Drive the DPLL(T) loop. Its first iteration runs the propagators on
   -- the starting state, seeding any unconditional inferences before the
@@ -292,14 +299,21 @@ driveLoop restartUnit alternate solver theory =
     -- The structural heuristic only runs when enabled; otherwise every window
     -- is pure VSIDS.
     initialMode :: SearchMode
-    initialMode = if useTheoryDecide theory then Structural else Activity
+    initialMode =
+      if useTheoryDecide $ theoryOptions theory
+      then Structural
+      else Activity
 
     -- Flip the mode for the next window, but only when both alternation and the
     -- structural heuristic are on; otherwise every window keeps 'initialMode'.
     nextMode :: SearchMode -> SearchMode
     nextMode m
-      | alternate && useTheoryDecide theory = case m of Structural -> Activity; Activity -> Structural
-      | otherwise                           = m
+      | alternate && useTheoryDecide ( theoryOptions theory )
+      = case m of
+          Structural -> Activity
+          Activity -> Structural
+      | otherwise
+      = m
 
     -- Run window @k@; on a restart, roll back to ground and open window @k + 1@.
     driveRestarts :: Int -> SearchMode -> ST s SAT.Verdict
