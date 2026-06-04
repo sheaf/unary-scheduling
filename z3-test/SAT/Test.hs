@@ -39,7 +39,7 @@ import SAT
   , Polarity(..)
   , LBool(..)
   , Verdict(..)
-  , Solver, newSolver, newVar
+  , SolverState, newSolver, newVar
   , addClause, PostResult(..)
   , solveWith, getModel
   , Assignment, assignmentValue
@@ -107,7 +107,7 @@ rawToLit ( RawLit i pol ) = mkLit ( Var i ) pol
 
 -- | Post every clause. Returns 'False' once any clause makes the problem
 -- instantly UNSAT; subsequent clauses are skipped.
-addAll :: Solver s -> [ [ Lit ] ] -> ST s Bool
+addAll :: SolverState s -> [ [ Lit ] ] -> ST s Bool
 addAll s = foldM step True
   where
     step False _ = pure False

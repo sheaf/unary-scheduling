@@ -32,7 +32,7 @@
 --     channelled-in bound propagates along the axis.
 module Schedule.LCG.Theory
   ( -- * Theory state
-    Theory(..), TheoryOptions(..)
+    TheoryState(..), TheoryOptions(..)
   , newTheory
     -- * SAT-decision-level synchronisation
   , pushLevel
@@ -174,12 +174,9 @@ import Schedule.Trail
 -- Theory state.
 
 -- | The DPLL(T) theory state for unary scheduling.
---
--- The @mode@ parameter selects the instrumentation level ('Schedule.Monitor');
--- at @mode ~ 'Schedule.Monitor.MonitoringOff'@ the monitor and all its hooks are erased.
-data Theory mode s task t = Theory
+data TheoryState mode s task t = TheoryState
   { -- | The CDCL core driving search.
-    solver         :: !( SAT.Solver s )
+    theorySolverState  :: !( SAT.SolverState s )
   , -- | The bijection between task pairs and SAT decision variables.
     atoms          :: !PrecedenceAtoms
   , -- | The lazily-grown registry of start-time bound atoms (auxiliary,
@@ -277,7 +274,7 @@ newTheory
   => MutableTaskInfos s task t
   -> [ Propagator task t ]
   -> TheoryOptions
-  -> ST s ( Theory mode s task t )
+  -> ST s ( TheoryState mode s task t )
 newTheory tis props opts = do
   s     <- SAT.newSolver
   let nT  = Boxed.Vector.length ( taskNames tis )
@@ -307,27 +304,27 @@ newTheory tis props opts = do
   gav   <- Boxed.Vector.generateM nT \ i ->
              taskAvailability <$> Boxed.MVector.unsafeRead ( taskAvails tis ) i
   mon   <- newMonitor @mode
-  let t = Theory
-        { solver          = s
-        , atoms           = ps
-        , boundAtoms      = ba
-        , tasks           = tis
-        , groundAvail     = gav
-        , schedTrail      = trail
-        , propagators     = props
-        , theoryOptions   = opts
-        , conflictClock   = cclk
-        , conflictStamps  = cstmp
-        , lastDecision    = ldec
-        , decisionBounds  = db
-        , theoryHead      = th
-        , levelMarks      = lms
-        , dirtySeed       = ds
-        , boundDirty      = bd
-        , passCapture     = pcap
-        , pendingConflict = pconf
-        , theoryPropCount = tpc
-        , monitor         = mon
+  let t = TheoryState
+        { theorySolverState = s
+        , atoms             = ps
+        , boundAtoms        = ba
+        , tasks             = tis
+        , groundAvail       = gav
+        , schedTrail        = trail
+        , propagators       = props
+        , theoryOptions     = opts
+        , conflictClock     = cclk
+        , conflictStamps    = cstmp
+        , lastDecision      = ldec
+        , decisionBounds    = db
+        , theoryHead        = th
+        , levelMarks        = lms
+        , dirtySeed         = ds
+        , boundDirty        = bd
+        , passCapture       = pcap
+        , pendingConflict   = pconf
+        , theoryPropCount   = tpc
+        , monitor           = mon
         }
   seedInitialBounds t nT
   when ( useBoundDecisions opts ) ( seedDecisionBounds t nT )
@@ -337,7 +334,7 @@ newTheory tis props opts = do
 seedDecisionBounds
   :: forall mode s task t
   .  ( Num t, Measurable t, Bounded t )
-  => Theory mode s task t -> Int -> ST s ()
+  => TheoryState mode s task t -> Int -> ST s ()
 seedDecisionBounds t nT =
   for_ [ 0 .. nT - 1 ] \ i -> do
     task <- readTask t i
@@ -357,7 +354,7 @@ seedDecisionBounds t nT =
 seedInitialBounds
   :: forall mode s task t
   .  ( Num t, Measurable t, Bounded t )
-  => Theory mode s task t -> Int -> ST s ()
+  => TheoryState mode s task t -> Int -> ST s ()
 seedInitialBounds t nT =
   for_ [ 0 .. nT - 1 ] \ i -> do
     task <- readTask t i
@@ -366,8 +363,8 @@ seedInitialBounds t nT =
     else do
       estL <- currentEstLit t i
       lctL <- currentLctLit t i
-      SAT.enqueueUndef ( solver t ) estL RFact
-      SAT.enqueueUndef ( solver t ) lctL RFact
+      SAT.enqueueUndef ( theorySolverState t ) estL RFact
+      SAT.enqueueUndef ( theorySolverState t ) lctL RFact
 
 -------------------------------------------------------------------------------
 -- SAT-decision-level synchronisation.
@@ -379,7 +376,7 @@ seedInitialBounds t nT =
 -- schedule-trail mark captured at the start of level @k + 1@ (i.e. just
 -- before the level-@(k+1)@ decision is asserted), so undoing back to that
 -- mark restores the trail to the state right after level @k@'s effects.
-pushLevel :: Theory mode s task t -> ST s ()
+pushLevel :: TheoryState mode s task t -> ST s ()
 pushLevel t = do
   m <- currentMark ( schedTrail t )
   Growable.push ( levelMarks t ) m
@@ -390,7 +387,7 @@ pushLevel t = do
 -- Precondition: @lvl@ is strictly less than the current SAT level
 -- (i.e. we are actually backjumping). This matches how
 -- 'SAT.Solver.cancelUntil' itself indexes 'SAT.Solver.trailLim'.
-popToLevel :: Theory mode s task t -> SAT.DecisionLevel -> ST s ()
+popToLevel :: TheoryState mode s task t -> SAT.DecisionLevel -> ST s ()
 popToLevel t ( SAT.DecisionLevel lvl ) = do
 #ifdef DEBUG
   n <- Growable.length ( levelMarks t )
@@ -405,20 +402,20 @@ popToLevel t ( SAT.DecisionLevel lvl ) = do
   Growable.truncate ( levelMarks t ) lvl
   undoTo ( schedTrail t ) ( tasks t ) m
   -- Rewind the theory head: any trail positions above the new top are gone.
-  newSize <- SAT.trailSize ( solver t )
+  newSize <- SAT.trailSize ( theorySolverState t )
   writeMutVar ( theoryHead t ) newSize
 
 -- | Number of precedence literals currently on the SAT trail.
 --
 -- Used only for debugging/instrumentation.
-numPrecedenceDecisions :: Theory mode s task t -> ST s Int
+numPrecedenceDecisions :: TheoryState mode s task t -> ST s Int
 numPrecedenceDecisions t = do
-  SAT.TrailPos sz <- SAT.trailSize ( solver t )
+  SAT.TrailPos sz <- SAT.trailSize ( theorySolverState t )
   let
     loop !i !acc
       | i >= sz   = pure acc
       | otherwise = do
-          lit <- SAT.trailAt ( solver t ) ( SAT.TrailPos i )
+          lit <- SAT.trailAt ( theorySolverState t ) ( SAT.TrailPos i )
           if isPrecedenceVar ( atoms t ) ( litVar lit )
           then loop ( i + 1 ) ( acc + 1 )
           else loop ( i + 1 ) acc
@@ -439,7 +436,7 @@ numPrecedenceDecisions t = do
 theoryDecide
   :: forall mode s task t
   .  ( Num t, Measurable t, Bounded t )
-  => Theory mode s task t
+  => TheoryState mode s task t
   -> ST s ( Maybe Lit )
 theoryDecide t
   | not ( useTheoryDecide $ theoryOptions t ) = pure Nothing
@@ -479,7 +476,7 @@ theoryDecide t
     firstUndecided :: [ Lit ] -> ST s ( Maybe Lit )
     firstUndecided [] = pure Nothing
     firstUndecided ( l : ls ) = do
-      v <- SAT.litValue ( solver t ) l
+      v <- SAT.litValue ( theorySolverState t ) l
       case v of
         LUndef -> pure ( Just l )
         _      -> firstUndecided ls
@@ -490,7 +487,7 @@ theoryDecide t
 -- | Record the variable just branched on, so the next conflict can blame it.
 --
 -- No-op unless conflict-ordering is enabled.
-noteDecision :: Theory mode s task t -> Lit -> ST s ()
+noteDecision :: TheoryState mode s task t -> Lit -> ST s ()
 noteDecision t lit =
   when ( useConflictOrdering $ theoryOptions t ) $
     writeMutVar ( lastDecision t ) ( Just ( litVar lit ) )
@@ -501,7 +498,7 @@ noteDecision t lit =
 -- is unassigned again.
 --
 -- No-op unless conflict-ordering is enabled.
-recordConflict :: Theory mode s task t -> ST s ()
+recordConflict :: TheoryState mode s task t -> ST s ()
 recordConflict t =
   when ( useConflictOrdering $ theoryOptions t ) $ do
     mbV <- readMutVar ( lastDecision t )
@@ -515,7 +512,7 @@ recordConflict t =
 
 -- | The most-recently-stamped currently unassigned decision variable.
 conflictOrderingPick
-  :: forall mode s task t. Theory mode s task t -> ST s ( Maybe Lit )
+  :: forall mode s task t. TheoryState mode s task t -> ST s ( Maybe Lit )
 conflictOrderingPick t = do
   stamps <- readMutVar ( conflictStamps t )
   fmap snd <$> foldM step Nothing ( IntMap.toList stamps )
@@ -528,7 +525,7 @@ conflictOrderingPick t = do
       case best of
         Just ( bclk, _ ) | clk <= bclk -> pure best
         _ -> do
-          mbLit <- SAT.decideVar ( solver t ) ( Var vi )
+          mbLit <- SAT.decideVar ( theorySolverState t ) ( Var vi )
           pure $ case mbLit of
             Just lit -> Just ( clk, lit )
             Nothing  -> best
@@ -547,7 +544,7 @@ conflictOrderingPick t = do
 criticalPair
   :: forall mode s task t
   .  ( Num t, Measurable t, Bounded t )
-  => Theory mode s task t
+  => TheoryState mode s task t
   -> ST s ( Maybe Lit )
 criticalPair t = do
   best <- go 0 1 Nothing
@@ -566,7 +563,7 @@ criticalPair t = do
           o <- readOrdering mat i j
           case o of
             Unknown -> do
-              v <- SAT.litValue ( solver t ) ( precLit ps i j )
+              v <- SAT.litValue ( theorySolverState t ) ( precLit ps i j )
               case v of
                 -- 'Unknown' in the matrix should mean the precedence atom is
                 -- unassigned; the check guards against deciding an assigned one.
@@ -616,7 +613,7 @@ theoryPropagate
      , Show t, Show task
      , MonitorMode mode
      )
-  => Theory mode s task t
+  => TheoryState mode s task t
   -> ST s ( Maybe SAT.Conflict )
 theoryPropagate t = do
   channelOutcome <- withPhaseTiming ( monitor t ) "channel-in" ( channelPending t )
@@ -638,7 +635,7 @@ channelPending
   .  ( Num t, Measurable t, Bounded t
      , MonitorMode mode
      )
-  => Theory mode s task t
+  => TheoryState mode s task t
   -> ST s ( Maybe SAT.Conflict )
 channelPending t = do
 #ifdef DEBUG
@@ -648,16 +645,16 @@ channelPending t = do
   where
     loop :: ST s ( Maybe SAT.Conflict )
     loop = do
-      ok <- SAT.isOk ( solver t )
+      ok <- SAT.isOk ( theorySolverState t )
       if not ok
-      then pure Nothing  -- solver already marked UNSAT; outer loop will bail.
+      then pure Nothing  -- theorySolverState already marked UNSAT; outer loop will bail.
       else do
         h@( SAT.TrailPos hi ) <- readMutVar ( theoryHead t )
-        SAT.TrailPos sz       <- SAT.trailSize ( solver t )
+        SAT.TrailPos sz       <- SAT.trailSize ( theorySolverState t )
         if hi >= sz
         then pure Nothing
         else do
-          lit <- SAT.trailAt ( solver t ) h
+          lit <- SAT.trailAt ( theorySolverState t ) h
           writeMutVar ( theoryHead t ) ( SAT.TrailPos ( hi + 1 ) )
           meaning <- litMeaning ( atoms t ) ( boundAtoms t ) lit
           case meaning of
@@ -689,7 +686,7 @@ checkMatrixTrailInvariant t ctx = iterPairs 0 1
     mat    = orderings ( tasks t )
     bad :: Int -> Int -> Order -> LBool -> String -> ST s ()
     bad i j o val expected = do
-      dump <- SAT.dumpSolverState ( solver t )
+      dump <- SAT.dumpSolverState ( theorySolverState t )
       error $ "Schedule.LCG.Theory.checkMatrixTrailInvariant [" <> ctx <> "]: "
            <> "mat[" <> show i <> "," <> show j <> "] = " <> show o
            <> " but lit " <> show ( precLit ps i j ) <> " is " <> show val
@@ -697,7 +694,7 @@ checkMatrixTrailInvariant t ctx = iterPairs 0 1
     checkPair :: Int -> Int -> ST s ()
     checkPair i j = do
       o   <- readOrdering mat i j
-      val <- SAT.litValue ( solver t ) ( precLit ps i j )
+      val <- SAT.litValue ( theorySolverState t ) ( precLit ps i j )
       case o of
         Unknown     -> pure ()
         LessThan    -> case val of LTrue  -> pure (); _ -> bad i j o val "LTrue"
@@ -725,7 +722,7 @@ channelLit
   .  ( Num t, Measurable t, Bounded t
      , MonitorMode mode
      )
-  => Theory mode s task t
+  => TheoryState mode s task t
   -> Int -> Int
   -> ST s ( Maybe SAT.Conflict )
 channelLit t predTask succTask = do
@@ -798,7 +795,7 @@ channelBound
   .  ( Num t, Measurable t, Bounded t
      , MonitorMode mode
      )
-  => Theory mode s task t
+  => TheoryState mode s task t
   -> Int -> Endpoint ( LatestTime t ) -> Polarity
   -> ST s ( Maybe SAT.Conflict )
 channelBound t task l pol = do
@@ -840,7 +837,7 @@ channelBound t task l pol = do
     -- lands on the channelled-in atom itself.
     case moved of
       Just MovedJumped -> do
-        ( channelAtom, _ ) <- internBoundAtomWith t ( SAT.newAuxVar ( solver t ) ) task l
+        ( channelAtom, _ ) <- internBoundAtomWith t ( SAT.newAuxVar ( theorySolverState t ) ) task l
         let channelledLit = case pol of { Positive -> channelAtom; Negative -> negateLit channelAtom }
             side          = case pol of { Positive -> Latest;      Negative -> Earliest }
         assertChannelInJump t side task [ channelledLit ]
@@ -851,7 +848,7 @@ channelBound t task l pol = do
 -- 'dirtySeed' is still 'Nothing' (before the first 'runPropagators' call) we
 -- leave it alone: that first call seeds every propagator with the full task
 -- set anyway.
-markDirtyPair :: Theory mode s task t -> Int -> Int -> ST s ()
+markDirtyPair :: TheoryState mode s task t -> Int -> Int -> ST s ()
 markDirtyPair t a b =
   modifyMutVar' ( dirtySeed t ) $ \ case
     Nothing    -> Nothing
@@ -859,7 +856,7 @@ markDirtyPair t a b =
 
 -- | Mark a task whose domain a channelled-in bound tightened, so the next
 -- 'runPropagators' wakes /all/ propagators on it.
-markBoundDirty :: Theory mode s task t -> Int -> ST s ()
+markBoundDirty :: TheoryState mode s task t -> Int -> ST s ()
 markBoundDirty t i = modifyMutVar' ( boundDirty t ) ( IntSet.insert i )
 
 -- | Outcome of a single channeling step, lifted through 'ExceptT'.
@@ -884,7 +881,7 @@ runPropagators
      , Show t, Show task
      , MonitorMode mode
      )
-  => Theory mode s task t
+  => TheoryState mode s task t
   -> ST s ( Maybe SAT.Conflict )
 runPropagators t = do
 #ifdef DEBUG
@@ -951,8 +948,8 @@ debugAuditPropagationFixpoint t = do
   case eRes of
     Right () | IntSet.null movedTasks -> pure ()
     _ -> do
-      SAT.DecisionLevel lvl <- SAT.currentLevel ( solver t )
-      dump                  <- SAT.dumpSolverState ( solver t )
+      SAT.DecisionLevel lvl <- SAT.currentLevel ( theorySolverState t )
+      dump                  <- SAT.dumpSolverState ( theorySolverState t )
       let finding = case eRes of
             Left inf -> "an entailed conflict was not surfaced: " <> show inf
             Right () -> "a bound tightening was not applied for tasks "
@@ -989,7 +986,7 @@ runSchedule tis action =
 assertEmittedPrecedences
   :: forall mode s task t
   .  ( Num t, Measurable t, Bounded t, MonitorMode mode )
-  => Theory mode s task t
+  => TheoryState mode s task t
   -> PassCapture t
   -> IntMap ( IntSet, IntSet )
   -> ST s ( Maybe SAT.Conflict )
@@ -1023,13 +1020,13 @@ assertEmittedPrecedences t cap precsMap = goEntries ( IntMap.toList precsMap )
 assertOnePrecedence
   :: forall mode s task t
   .  ( Num t, Measurable t, Bounded t, MonitorMode mode )
-  => Theory mode s task t
+  => TheoryState mode s task t
   -> PassCapture t
   -> Int -> Int
   -> [ Int ]   -- ^ tasks whose bounds justify the precedence
   -> ST s ( Maybe SAT.Conflict )
 assertOnePrecedence t cap a b reasonTasks = do
-  ok <- SAT.isOk ( solver t )
+  ok <- SAT.isOk ( theorySolverState t )
   if not ok then pure Nothing
   else do
 #ifdef DEBUG
@@ -1049,7 +1046,7 @@ assertOnePrecedence t cap a b reasonTasks = do
 -- Bound-atom literals.
 
 -- | Read a task's current availability record.
-readTask :: Theory mode s task t -> Int -> ST s ( Task task t )
+readTask :: TheoryState mode s task t -> Int -> ST s ( Task task t )
 readTask t i = Boxed.MVector.unsafeRead ( taskAvails ( tasks t ) ) i
 
 -- | Get-or-create a latest-start atom via the given variable allocator, wiring
@@ -1059,7 +1056,7 @@ readTask t i = Boxed.MVector.unsafeRead ( taskAvails ( tasks t ) ) i
 -- variable for day-assignment branching.
 internBoundAtomWith
   :: Measurable t
-  => Theory mode s task t -> ST s Var -> Int -> Endpoint ( LatestTime t ) -> ST s ( Lit, Bool )
+  => TheoryState mode s task t -> ST s Var -> Int -> Endpoint ( LatestTime t ) -> ST s ( Lit, Bool )
 internBoundAtomWith t allocVar i thr = do
   ( lit, isNew ) <- internStartUpper ( boundAtoms t ) allocVar i thr
   when isNew $ do
@@ -1072,17 +1069,17 @@ internBoundAtomWith t allocVar i thr = do
     -- as a lazily-generated lemma. /Not/ 'SAT.addClause': mid-search, a clause
     -- with a ground-false literal would there collapse to a unit and enqueue an
     -- 'RFact' at the current (non-ground) level, corrupting conflict analysis.
-    imply a b = SAT.addBinaryLemma ( solver t ) ( negateLit a ) b
+    imply a b = SAT.addBinaryLemma ( theorySolverState t ) ( negateLit a ) b
 
 -- | Get-or-create a /decision/ latest-start atom (placed in the VSIDS heap),
 -- bumping its activity on first creation so day-assignment is decided ahead of
 -- within-day sequencing.
 internDecisionBoundAtom
   :: Measurable t
-  => Theory mode s task t -> Int -> Endpoint ( LatestTime t ) -> ST s Lit
+  => TheoryState mode s task t -> Int -> Endpoint ( LatestTime t ) -> ST s Lit
 internDecisionBoundAtom t i thr = do
-  ( lit, isNew ) <- internBoundAtomWith t ( SAT.newVar ( solver t ) ) i thr
-  when isNew ( SAT.bumpVarActivity ( solver t ) ( litVar lit ) )
+  ( lit, isNew ) <- internBoundAtomWith t ( SAT.newVar ( theorySolverState t ) ) i thr
+  when isNew ( SAT.bumpVarActivity ( theorySolverState t ) ( litVar lit ) )
   pure lit
 
 -- | The literal asserting the /lower/ bound @start_i ≥ e@ for the given earliest
@@ -1094,9 +1091,9 @@ internDecisionBoundAtom t i thr = do
 -- See also 'lctLitAt'.
 estLitAt
   :: ( Measurable t, Bounded t )
-  => Theory mode s task t -> Int -> Endpoint ( EarliestTime t ) -> ST s Lit
+  => TheoryState mode s task t -> Int -> Endpoint ( EarliestTime t ) -> ST s Lit
 estLitAt t i e = do
-  ( lit, _ ) <- internBoundAtomWith t ( SAT.newAuxVar ( solver t ) ) i
+  ( lit, _ ) <- internBoundAtomWith t ( SAT.newAuxVar ( theorySolverState t ) ) i
                   ( estLowerToStartUpper e )
   pure ( negateLit lit )
 
@@ -1107,24 +1104,24 @@ estLitAt t i e = do
 -- See also 'estLitAt'.
 lctLitAt
   :: ( Num t, Measurable t, Bounded t )
-  => Theory mode s task t -> Int -> Endpoint ( LatestTime t ) -> ST s Lit
+  => TheoryState mode s task t -> Int -> Endpoint ( LatestTime t ) -> ST s Lit
 lctLitAt t i l = do
   task <- readTask t i
-  fst <$> internBoundAtomWith t ( SAT.newAuxVar ( solver t ) ) i
+  fst <$> internBoundAtomWith t ( SAT.newAuxVar ( theorySolverState t ) ) i
             ( latestStartFromCompletion ( taskDuration task ) l )
 
 -- | The literal asserting task @i@'s /current/ (domain) lower bound
 -- @start_i ≥ est_i@.
 currentEstLit
   :: ( Num t, Measurable t, Bounded t )
-  => Theory mode s task t -> Int -> ST s Lit
+  => TheoryState mode s task t -> Int -> ST s Lit
 currentEstLit t i = readTask t i >>= estLitAt t i . est
 
 -- | The literal asserting task @i@'s /current/ (domain) upper bound
 -- @start_i ≤ lst_i@.
 currentLctLit
   :: ( Num t, Measurable t, Bounded t )
-  => Theory mode s task t -> Int -> ST s Lit
+  => TheoryState mode s task t -> Int -> ST s Lit
 currentLctLit t i = readTask t i >>= lctLitAt t i . lct
 
 -- | The current bound literal of task @i@ on the given side, interning its atom
@@ -1132,7 +1129,7 @@ currentLctLit t i = readTask t i >>= lctLitAt t i . lct
 -- bound @start ≤ lst@ at 'Latest'.
 sideLit
   :: ( Num t, Measurable t, Bounded t )
-  => Theory mode s task t -> Handedness -> Int -> ST s Lit
+  => TheoryState mode s task t -> Handedness -> Int -> ST s Lit
 sideLit t Earliest i = currentEstLit t i
 sideLit t Latest   i = currentLctLit t i
 
@@ -1148,7 +1145,7 @@ sideLit t Latest   i = currentLctLit t i
 -- when 1-UIP forces it.
 boundLits
   :: ( Num t, Measurable t, Bounded t )
-  => Theory mode s task t -> [ Int ] -> ST s [ Lit ]
+  => TheoryState mode s task t -> [ Int ] -> ST s [ Lit ]
 boundLits t = fmap concat . traverse one
   where
     one i = do
@@ -1169,7 +1166,7 @@ boundReasonLits propLit antecedents = do
 -- (true on the trail), or 'Nothing' if they are unordered.
 precEdgeLit
   :: forall mode s task t
-  .  Theory mode s task t -> Int -> Int -> ST s ( Maybe Lit )
+  .  TheoryState mode s task t -> Int -> Int -> ST s ( Maybe Lit )
 precEdgeLit t i p = do
   o <- readOrdering ( orderings ( tasks t ) ) p i
   pure $ case o of
@@ -1194,7 +1191,7 @@ compulsoryPart taskC =
 -- ('Latest'). The carvers covering this span explain the jump.
 jumpWindow
   :: ( Num t, Measurable t, Bounded t )
-  => Theory mode s task t -> Handedness -> Int
+  => TheoryState mode s task t -> Handedness -> Int
   -> Endpoint ( EarliestTime t )   -- ^ new earliest start (for 'Earliest')
   -> Endpoint ( LatestTime t )     -- ^ new latest start  (for 'Latest')
   -> Intervals t
@@ -1243,7 +1240,7 @@ collectCarversWith compOf n i window0 = go ( n - 1 ) window0 []
 -- every cited bound is already on the trail.
 jumpCarverLits
   :: ( Num t, Measurable t, Bounded t )
-  => Theory mode s task t -> Handedness -> Int -> ST s [ Lit ]
+  => TheoryState mode s task t -> Handedness -> Int -> ST s [ Lit ]
 jumpCarverLits t side i = do
   task <- readTask t i
   let window = jumpWindow t side i ( est task )
@@ -1265,7 +1262,7 @@ jumpCarverLits t side i = do
 assertChannelInJump
   :: forall mode s task t
   .  ( Num t, Measurable t, Bounded t, MonitorMode mode )
-  => Theory mode s task t -> Handedness -> Int -> [ Lit ] -> ST s ( Maybe SAT.Conflict )
+  => TheoryState mode s task t -> Handedness -> Int -> [ Lit ] -> ST s ( Maybe SAT.Conflict )
 assertChannelInJump t side i base = do
   lit     <- sideLit t side i
   carvers <- jumpCarverLits t side i
@@ -1315,7 +1312,7 @@ capCompOf cap c = case IntMap.lookup c ( capBounds cap ) of
 snapshotBounds
   :: forall mode s task t
   .  ( Num t, Measurable t, Bounded t )
-  => Theory mode s task t
+  => TheoryState mode s task t
   -> ST s ( IntMap ( Endpoint ( EarliestTime t ), Endpoint ( LatestTime t ), Interval t ) )
 snapshotBounds t =
   foldM
@@ -1333,7 +1330,7 @@ snapshotBounds t =
 currentCapture
   :: forall mode s task t
   .  ( Num t, Measurable t, Bounded t )
-  => Theory mode s task t -> ST s ( PassCapture t )
+  => TheoryState mode s task t -> ST s ( PassCapture t )
 currentCapture t = do
   bnds <- snapshotBounds t
   pure ( PassCapture bnds IntMap.empty IntMap.empty IntMap.empty )
@@ -1342,7 +1339,7 @@ currentCapture t = do
 capturePass
   :: forall mode s task t
   .  ( Num t, Measurable t, Bounded t )
-  => Theory mode s task t -> Constraints t -> ST s ()
+  => TheoryState mode s task t -> Constraints t -> ST s ()
 capturePass t ( Constraints { boundReasons = brs } ) = do
 #ifdef DEBUG
   -- Capturing a task's pre-pass bound only yields an on-trail atom if the
@@ -1364,7 +1361,7 @@ capturePass t ( Constraints { boundReasons = brs } ) = do
 -- captured values so they are the on-trail atoms the propagator read.
 capSubsetLits
   :: ( Num t, Measurable t, Bounded t )
-  => Theory mode s task t -> PassCapture t -> [ Int ] -> ST s [ Lit ]
+  => TheoryState mode s task t -> PassCapture t -> [ Int ] -> ST s [ Lit ]
 capSubsetLits t cap = fmap concat . traverse one
   where
     one s = case IntMap.lookup s ( capBounds cap ) of
@@ -1380,7 +1377,7 @@ capSubsetLits t cap = fmap concat . traverse one
 -- carvers from the /captured/ compulsory parts and cite their captured bounds.
 capCarverLits
   :: ( Num t, Measurable t, Bounded t )
-  => Theory mode s task t -> PassCapture t -> Handedness -> Int
+  => TheoryState mode s task t -> PassCapture t -> Handedness -> Int
   -> Endpoint ( EarliestTime t ) -> Endpoint ( LatestTime t ) -> ST s [ Lit ]
 capCarverLits t cap side i newEst newLst = do
   let window = jumpWindow t side i newEst newLst
@@ -1397,7 +1394,7 @@ capCarverLits t cap side i newEst newLst = do
 channelPass
   :: forall mode s task t
   .  ( Num t, Measurable t, Bounded t, MonitorMode mode )
-  => Theory mode s task t
+  => TheoryState mode s task t
   -> Constraints t
   -> IntMap ( Maybe BoundMove, Maybe BoundMove )  -- ^ how each task's @(est, lct)@ moved
   -> ST s ( Maybe SAT.Conflict )
@@ -1413,7 +1410,7 @@ channelPass t cts deltas = do
     channelBounds :: PassCapture t -> [ ( Int, ( Maybe BoundMove, Maybe BoundMove ) ) ] -> ST s ( Maybe SAT.Conflict )
     channelBounds _   [] = pure Nothing
     channelBounds cap ( ( i, ( estMv, lctMv ) ) : rest ) = do
-      ok <- SAT.isOk ( solver t )
+      ok <- SAT.isOk ( theorySolverState t )
       if not ok then pure Nothing
       else do
         task <- readTask t i
@@ -1453,7 +1450,7 @@ channelPass t cts deltas = do
 passChanneller
   :: forall mode s task t
   .  ( Num t, Measurable t, Bounded t, MonitorMode mode )
-  => Theory mode s task t -> PassChanneller s task t
+  => TheoryState mode s task t -> PassChanneller s task t
 passChanneller t = PassChanneller
   { onCapture = capturePass t
   , onChannel = \ cts applied -> do
@@ -1472,21 +1469,21 @@ passChanneller t = PassChanneller
 -- reason otherwise).
 enqueuePropagated
   :: forall mode s task t
-  .  Theory mode s task t -> Lit -> LazyReason s -> ST s ()
+  .  TheoryState mode s task t -> Lit -> LazyReason s -> ST s ()
 enqueuePropagated t lit reason = do
-  lvl <- SAT.currentLevel ( solver t )
+  lvl <- SAT.currentLevel ( theorySolverState t )
   if lvl == SAT.GroundLevel
   then
     -- A ground-level theory propagation is an unconditional fact; 1-UIP never
     -- resolves against ground-level literals, so it needs no reason clause.
-    SAT.enqueueUndef ( solver t ) lit RFact
+    SAT.enqueueUndef ( theorySolverState t ) lit RFact
   else do
 #ifdef DEBUG
     debugCheckReasonAntecedents t lit reason
 #endif
     -- TODO: the lazy-reason table is never reclaimed on backjump.
-    lref <- SAT.recordLazyReason ( solver t ) reason
-    SAT.enqueueUndef ( solver t ) lit ( RLazy lref )
+    lref <- SAT.recordLazyReason ( theorySolverState t ) reason
+    SAT.enqueueUndef ( theorySolverState t ) lit ( RLazy lref )
   modifyMutVar' ( theoryPropCount t ) ( + 1 )
 
 #ifdef DEBUG
@@ -1505,12 +1502,12 @@ debugCheckReasonAntecedents t propLit reason = do
       check ( l : ls )
         | litVar l == litVar propLit = check ls
         | otherwise = do
-            v <- SAT.litValue ( solver t ) l
+            v <- SAT.litValue ( theorySolverState t ) l
             if v == LFalse
             then check ls
             else do
               mbMeaning <- litMeaning ( atoms t ) ( boundAtoms t ) l
-              dump      <- SAT.dumpSolverState ( solver t )
+              dump      <- SAT.dumpSolverState ( theorySolverState t )
               error $ "Schedule.LCG.Theory.enqueuePropagated: reason for "
                    <> show propLit <> " cites antecedent " <> show l <> " which is "
                    <> show v <> " (expected the clause literal to be LFalse, i.e. the "
@@ -1534,12 +1531,12 @@ debugMeaning ( Just ( MeansBound i _ pol ) )  = "bound task=" <> show i <> " pol
 assertTheoryLit
   :: forall mode s task t
   .  MonitorMode mode
-  => Theory mode s task t
+  => TheoryState mode s task t
   -> Lit
   -> LazyReason s
   -> ST s ( Maybe SAT.Conflict )
 assertTheoryLit t lit reason = do
-  val <- SAT.litValue ( solver t ) lit
+  val <- SAT.litValue ( theorySolverState t ) lit
   case val of
     LTrue  -> pure Nothing
     LUndef -> enqueuePropagated t lit reason *> pure Nothing
@@ -1549,7 +1546,7 @@ assertTheoryLit t lit reason = do
       body <- forceLazyReason reason
       tickConflict ( monitor t ) "derived-edge"
       recordReasonLen ( monitor t ) ( length body )
-      literalsAsConflict "derived-edge" ( solver t ) body
+      literalsAsConflict "derived-edge" ( theorySolverState t ) body
 
 -- | Assert a theory-propagated literal carrying a tight lazy @reason@: enqueue
 -- it (the common case), skip it if already true, or — if it is already false —
@@ -1564,12 +1561,12 @@ assertTheoryLit t lit reason = do
 assertBatch
   :: forall mode s task t
   .  MonitorMode mode
-  => Theory mode s task t
+  => TheoryState mode s task t
   -> Lit
   -> LazyReason s
   -> ST s ( Maybe SAT.Conflict )
 assertBatch t lit reason = do
-  val <- SAT.litValue ( solver t ) lit
+  val <- SAT.litValue ( theorySolverState t ) lit
   case val of
     LTrue  -> pure Nothing
     LUndef -> enqueuePropagated t lit reason *> pure Nothing
@@ -1577,7 +1574,7 @@ assertBatch t lit reason = do
       body <- forceLazyReason reason
       tickConflict ( monitor t ) "bound"
       recordReasonLen ( monitor t ) ( length body )
-      literalsAsConflict "bound" ( solver t ) body
+      literalsAsConflict "bound" ( theorySolverState t ) body
 
 -------------------------------------------------------------------------------
 -- Conflict assembly.
@@ -1586,7 +1583,7 @@ assertBatch t lit reason = do
 buildInfeasibleConflict
   :: forall mode s task t
   .  ( Num t, Measurable t, Bounded t, MonitorMode mode )
-  => Theory mode s task t
+  => TheoryState mode s task t
   -> Infeasible t
   -> ST s ( Maybe SAT.Conflict )
 buildInfeasibleConflict t = \ case
@@ -1598,7 +1595,7 @@ buildInfeasibleConflict t = \ case
     lits <- boundLits t ( IntSet.toList culprit )
     tickConflict ( monitor t ) "overload"
     recordReasonLen ( monitor t ) ( length lits )
-    literalsAsConflict "overload" ( solver t ) ( map negateLit lits )
+    literalsAsConflict "overload" ( theorySolverState t ) ( map negateLit lits )
   EmptyDomain { emptiedTask = i, enforcedEarliest = lo, enforcedLatest = hi } -> do
     -- The emptying pass's pre-pass antecedents are in 'passCapture'.
     cap <- readMutVar ( passCapture t )
@@ -1623,7 +1620,7 @@ buildInfeasibleConflict t = \ case
 emptyDomainConflict
   :: forall mode s task t
   .  ( Num t, Measurable t, Bounded t, MonitorMode mode )
-  => Theory mode s task t
+  => TheoryState mode s task t
   -> PassCapture t
   -> Int
   -> Endpoint ( EarliestTime t )
@@ -1642,15 +1639,15 @@ emptyDomainConflict t cap i lo hi = do
   -- only @prune@\/@timetable@ removals this always holds (the others are ground).
   let fits iv = measure iv >= dur
   when ( any fits ( toList ( intervals residual ) ) ) $ do
-    dump <- SAT.dumpSolverState ( solver t )
+    dump <- SAT.dumpSolverState ( theorySolverState t )
     error $ "Schedule.LCG.Theory.emptyDomainConflict: residual still admits task "
          <> show i <> " (carver reconstruction incomplete)\n" <> dump
 #else
   let _ = residual
 #endif
   carverLits <- capSubsetLits t cap carvers
-  ( lowerAtom, _ ) <- internBoundAtomWith t ( SAT.newAuxVar ( solver t ) ) i ( estLowerToStartUpper lo )
-  ( upperLit,  _ ) <- internBoundAtomWith t ( SAT.newAuxVar ( solver t ) ) i lstThr
+  ( lowerAtom, _ ) <- internBoundAtomWith t ( SAT.newAuxVar ( theorySolverState t ) ) i ( estLowerToStartUpper lo )
+  ( upperLit,  _ ) <- internBoundAtomWith t ( SAT.newAuxVar ( theorySolverState t ) ) i lstThr
   let lowerLit = negateLit lowerAtom   -- start ≥ lo
   -- Assert both crossing bound atoms (the emptied task was skipped by
   -- channel-out), each with a tight pre-pass reason: the squeezing subset plus
@@ -1670,7 +1667,7 @@ emptyDomainConflict t cap i lo hi = do
           let body = negateLit lowerLit : negateLit upperLit : map negateLit carverLits
           tickConflict ( monitor t ) "empty-domain"
           recordReasonLen ( monitor t ) ( length body )
-          literalsAsConflict "empty-domain" ( solver t ) body
+          literalsAsConflict "empty-domain" ( theorySolverState t ) body
 
 -- | Tight conflict for a matrix cycle closed by the new edge @predTask ≺
 -- succTask@: a path @succTask ≺ x₁ ≺ … ≺ predTask@ of precedence literals
@@ -1679,7 +1676,7 @@ emptyDomainConflict t cap i lo hi = do
 reconstructCycle
   :: forall mode s task t
   .  MonitorMode mode
-  => Theory mode s task t
+  => TheoryState mode s task t
   -> Int          -- ^ @predTask@: tail of the new edge
   -> Int          -- ^ @succTask@: head of the new edge
   -> ST s ( Maybe SAT.Conflict )
@@ -1692,7 +1689,7 @@ reconstructCycle t predTask succTask = do
       let body = map negateLit ( precLit ( atoms t ) predTask succTask : pathLits )
       tickConflict ( monitor t ) "cycle"
       recordReasonLen ( monitor t ) ( length body )
-      literalsAsConflict "cycle" ( solver t ) body
+      literalsAsConflict "cycle" ( theorySolverState t ) body
   where
     n = numTasks ( atoms t )
     -- Depth-first search over the /true/ precedence edges from @x@ to
@@ -1709,7 +1706,7 @@ reconstructCycle t predTask succTask = do
       | IntSet.member y visited     = tryEdges visited x ( y + 1 )
       | otherwise                   = do
           let edge = precLit ( atoms t ) x y
-          v <- SAT.litValue ( solver t ) edge
+          v <- SAT.litValue ( theorySolverState t ) edge
           case v of
             LTrue -> do
               mb <- findPath ( IntSet.insert y visited ) y
@@ -1723,7 +1720,7 @@ reconstructCycle t predTask succTask = do
 -- DEBUG-gated soundness check in 'debugAssertCurrentLevelLit'.
 literalsAsConflict
   :: Text          -- ^ conflict-source label (for DEBUG diagnostics)
-  -> SAT.Solver s
+  -> SAT.SolverState s
   -> [ Lit ]
   -> ST s ( Maybe SAT.Conflict )
 literalsAsConflict _label s body = do
@@ -1769,9 +1766,9 @@ debugAssertCitability t ctx = go 0
             check i "lst" l
             go ( i + 1 )
     check i which lit = do
-      v <- SAT.litValue ( solver t ) lit
+      v <- SAT.litValue ( theorySolverState t ) lit
       when ( v /= LTrue ) $ do
-        dump <- SAT.dumpSolverState ( solver t )
+        dump <- SAT.dumpSolverState ( theorySolverState t )
         error $ "Schedule.LCG.Theory.debugAssertCitability [" <> ctx <> "]: task "
              <> show i <> "'s " <> which <> " bound atom " <> show lit <> " is " <> show v
              <> ", not LTrue (citability invariant violated)\n" <> dump

@@ -78,26 +78,12 @@ import Schedule.Task
 
 -- | Options for 'lcgSearch'.
 data SearchOptions = SearchOptions
-  { -- | Maximum propagator-loop iterations per theory step.
-    optPropRounds :: !Int
-  , -- | SAT-solver options.
+  { -- | SAT-solver options.
     --
     -- TODO: currently IGNORED by 'lcgSearch'.
     optSolver     :: !SAT.SolverOptions
     -- | Theory-side options.
   , optTheoryOpts :: !TheoryOptions
-  , -- | Branch on /day-assignment/: seed, for each gappy task, a decision bound
-    -- atom at every internal availability-gap boundary (\"does this task start
-    -- by the end of day @j@?\"), prioritised so the search commits a task to a
-    -- sub-interval before sequencing within it. 'False' gives a precedence-only
-    -- baseline (for A\/B comparison). See "Schedule.LCG.Theory".
-    optBoundDecisions :: !Bool
-  , -- | Use the theory's structural decision heuristic ('theoryDecide') in
-    -- /structural/ search windows. With 'optAlternateSearch' on, structural and
-    -- VSIDS windows alternate (see 'optRestartUnit'); with it off, every window
-    -- is structural. 'False' disables the structural heuristic entirely (pure
-    -- VSIDS), regardless of 'optAlternateSearch'.
-    optTheoryDecide   :: !Bool
   , -- | Base Luby restart window, in conflicts: the @k@-th window allows
     -- @optRestartUnit * 'SAT.Restart.luby' k@ conflicts before restarting to the
     -- ground level (keeping learnt clauses). @<= 0@ disables restarts — a single
@@ -117,32 +103,13 @@ data SearchOptions = SearchOptions
     -- A feasible instance that the structural dive cracks within the first
     -- window never reaches a VSIDS window, so it is unaffected.
     optAlternateSearch :: !Bool
-  , -- | Apply conflict-ordering search within the structural heuristic
-    -- ('Schedule.LCG.Theory.theoryDecide'): revisit the decision variable most
-    -- recently found to be a conflict culprit before resuming the base
-    -- (day-first-fail + critical-pair) order. Folds conflict information into the
-    -- structural search so it stops re-diving into the same dead ends. Only
-    -- meaningful with 'optTheoryDecide' on; inert until the first conflict, so it
-    -- never perturbs an instance the structural dive solves cleanly.
-    --
-    -- Off by default: measurement shows it is a strong win on bin-packing
-    -- fragmentation (copies=2: 145 → 36 conflicts) but a ~2x regression on
-    -- structural-friendly UNSAT instances (interval pigeonhole: 19 → 36
-    -- conflicts), where its culprit-reordering disrupts the critical-pair order.
-    -- Available as an opt-in pending a gentler integration (e.g. last-conflict
-    -- only, or conflict-ordering restricted to precedence sequencing).
-    optConflictOrdering :: !Bool
   }
 
 defaultSearchOptions :: SearchOptions
 defaultSearchOptions = SearchOptions
-  { optPropRounds     = 1000
-  , optSolver         = SAT.defaultOptions
-  , optBoundDecisions = True
-  , optTheoryDecide   = True
-  , optRestartUnit    = 100
+  { optSolver          = SAT.defaultOptions
+  , optRestartUnit     = 100
   , optAlternateSearch = True
-  , optConflictOrdering = False
   , optTheoryOpts =
       TheoryOptions
         { maxPropRounds = 1000
@@ -215,12 +182,16 @@ lcgSearch opts props givenTasks = runST do
   -- Allocate scheduler state and theory in one go.
   tis    <- initialTaskData @taskData @task @t givenTasks
   theory <- newTheory @mode tis props ( optTheoryOpts opts )
+  let solverState = theorySolverState theory
 
   -- Drive the DPLL(T) loop. Its first iteration runs the propagators on
   -- the starting state, seeding any unconditional inferences before the
   -- SAT core takes its first decision.
-  finalVerdict <- driveLoop ( optRestartUnit opts ) ( optAlternateSearch opts )
-                    ( solver theory ) theory
+  finalVerdict <-
+    driveLoop
+      ( optRestartUnit opts )
+      ( optAlternateSearch opts )
+      theory
 
   -- Build the result.
   mbSolution <- case finalVerdict of
@@ -237,12 +208,12 @@ lcgSearch opts props givenTasks = runST do
       -- TODO: driveLoop never reports 'Unknown' at the moment.
       pure ( Left "unary-scheduling: search budget exhausted" )
 
-  cc <- SAT.numConflicts ( solver theory )
-  dc <- SAT.numDecisions ( solver theory )
-  lc <- SAT.numLearnts   ( solver theory )
+  cc <- SAT.numConflicts ( theorySolverState theory )
+  dc <- SAT.numDecisions solverState
+  lc <- SAT.numLearnts   solverState
   tp <- readMutVar ( theoryPropCount theory )
-  lf <- SAT.numLazyForces    ( solver theory )
-  ll <- SAT.numLazyForceLits ( solver theory )
+  lf <- SAT.numLazyForces    solverState
+  ll <- SAT.numLazyForceLits solverState
   let !stats0 = SearchStats
         { numConflicts          = cc
         , numDecisions          = dc
@@ -287,12 +258,12 @@ driveLoop
      )
   => Int                      -- ^ base Luby restart window, in conflicts (@<= 0@: no restarts)
   -> Bool                     -- ^ alternate structural / VSIDS between windows
-  -> SAT.Solver s
-  -> Theory mode s task t
+  -> TheoryState mode s task t
   -> ST s SAT.Verdict
-driveLoop restartUnit alternate solver theory =
-  driveRestarts 1 initialMode
+driveLoop restartUnit alternate theoryState = driveRestarts 1 initialMode
   where
+    solverState :: SAT.SolverState s
+    solverState = theorySolverState theoryState
     restartEnabled :: Bool
     restartEnabled = restartUnit > 0
 
@@ -300,7 +271,7 @@ driveLoop restartUnit alternate solver theory =
     -- is pure VSIDS.
     initialMode :: SearchMode
     initialMode =
-      if useTheoryDecide $ theoryOptions theory
+      if useTheoryDecide $ theoryOptions theoryState
       then Structural
       else Activity
 
@@ -308,7 +279,7 @@ driveLoop restartUnit alternate solver theory =
     -- structural heuristic are on; otherwise every window keeps 'initialMode'.
     nextMode :: SearchMode -> SearchMode
     nextMode m
-      | alternate && useTheoryDecide ( theoryOptions theory )
+      | alternate && useTheoryDecide ( theoryOptions theoryState )
       = case m of
           Structural -> Activity
           Activity -> Structural
@@ -326,10 +297,10 @@ driveLoop restartUnit alternate solver theory =
           -- Restart all the way to ground, keeping learnt clauses. Guard the
           -- theory rollback: the triggering conflict may have already backjumped
           -- to ground (so there is no level to pop).
-          cur <- SAT.currentLevel solver
+          cur <- SAT.currentLevel ( theorySolverState theoryState )
           when ( cur > SAT.GroundLevel ) do
-            SAT.cancelUntil solver SAT.GroundLevel
-            popToLevel theory SAT.GroundLevel
+            SAT.cancelUntil solverState SAT.GroundLevel
+            popToLevel theoryState SAT.GroundLevel
           driveRestarts ( k + 1 ) ( nextMode mode )
 
     -- One restart window: the inner BCP/theory/decide loop, bounded by @limit@
@@ -339,28 +310,28 @@ driveLoop restartUnit alternate solver theory =
       where
         step :: Int -> ST s WindowResult
         step !confs = do
-          ok <- SAT.isOk solver
+          ok <- SAT.isOk solverState
           if not ok
           then pure ( Solved SAT.Unsat )
           else do
             -- 1. Binary Constraint Propagation
-            mbConf <- withPhaseTiming ( monitor theory ) "BCP" ( SAT.propagate solver )
+            mbConf <- withPhaseTiming ( monitor theoryState ) "BCP" ( SAT.propagate solverState )
             case mbConf of
               Just c  -> onConflict confs c
               Nothing -> do
                 -- 2. Theory propagation.
-                szBefore <- SAT.trailSize solver
-                mbTConf <- theoryPropagate theory
+                szBefore <- SAT.trailSize solverState
+                mbTConf <- theoryPropagate theoryState
                 case mbTConf of
                   Just c  -> onConflict confs c
                   Nothing -> do
                     -- Theory may have marked the solver UNSAT via a ground-level
                     -- snapshot conflict; re-check 'isOk' before continuing.
-                    okAfter <- SAT.isOk solver
+                    okAfter <- SAT.isOk solverState
                     if not okAfter
                     then pure ( Solved SAT.Unsat )
                     else do
-                      szAfter <- SAT.trailSize solver
+                      szAfter <- SAT.trailSize solverState
                       if szAfter > szBefore
                       -- Theory pushed new literals — re-run BCP before deciding.
                       then step confs
@@ -376,39 +347,39 @@ driveLoop restartUnit alternate solver theory =
           -- assert a fresh full sweep agrees (no stranded propagator left work undone).
           debugAuditPropagationFixpoint theory
 #endif
-          mbLit <- withPhaseTiming ( monitor theory ) "decide" do
+          mbLit <- withPhaseTiming ( monitor theoryState ) "decide" do
             mbTheory <- case mode of
-              Structural -> theoryDecide theory
+              Structural -> theoryDecide theoryState
               Activity   -> pure Nothing
             case mbTheory of
               -- A theory-proposed branch is still a decision: count it so that
               -- 'numDecisions' reflects the full search-tree size.
-              Just lit -> SAT.countDecision solver *> pure ( Just lit )
-              Nothing  -> SAT.decide solver
+              Just lit -> SAT.countDecision solverState *> pure ( Just lit )
+              Nothing  -> SAT.decide solverState
           case mbLit of
             Nothing  -> pure ( Solved SAT.Sat )
             Just lit -> do
               -- Remember the culprit for conflict-ordering (no-op when off).
-              noteDecision theory lit
-              SAT.pushNewLevel solver
-              pushLevel theory
-              SAT.enqueueUndef solver lit RDecision
+              noteDecision theoryState lit
+              SAT.pushNewLevel solverState
+              pushLevel theoryState
+              SAT.enqueueUndef solverState lit RDecision
               step confs
 
         -- Common conflict-handling path (used for both BCP and theory conflicts).
         onConflict :: Int -> SAT.Conflict -> ST s WindowResult
         onConflict !confs c = do
-          lvl <- SAT.currentLevel solver
+          lvl <- SAT.currentLevel solverState
           if lvl == SAT.GroundLevel
           then do
-            SAT.markFalse solver
+            SAT.markFalse solverState
             pure ( Solved SAT.Unsat )
           else do
             -- Stamp the culprit for conflict-ordering (no-op when off), then
             -- analyse/backjump/install/decay.
-            recordConflict theory
-            withPhaseTiming ( monitor theory ) "analysis"
-              ( SAT.resolveConflict solver c ( popToLevel theory ) )
+            recordConflict theoryState
+            withPhaseTiming ( monitor theoryState ) "analysis"
+              ( SAT.resolveConflict solverState c ( popToLevel theoryState ) )
             if restartEnabled && confs + 1 >= limit
             then pure Restart
             else step ( confs + 1 )

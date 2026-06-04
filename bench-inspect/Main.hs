@@ -37,7 +37,7 @@ import Control.DeepSeq
 -- unary-scheduling
 import Schedule.LCG.Search
   ( SearchResult(..), SearchStats(..), SearchOptions(..)
-  , defaultSearchOptions, lcgSearch
+  , defaultSearchOptions, lcgSearch, TheoryOptions (..)
   )
 import Schedule.Monitor
   ( Monitoring(..), MonitorReport(..), renderReport )
@@ -84,15 +84,21 @@ data Cfg = Cfg
 -- | Decision-strategy configurations.
 abConfigs :: [ Cfg ]
 abConfigs =
-  [ Cfg "struct (no restart)" base { optRestartUnit = 0, optAlternateSearch = False, optConflictOrdering = False }
-  , Cfg "+restart+alt"        base { optAlternateSearch = True , optConflictOrdering = False }
-  , Cfg "+COS (no alt)"       base { optAlternateSearch = False, optConflictOrdering = True }
+  [ Cfg "struct (no restart)" $ setCOS False $ base { optRestartUnit = 0, optAlternateSearch = False }
+  , Cfg "+restart+alt"        $ setCOS False $ base { optAlternateSearch = True }
+  , Cfg "+COS (no alt)"       $ setCOS True  $ base { optAlternateSearch = False }
   , Cfg "default (alt+COS)"   base
-  , Cfg "VSIDS only"          base { optTheoryDecide = False }
-  , Cfg "BA decisions off"    base { optBoundDecisions = False }
+  , Cfg "VSIDS only"          $ setDecide False $ base
+  , Cfg "BA decisions off"    $ setBoundDecisions False $ base
   ]
   where
+
     base = defaultSearchOptions
+
+setCOS, setDecide, setBoundDecisions :: Bool -> SearchOptions -> SearchOptions
+setCOS b opts = opts { optTheoryOpts = ( optTheoryOpts opts ) { useConflictOrdering = b } }
+setDecide b opts = opts { optTheoryOpts = ( optTheoryOpts opts ) { useTheoryDecide = b } }
+setBoundDecisions b opts = opts { optTheoryOpts = ( optTheoryOpts opts ) { useBoundDecisions = b } }
 
 -------------------------------------------------------------------------------
 -- Measurement.
@@ -272,7 +278,7 @@ optionToggleExperiment = do
     optConfigs :: [ ( String, SearchOptions ) ]
     optConfigs =
       [ ( "default",          defaultSearchOptions )
-      , ( "no-day-decisions", defaultSearchOptions { optBoundDecisions = False } )
+      , ( "no-day-decisions", setBoundDecisions False $ defaultSearchOptions ) 
       ]
     optInstances :: [ ( String, Instance ) ]
     optInstances =
@@ -387,10 +393,10 @@ sizeSweeps = do
 
 strategyConfigs :: [ ( String, SearchOptions ) ]
 strategyConfigs =
-  [ ( "struct(no-rs)", defaultSearchOptions { optRestartUnit = 0, optAlternateSearch = False, optConflictOrdering = False } )
-  , ( "alt(no-COS)",   defaultSearchOptions { optConflictOrdering = False } )
+  [ ( "struct(no-rs)", setCOS False $ defaultSearchOptions { optRestartUnit = 0, optAlternateSearch = False } )
+  , ( "alt(no-COS)",   setCOS False $ defaultSearchOptions )
   , ( "default",       defaultSearchOptions )
-  , ( "VSIDS",         defaultSearchOptions { optTheoryDecide = False } )
+  , ( "VSIDS",         setDecide False $ defaultSearchOptions )
   ]
 
 -- | Run every 'strategyConfigs' column on each instance, holding propagators and

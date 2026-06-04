@@ -3,7 +3,7 @@ module SAT
   ( -- * Literals
     module SAT.Base
     -- * Solver
-  , Solver
+  , SolverState
   , newSolver
     -- * Building the problem
   , newVar
