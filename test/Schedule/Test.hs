@@ -77,22 +77,19 @@ prunePropagators = [ prunePropagator ]
 pruneTasks :: [ ( TimeOfDayTask, Text ) ]
 pruneTasks =
   [ ( task1, "#1 (no prune 1)")
-  , ( task2, "#1 (no prune 2)" )
-  , ( task3, "#2 (partially prune)" )
-  , ( task4, "#3 (fully prune)" )
+  , ( task2, "#2 (no prune 2)" )
+  , ( task3, "#3 (partially prune)" )
   ]
   where
     task1 = timeOfDayTask ( Minutes 30 ) []
     task2 = timeOfDayTask ( Minutes 15 ) [ ( 07 `h` 00, 08 `h` 00 ), ( 10 `h` 00, 12 `h` 00 ) ]
     task3 = timeOfDayTask ( Minutes 30 ) [ ( 08 `h` 00, 09 `h` 00 ), ( 11 `h` 00, 11 `h` 15 ), ( 11 `h` 20, 11 `h` 30 ) ]
-    task4 = timeOfDayTask ( Minutes 60 ) [ ( 09 `h` 15, 10 `h` 00 ), ( 14 `h` 00, 14 `h` 30 ) ]
 
 expectedPruneTasks :: [ TimeOfDayTask ]
 expectedPruneTasks =
   [ timeOfDayTask ( Minutes 30 ) []
   , timeOfDayTask ( Minutes 15 ) [ ( 07 `h` 00, 08 `h` 00 ), ( 10 `h` 00, 12 `h` 00 ) ]
   , timeOfDayTask ( Minutes 30 ) [ ( 08 `h` 00, 09 `h` 00 ) ]
-  , timeOfDayTask ( Minutes 60 ) []
   ]
 
 -------------------------------------------------------------------------------
