@@ -307,7 +307,7 @@ scheduleSpreadsheet = do
                 ( \ trail -> do
                     for_ chain ( \ ( a, b ) -> addEdge trail a b )
                     let allTasks = IntSet.fromList [ 0 .. length schedulingTasks - 1 ]
-                    propagationLoop NoMonitoring 1000 trail propagators
+                    propagationLoop NoMonitoring 1000 trail propagators Nothing
                       ( seedAllOf propagators allTasks ) )
             -- Tasks for which the Z3 start no longer lies within the tightened window.
             violators :: [ Text ]
