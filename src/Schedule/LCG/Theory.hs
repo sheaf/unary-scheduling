@@ -22,10 +22,9 @@
 --       (1) /Learning + pruning./ Each propagator bound tightening is channelled
 --           /out/ to the matching bound atom with a tight, local clausal reason.
 --
---       (2) /Day-assignment decisions./ For each task whose availability has
---           interior gaps (a multi-day song that cannot straddle a day boundary),
---           a /decision/ bound atom is seeded at every gap boundary. Allows
---           for some meaningful structural branching.
+--       (2) /Interval commitment./ For each task whose availability has
+--           interior gaps, a /decision/ bound atom is seeded at every gap
+--           boundary. Allows for some meaningful structural branching.
 --
 --     Binary monotonicity lemmata (@[start ≤ a] ⟹ [start ≤ b]@ for @a ≤ b@)
 --     keep a task's bound atoms mutually consistent, so a decided or
@@ -39,11 +38,13 @@ module Schedule.LCG.Theory
   , popToLevel
     -- * One round of theory propagation
   , theoryPropagate
-    -- * Structural decision heuristic
+    -- * Failure-directed decision heuristic
   , theoryDecide
-    -- * Conflict-ordering search
+  , measureSpace
+    -- * Failure-directed rating updates
   , noteDecision
-  , recordConflict
+  , settlePending
+  , settleConflict
     -- * Inspection
   , numPrecedenceDecisions
 #ifdef DEBUG
@@ -122,7 +123,7 @@ import qualified Data.Vector.Primitive.Mutable as Primitive
 import SAT.Base
   ( Var(..), Lit, LBool(..)
   , Polarity(Positive, Negative)
-  , negateLit, litVar, varIndex
+  , negateLit, litVar, varIndex, litIndex
   )
 import SAT.Clause
   ( Reason(..), LazyReason(..), forceLazyReason )
@@ -164,7 +165,7 @@ import Schedule.Task
   ( MutableTaskInfos, TaskInfos(..), Task(..)
   , est, ect, lst, lct )
 import Schedule.Time
-  ( EarliestTime, LatestTime, Delta, HandedTime(handedTime)
+  ( EarliestTime, LatestTime, Delta(getDelta), HandedTime(handedTime)
   , Handedness(Earliest, Latest)
   )
 import Schedule.Trail
@@ -195,21 +196,32 @@ data TheoryState mode s task t = TheoryState
     propagators    :: ![ Propagator task t ]
     -- | Configuration options.
   , theoryOptions  :: !TheoryOptions
-  , -- | Monotone conflict counter ticked by 'recordConflict'; supplies the
-    -- recency stamp for conflict-ordering.
-    conflictClock :: !( MutVar s Int )
-  , -- | Per decision variable (by 'varIndex'), the 'conflictClock' value at which
-    -- it was last a conflict culprit. Higher = more recent. Entries persist
-    -- across restarts (recency is global); 'conflictOrderingPick' skips those
-    -- whose variable is currently assigned.
-    conflictStamps :: !( MutVar s ( IntMap Int ) )
-  , -- | The variable of the most recent branching decision (its culprit on the
-    -- next conflict, by last-conflict reasoning).
-    lastDecision :: !( MutVar s ( Maybe Var ) )
-  , -- | Per gappy task, its day-assignment decision atoms in ascending threshold
-    -- order (the positive literal @start ≤ boundary@), as seeded by
-    -- 'seedDecisionBounds'. Read by 'theoryDecide' for first-fail day branching;
-    -- written once at construction and never mutated thereafter.
+  , -- | Per-branch failure-directed rating, indexed by 'litIndex' (so the two
+    -- polarities of a variable are scored independently). Lower = more
+    -- failure-prone = preferred by 'theoryDecide'.
+    --
+    -- Each entry is an exponential moving average of the branch's per-application
+    -- /local rating/ (@0@ on a wipeout, else @1 + R@ for the search-space
+    -- reduction @R@; see 'settlePending' \/ 'settleConflict'), starting from the
+    -- neutral 'initialRating'. Grown on demand to cover every interned literal;
+    -- entries persist across restarts (a matured rating re-steers the top of the
+    -- tree on the next dive).
+    branchRating :: !( Growable Primitive.MVector s Double )
+  , -- | Per search depth (SAT decision level), the running average local rating
+    -- of branches rated at that depth (the paper's @avgRating[d]@), used to
+    -- normalise a branch's rating in 'settleBranch'. Indexed by depth, grown on
+    -- demand, 'initialRating' until a branch at that depth is rated.
+    avgRating :: !( Growable Primitive.MVector s Double )
+  , -- | The branch chosen by the most recent decision, paired with the (log)
+    -- search-space measure ('measureSpace') in effect when it was taken. A
+    -- one-slot pending observation: settled into 'branchRating' when the next
+    -- decision is taken ('settlePending') or a conflict fires ('settleConflict',
+    -- a wipeout), then cleared.
+    pendingDecision :: !( MutVar s ( Maybe ( Lit, Double ) ) )
+  , -- | Per gappy task, its interval commitment decision atoms in ascending
+    -- threshold order (the positive literal @start ≤ boundary@), as seeded by
+    -- 'seedDecisionBounds'. Read by 'theoryDecide' for interval commitment
+    -- branching; written once at construction and never mutated thereafter.
     decisionBounds :: !( MutVar s ( IntMap [ Lit ] ) )
   , -- | Next SAT trail position to channel into the scheduler.
     --
@@ -252,16 +264,13 @@ data TheoryOptions
   = TheoryOptions
   { -- | Maximum propagator-round iterations per theory step.
     maxPropRounds  :: !Int
-  , -- | Whether to branch on day-assignment by seeding a /decision/ bound atom
-    -- at each task's internal availability-gap boundaries (see 'seedDecisionBounds').
+  , -- | Whether to perform interval commitment decision branching by seeding
+    -- a /decision/ bound atom at each task's internal availability-gap
+    -- boundaries (see 'seedDecisionBounds').
     useBoundDecisions :: !Bool
-  , -- | Whether 'theoryDecide' proposes structural day-assignment decisions
-    -- ahead of VSIDS. Only meaningful together with 'useBoundDecisions'.
+  , -- | Whether 'theoryDecide' drives failure-directed branch selection ahead of
+    -- VSIDS. 'False' makes the search pure VSIDS, with the ratings left inert.
     useTheoryDecide :: !Bool
-  , -- | Whether 'theoryDecide' applies /conflict-ordering search/ ahead of its
-    -- structural choice: revisit the decision variable most recently found
-    -- to be a conflict culprit before resuming the base order.
-    useConflictOrdering :: !Bool
   }
 
 {-# SPECIALISE newTheory @MonitoringOff #-}
@@ -297,9 +306,9 @@ newTheory tis props opts = do
   pconf <- newMutVar Nothing
   tpc   <- newMutVar 0
   db    <- newMutVar mempty
-  cclk  <- newMutVar 0
-  cstmp <- newMutVar mempty
-  ldec  <- newMutVar Nothing
+  brat  <- Growable.new 16
+  avgr  <- Growable.new 16
+  pdec  <- newMutVar Nothing
   -- Snapshot ground availabilities now, before any propagation mutates them.
   gav   <- Boxed.Vector.generateM nT \ i ->
              taskAvailability <$> Boxed.MVector.unsafeRead ( taskAvails tis ) i
@@ -313,9 +322,9 @@ newTheory tis props opts = do
         , schedTrail        = trail
         , propagators       = props
         , theoryOptions     = opts
-        , conflictClock     = cclk
-        , conflictStamps    = cstmp
-        , lastDecision      = ldec
+        , branchRating      = brat
+        , avgRating         = avgr
+        , pendingDecision   = pdec
         , decisionBounds    = db
         , theoryHead        = th
         , levelMarks        = lms
@@ -363,8 +372,14 @@ seedInitialBounds t nT =
     else do
       estL <- currentEstLit t i
       lctL <- currentLctLit t i
-      SAT.enqueueUndef ( theorySolverState t ) estL RFact
-      SAT.enqueueUndef ( theorySolverState t ) lctL RFact
+      -- @estL@ (@start ≥ est@) and @lctL@ (@start ≤ lst@) coincide on a single
+      -- atom with opposite polarities exactly when @est > lst@: a task whose
+      -- availability has slots but none long enough for its duration, hence no
+      -- feasible start. Seeding both then contradicts, so seed defensively and
+      -- surface the contradiction as a root infeasibility.
+      ok1 <- SAT.tryEnqueue ( theorySolverState t ) estL RFact
+      ok2 <- SAT.tryEnqueue ( theorySolverState t ) lctL RFact
+      when ( not ( ok1 && ok2 ) ) ( SAT.markFalse ( theorySolverState t ) )
 
 -------------------------------------------------------------------------------
 -- SAT-decision-level synchronisation.
@@ -422,140 +437,186 @@ numPrecedenceDecisions t = do
   loop 0 0
 
 -------------------------------------------------------------------------------
--- Structural decision heuristic.
+-- Failure-directed decision heuristic.
+--
+-- Failure-Directed Search (Vilím, Laborie & Shaw, CPAIOR 2015) rates each
+-- /branch/ (a variable+polarity) by how close it tends to come to a wipeout, and
+-- dives the branch most likely to fail first — provably shrinking the space
+-- fastest, which is what closes a search on feasible and infeasible alike. The
+-- ratings ('branchRating') live over the precedence tournament (the primary,
+-- complete choice set), with interval-commit bound atoms as completion choices
+-- (see 'theoryDecide'), and mature via an EMA of per-decision local ratings (see
+-- 'settlePending' \/ 'settleConflict').
+--
+-- Two deviations from the paper, both order-only:
+--
+--   * The paper warm-starts ratings by strong branching at each restart root; we
+--     instead leave untrained ratings at the neutral 'initialRating' and break
+--     /score ties/ among them by critical-pair criticality. On a conflict-free
+--     dive no candidate is ever rated (only /decided/ branches are), so every
+--     candidate stays neutral and the tie-break reproduces the structural
+--     critical-pair dive exactly — protecting the 0-conflict feasibles. Once a
+--     branch is rated (post-conflict), its learned rating governs and pure FDS
+--     takes over.
+--
+--   * Restarts follow the surrounding Luby schedule rather than the paper's
+--     geometric one.
 
--- | Propose the next branching literal from a CP search strategy, or 'Nothing'
--- to defer to the SAT decision logic.
+-- | The neutral starting value for every branch rating and depth average.
+initialRating :: Double
+initialRating = 1
+
+-- | EMA retention weight @α@ in the rating update.
 --
---  1. For gappy tasks, branch on the lowest undecided inner boundary atom of
---     the most constrained task.
---  2. Critical pair sequencing (settle the most resource critical unordered task pair).
+-- The paper uses a slow decay @α ∈ [0.9, 0.99]@: a single observation nudges a
+-- rating, and it takes a run of failures to drive a branch toward @0@.
+fdsAlpha :: Double
+fdsAlpha = 0.95
+
+-- | Floor on a depth's average rating, guarding the per-depth normalisation
+-- against a depth whose observations have driven the average toward @0@.
+avgRatingFloor :: Double
+avgRatingFloor = 1e-3
+
+-- | Grow 'branchRating' to cover the given literal, filling fresh cells with the
+-- neutral 'initialRating'.
+ensureRating :: TheoryState mode s task t -> Lit -> ST s ()
+ensureRating t lit =
+  Growable.ensureSize ( branchRating t ) ( litIndex lit + 1 ) initialRating
+
+-- | The current rating of a branch ('initialRating' if never rated), growing the
+-- store as needed.
+readRating :: TheoryState mode s task t -> Lit -> ST s Double
+readRating t lit = do
+  ensureRating t lit
+  Growable.read ( branchRating t ) ( litIndex lit )
+
+writeRating :: TheoryState mode s task t -> Lit -> Double -> ST s ()
+writeRating t lit r = do
+  ensureRating t lit
+  Growable.write ( branchRating t ) ( litIndex lit ) r
+
+-- | The running average rating at a search depth (the paper's @avgRating[d]@),
+-- 'initialRating' until any branch at that depth is rated.
+readAvgRating :: TheoryState mode s task t -> Int -> ST s Double
+readAvgRating t d = do
+  Growable.ensureSize ( avgRating t ) ( d + 1 ) initialRating
+  Growable.read ( avgRating t ) d
+
+writeAvgRating :: TheoryState mode s task t -> Int -> Double -> ST s ()
+writeAvgRating t d r = do
+  Growable.ensureSize ( avgRating t ) ( d + 1 ) initialRating
+  Growable.write ( avgRating t ) d r
+
+-- | The current SAT decision level as a plain depth.
+currentDepth :: TheoryState mode s task t -> ST s Int
+currentDepth t = do
+  SAT.DecisionLevel d <- SAT.currentLevel ( theorySolverState t )
+  pure d
+
+-- | The log of the remaining search-space size: @Σ_tasks log |domain|@, the
+-- domain of a task being the measure of its current availability (its feasible
+-- start positions). The paper's reduction @R@ is the /product/ of per-variable
+-- domain ratios before and after a decision, so working in this log-sum lets
+-- 'settlePending' recover @R = exp(after − before)@ in one subtraction.
 --
--- Only when both stages abstain does it return 'Nothing', letting the SAT
--- decision logic kick in.
+-- A fixed task contributes a unit (log @0@) domain; an /emptied/ domain is a
+-- failure, surfaced as a conflict and rated by 'settleConflict', so it is never
+-- measured here (the @max 1@ only guards against @log 0@ on a degenerate slot).
+measureSpace
+  :: forall mode s task t
+  .  ( Real t, Measurable t )
+  => TheoryState mode s task t -> ST s Double
+measureSpace t = go 0 0
+  where
+    n = numTasks ( atoms t )
+    go :: Int -> Double -> ST s Double
+    go !i !acc
+      | i >= n    = pure acc
+      | otherwise = do
+          task <- readTask t i
+          let vol = sum [ getDelta ( measure iv )
+                        | iv <- toList ( intervals ( taskAvailability task ) ) ]
+          go ( i + 1 ) ( acc + log ( max 1 ( realToFrac vol ) ) )
+
+-- | Propose the next branching literal by failure-directed selection, or
+-- 'Nothing' to defer to VSIDS.
+--
+-- The precedence tournament is the /primary/ choice set: a complete acyclic
+-- ordering plus propagation determines a schedule, so precedences alone are a
+-- sound and complete branching. Each undecided pair's variable @v@ is scored by
+-- the combined rating of its two branches,
+--
+-- > score v = rating[pos v] + rating[neg v]
+--
+-- (both branches failure-prone ⇒ a /closing choice/, the best). The
+-- minimum-score candidate is branched on its lower-rated — more failure-prone —
+-- side first (fail-first); score ties are broken by criticality (see 'evalPair'),
+-- which on an untrained dive reproduces the structural critical-pair heuristic.
+--
+-- Interval-commit atoms are /completion/ choices: redundant given the
+-- precedences, they are considered only once every precedence is decided but the
+-- formula is not yet fully assigned (cf. the paper completing a fully-decided
+-- choice set). Mixing them into the primary pool lets shallow interval-commit
+-- failures crowd out the precedence proof, which the per-instance sweep confirms
+-- hurts the infeasible families without helping the feasible ones.
+--
+-- 'Nothing' once every structural atom is decided (or when 'useTheoryDecide' is
+-- off): the leftover auxiliary\/bound atoms fall through to VSIDS, so search
+-- stays complete.
 theoryDecide
   :: forall mode s task t
-  .  ( Num t, Measurable t, Bounded t )
+  .  ( Real t, Measurable t, Bounded t )
   => TheoryState mode s task t
   -> ST s ( Maybe Lit )
 theoryDecide t
   | not ( useTheoryDecide $ theoryOptions t ) = pure Nothing
   | otherwise = do
-      -- Conflict-ordering first: revisit the most recent unsettled culprit.
-      mbCos <- if useConflictOrdering ( theoryOptions t )
-               then conflictOrderingPick t
-               else pure Nothing
-      case mbCos of
-        Just lit -> pure ( Just lit )
-        Nothing  -> do
-          -- Base order: day-assignment first-fail, then critical-pair sequencing.
-          dbs  <- readMutVar ( decisionBounds t )
-          best <- foldM considerTask Nothing ( IntMap.toList dbs )
-          case best of
-            Just ( _, _, lit ) -> pure ( Just lit )
-            Nothing            -> criticalPair t
-  where
-    -- Keep the most-constrained candidate (fewest remaining intervals).
-    considerTask
-      :: Maybe ( Int, Int, Lit ) -> ( Int, [ Lit ] )
-      -> ST s ( Maybe ( Int, Int, Lit ) )
-    considerTask acc ( i, lits ) = do
-      task <- readTask t i
-      let nIvals = length ( intervals ( taskAvailability task ) )
-      if nIvals <= 1
-      then pure acc   -- already committed to a single interval
-      else do
-        mbLit <- firstUndecided lits
-        pure $ case mbLit of
-          Nothing  -> acc   -- no: all decided already
-          Just lit -> case acc of
-            Just ( bestN, _, _ ) | bestN <= nIvals -> acc
-            _                                      -> Just ( nIvals, i, lit )
+      mbPrec <- scanPrecedences t Nothing
+      case mbPrec of
+        Just cand -> pure ( Just ( candidateLit cand ) )
+        Nothing   -> fmap candidateLit <$> scanBoundDecisions t Nothing
 
-    -- The lowest-threshold inner-boundary atom not yet assigned.
-    firstUndecided :: [ Lit ] -> ST s ( Maybe Lit )
-    firstUndecided [] = pure Nothing
-    firstUndecided ( l : ls ) = do
-      v <- SAT.litValue ( theorySolverState t ) l
-      case v of
-        LUndef -> pure ( Just l )
-        _      -> firstUndecided ls
+-- | A scored failure-directed candidate: its combined @score@ (lower =
+-- preferred), a @tieKey@ breaking equal scores (lower = preferred), and the
+-- branch literal to assert first (its lower-rated, more failure-prone side).
+type Candidate = ( Double, Double, Lit )
 
--------------------------------------------------------------------------------
--- Conflict-ordering search (Gay, Hartert & Schaus, CP 2015).
+candidateLit :: Candidate -> Lit
+candidateLit ( _, _, lit ) = lit
 
--- | Record the variable just branched on, so the next conflict can blame it.
---
--- No-op unless conflict-ordering is enabled.
-noteDecision :: TheoryState mode s task t -> Lit -> ST s ()
-noteDecision t lit =
-  when ( useConflictOrdering $ theoryOptions t ) $
-    writeMutVar ( lastDecision t ) ( Just ( litVar lit ) )
+-- | Keep the better of an incumbent candidate and a new one, comparing by
+-- @(score, tieKey)@ lexicographically.
+keepBest :: Maybe Candidate -> Candidate -> Maybe Candidate
+keepBest Nothing cand = Just cand
+keepBest acc@( Just ( bScore, bTie, _ ) ) cand@( cScore, cTie, _ )
+  | ( cScore, cTie ) < ( bScore, bTie ) = Just cand
+  | otherwise                            = acc
 
--- | Record that a conflict just occurred: stamp the most recent decision
--- variable (the conflict's culprit, by last-conflict reasoning) with a fresh
--- 'conflictClock' tick, so 'conflictOrderingPick' will revisit it first once it
--- is unassigned again.
---
--- No-op unless conflict-ordering is enabled.
-recordConflict :: TheoryState mode s task t -> ST s ()
-recordConflict t =
-  when ( useConflictOrdering $ theoryOptions t ) $ do
-    mbV <- readMutVar ( lastDecision t )
-    case mbV of
-      Nothing -> pure ()
-      Just v  -> do
-        clk <- readMutVar ( conflictClock t )
-        let !clk' = clk + 1
-        writeMutVar ( conflictClock t ) clk'
-        modifyMutVar' ( conflictStamps t ) ( IntMap.insert ( varIndex v ) clk' )
+-- | Assemble a candidate from a variable's two branch ratings, a score-tie key,
+-- and the side to branch first when the two ratings are equal.
+mkCandidate :: Lit -> Lit -> Double -> Double -> Double -> Lit -> Candidate
+mkCandidate posLit negLit ratPos ratNeg tieKey tieSide =
+  ( ratPos + ratNeg
+  , tieKey
+  , case compare ratPos ratNeg of
+      LT -> posLit
+      GT -> negLit
+      EQ -> tieSide
+  )
 
--- | The most-recently-stamped currently unassigned decision variable.
-conflictOrderingPick
-  :: forall mode s task t. TheoryState mode s task t -> ST s ( Maybe Lit )
-conflictOrderingPick t = do
-  stamps <- readMutVar ( conflictStamps t )
-  fmap snd <$> foldM step Nothing ( IntMap.toList stamps )
-  where
-    -- Track the @(clock, literal)@ of the best unassigned culprit so far. Only
-    -- probe a variable's assignment (via 'decideVar') when its stamp could beat
-    -- the incumbent.
-    step :: Maybe ( Int, Lit ) -> ( Int, Int ) -> ST s ( Maybe ( Int, Lit ) )
-    step best ( vi, clk ) =
-      case best of
-        Just ( bclk, _ ) | clk <= bclk -> pure best
-        _ -> do
-          mbLit <- SAT.decideVar ( theorySolverState t ) ( Var vi )
-          pure $ case mbLit of
-            Just lit -> Just ( clk, lit )
-            Nothing  -> best
-
--- | Settle the most resource-critical unordered task pair.
---
--- The most /contended/ disjunction is the pair minimising the larger of the two
--- slacks (even its looser ordering is tight). branch its larger-slack direction
--- first (textbook disjunctive-scheduling order).
---
--- (Clusivity is ignored in the slack — it shifts a bound by at most one unit,
--- which is immaterial to a branching /heuristic/.)
---
--- Returns 'Nothing' when every pair is ordered (the precedence tournament
--- is complete).
-criticalPair
+-- | Scan the undecided precedence pairs (the upper-triangular ordering matrix),
+-- scoring each and keeping the best-scoring candidate.
+scanPrecedences
   :: forall mode s task t
-  .  ( Num t, Measurable t, Bounded t )
-  => TheoryState mode s task t
-  -> ST s ( Maybe Lit )
-criticalPair t = do
-  best <- go 0 1 Nothing
-  pure ( fmap snd best )
+  .  ( Real t, Measurable t, Bounded t )
+  => TheoryState mode s task t -> Maybe Candidate -> ST s ( Maybe Candidate )
+scanPrecedences t = go 0 1
   where
     ps  = atoms t
     n   = numTasks ps
     mat = orderings ( tasks t )
-
-    -- Scan the upper-triangular pairs, keeping the minimum-criticality candidate.
-    go :: Int -> Int -> Maybe ( Delta t, Lit ) -> ST s ( Maybe ( Delta t, Lit ) )
+    go :: Int -> Int -> Maybe Candidate -> ST s ( Maybe Candidate )
     go i j best
       | i >= n - 1 = pure best
       | j >= n     = go ( i + 1 ) ( i + 2 ) best
@@ -566,34 +627,149 @@ criticalPair t = do
               v <- SAT.litValue ( theorySolverState t ) ( precLit ps i j )
               case v of
                 -- 'Unknown' in the matrix should mean the precedence atom is
-                -- unassigned; the check guards against deciding an assigned one.
+                -- unassigned; the check guards against branching an assigned one.
                 LUndef -> do
-                  cand <- evalPair i j
-                  go i ( j + 1 ) ( keepMin best cand )
+                  cand <- precCandidate t i j
+                  go i ( j + 1 ) ( keepBest best cand )
                 _ -> go i ( j + 1 ) best
             _ -> go i ( j + 1 ) best
 
-    keepMin :: Maybe ( Delta t, Lit ) -> ( Delta t, Lit ) -> Maybe ( Delta t, Lit )
-    keepMin Nothing               cand            = Just cand
-    keepMin acc@( Just ( b, _ ) ) cand@( c, _ )
-      | c < b     = Just cand
-      | otherwise = acc
+-- | Score one undecided precedence pair: combined branch rating, with the pair's
+-- criticality ('evalPair') as the score-tie key and its larger-slack direction
+-- as the within-pair tie side. On an untrained dive every rating is neutral, so
+-- the criticality tie-break drives selection — the structural critical-pair dive.
+precCandidate
+  :: ( Real t, Measurable t, Bounded t )
+  => TheoryState mode s task t -> Int -> Int -> ST s Candidate
+precCandidate t i j = do
+  let ps     = atoms t
+      posLit = precLit ps i j   -- i ≺ j
+      negLit = precLit ps j i   -- j ≺ i
+  ( crit, dirLit ) <- evalPair t i j
+  rPos <- readRating t posLit
+  rNeg <- readRating t negLit
+  pure ( mkCandidate posLit negLit rPos rNeg ( realToFrac ( getDelta crit ) ) dirLit )
 
-    -- The criticality (smaller = more contended) and chosen directed literal.
-    evalPair :: Int -> Int -> ST s ( Delta t, Lit )
-    evalPair i j = do
-      ti <- readTask t i
-      tj <- readTask t j
-      let ectI = handedTime ( endpoint ( ect ti ) )
-          lstI = handedTime ( endpoint ( lst ti ) )
-          ectJ = handedTime ( endpoint ( ect tj ) )
-          lstJ = handedTime ( endpoint ( lst tj ) )
-          slackIJ = ectI --> lstJ   -- room if i precedes j
-          slackJI = ectJ --> lstI   -- room if j precedes i
-          crit    = max slackIJ slackJI
-          lit | slackIJ >= slackJI = precLit ps i j   -- larger-slack direction first
-              | otherwise          = precLit ps j i
-      pure ( crit, lit )
+-- | Scan each gappy task's lowest undecided interval-commit atom (a completion
+-- choice; see 'theoryDecide') and keep the best-scoring candidate. With no
+-- precedence left to compete with, score alone decides; equal scores fall to the
+-- first (lowest-threshold) atom.
+scanBoundDecisions
+  :: forall mode s task t
+  .  TheoryState mode s task t -> Maybe Candidate -> ST s ( Maybe Candidate )
+scanBoundDecisions t acc0 = do
+  dbs <- readMutVar ( decisionBounds t )
+  foldM step acc0 ( IntMap.toList dbs )
+  where
+    step :: Maybe Candidate -> ( Int, [ Lit ] ) -> ST s ( Maybe Candidate )
+    step acc ( i, lits ) = do
+      task <- readTask t i
+      let nIvals = length ( intervals ( taskAvailability task ) )
+      if nIvals <= 1
+      then pure acc   -- already committed to a single interval
+      else do
+        mbLit <- firstUndecided t lits
+        case mbLit of
+          Nothing     -> pure acc   -- all decided already
+          Just posLit -> do
+            let negLit = negateLit posLit
+            rPos <- readRating t posLit
+            rNeg <- readRating t negLit
+            pure ( keepBest acc ( mkCandidate posLit negLit rPos rNeg 0 posLit ) )
+
+-- | The lowest-threshold interval-commit atom of the list not yet assigned.
+firstUndecided :: TheoryState mode s task t -> [ Lit ] -> ST s ( Maybe Lit )
+firstUndecided _ [] = pure Nothing
+firstUndecided t ( l : ls ) = do
+  v <- SAT.litValue ( theorySolverState t ) l
+  case v of
+    LUndef -> pure ( Just l )
+    _      -> firstUndecided t ls
+
+-- | The criticality of an unordered task pair (the larger of the two ordering
+-- slacks; smaller = more contended) together with the larger-slack directed
+-- precedence literal — the textbook direction to branch first.
+--
+-- (Clusivity is ignored in the slack — it shifts a bound by at most one unit,
+-- immaterial to a branching /heuristic/.)
+evalPair
+  :: ( Num t, Measurable t, Bounded t )
+  => TheoryState mode s task t -> Int -> Int -> ST s ( Delta t, Lit )
+evalPair t i j = do
+  ti <- readTask t i
+  tj <- readTask t j
+  let ps   = atoms t
+      ectI = handedTime ( endpoint ( ect ti ) )
+      lstI = handedTime ( endpoint ( lst ti ) )
+      ectJ = handedTime ( endpoint ( ect tj ) )
+      lstJ = handedTime ( endpoint ( lst tj ) )
+      slackIJ = ectI --> lstJ   -- room if i precedes j
+      slackJI = ectJ --> lstI   -- room if j precedes i
+      crit    = max slackIJ slackJI
+      lit | slackIJ >= slackJI = precLit ps i j   -- larger-slack direction first
+          | otherwise          = precLit ps j i
+  pure ( crit, lit )
+
+-------------------------------------------------------------------------------
+-- Failure-directed rating updates.
+--
+-- A one-slot pending observation links the two hook points: 'noteDecision'
+-- records the branch just taken with the (log) search-space measure then in
+-- effect; 'settlePending' \/ 'settleConflict' fold its measured failure-directed
+-- local rating into the branch's EMA when the next decision is taken or a
+-- conflict fires. Because nothing happens between a decision and its settlement
+-- but that branch's own propagation, the settlement sees exactly the branch's
+-- effect (the paper's "update rating of branch right after it propagates").
+
+-- | Record the branch just taken, with the (log) search-space measure
+-- ('measureSpace') in effect when it was chosen, as the one-slot pending
+-- observation to be settled later.
+noteDecision :: TheoryState mode s task t -> Lit -> Double -> ST s ()
+noteDecision t lit spaceBefore =
+  writeMutVar ( pendingDecision t ) ( Just ( lit, spaceBefore ) )
+
+-- | Settle the pending decision against the (log) search-space measure now in
+-- effect (after it propagated to a fixpoint). Its local rating is the paper's
+-- @1 + R@, where @R = exp(after − before) ∈ (0, 1]@ is the product of per-task
+-- domain ratios — so a non-failing branch rates in @(1, 2]@, sharply above the
+-- @0@ a wipeout earns ('settleConflict'). A no-op when no decision is pending.
+settlePending :: TheoryState mode s task t -> Double -> ST s ()
+settlePending t spaceAfter = do
+  mb <- readMutVar ( pendingDecision t )
+  case mb of
+    Nothing -> pure ()
+    Just ( lit, spaceBefore ) -> do
+      let r = min 1 ( exp ( spaceAfter - spaceBefore ) )
+      settleBranch t lit ( 1 + r )
+      writeMutVar ( pendingDecision t ) Nothing
+
+-- | Settle the pending decision as a wipeout (local rating @0@): the branch led
+-- straight to a conflict, the maximally failure-directed outcome. A no-op when
+-- no decision is pending.
+settleConflict :: TheoryState mode s task t -> ST s ()
+settleConflict t = do
+  mb <- readMutVar ( pendingDecision t )
+  case mb of
+    Nothing -> pure ()
+    Just ( lit, _ ) -> do
+      settleBranch t lit 0
+      writeMutVar ( pendingDecision t ) Nothing
+
+-- | Fold a branch's fresh local rating into its EMA, normalised by the running
+-- average rating at the current depth (so a branch is judged against its peers
+-- at the same depth, where local ratings are systematically higher near the
+-- root): @rating ← α·rating + (1−α)·localRating \/ avgRating[d]@. The depth's
+-- average absorbs the same observation.
+settleBranch :: TheoryState mode s task t -> Lit -> Double -> ST s ()
+settleBranch t lit localRating = do
+  d   <- currentDepth t
+  avg <- readAvgRating t d
+  r0  <- readRating t lit
+  let avg' = max avgRatingFloor avg
+      r'   = fdsAlpha * r0  + ( 1 - fdsAlpha ) * ( localRating / avg' )
+      avgN = fdsAlpha * avg + ( 1 - fdsAlpha ) * localRating
+  writeRating t lit r'
+  writeAvgRating t d avgN
 
 -------------------------------------------------------------------------------
 -- One round of theory propagation.
@@ -676,7 +852,7 @@ channelPending t = do
 -- SAT trail.
 checkMatrixTrailInvariant
   :: forall mode s task t
-  .  Theory mode s task t
+  .  TheoryState mode s task t
   -> String
   -> ST s ()
 checkMatrixTrailInvariant t ctx = iterPairs 0 1
@@ -936,11 +1112,11 @@ runPropagators t = do
 debugAuditPropagationFixpoint
   :: forall mode s task t
   .  ( Num t, Measurable t, Bounded t, Show t, Show task, MonitorMode mode )
-  => Theory mode s task t -> ST s ()
+  => TheoryState mode s task t -> ST s ()
 debugAuditPropagationFixpoint t = do
   let allTasks = IntSet.fromList [ 0 .. numTasks ( atoms t ) - 1 ]
   ( eRes, updates ) <- runSchedule ( tasks t )
-    ( propagationLoop ( monitor t ) ( maxPropRounds t ) ( schedTrail t )
+    ( propagationLoop ( monitor t ) ( maxPropRounds $ theoryOptions t ) ( schedTrail t )
         ( propagators t ) Nothing ( seedAllOf ( propagators t ) allTasks ) )
   let movedTasks =
         IntMap.keysSet $
@@ -1053,7 +1229,7 @@ readTask t i = Boxed.MVector.unsafeRead ( taskAvails ( tasks t ) ) i
 -- its monotonicity links to the task's neighbouring thresholds the first time
 -- it is created. Returns whether the atom was freshly created. The allocator
 -- chooses the atom's role: an auxiliary (theory-only) variable, or a decision
--- variable for day-assignment branching.
+-- variable for interval commitment branching.
 internBoundAtomWith
   :: Measurable t
   => TheoryState mode s task t -> ST s Var -> Int -> Endpoint ( LatestTime t ) -> ST s ( Lit, Bool )
@@ -1072,8 +1248,8 @@ internBoundAtomWith t allocVar i thr = do
     imply a b = SAT.addBinaryLemma ( theorySolverState t ) ( negateLit a ) b
 
 -- | Get-or-create a /decision/ latest-start atom (placed in the VSIDS heap),
--- bumping its activity on first creation so day-assignment is decided ahead of
--- within-day sequencing.
+-- bumping its activity on first creation (so interval commitment is decided
+-- ahead of precedence branching).
 internDecisionBoundAtom
   :: Measurable t
   => TheoryState mode s task t -> Int -> Endpoint ( LatestTime t ) -> ST s Lit
@@ -1495,7 +1671,7 @@ enqueuePropagated t lit reason = do
 -- antecedent was cited as if true. Either is a reason-construction bug.
 debugCheckReasonAntecedents
   :: forall mode s task t
-  .  Theory mode s task t -> Lit -> LazyReason s -> ST s ()
+  .  TheoryState mode s task t -> Lit -> LazyReason s -> ST s ()
 debugCheckReasonAntecedents t propLit reason = do
   body <- forceLazyReason reason
   let check []         = pure ()
@@ -1749,7 +1925,7 @@ literalsAsConflict _label s body = do
 debugAssertCitability
   :: forall mode s task t
   .  ( Num t, Measurable t, Bounded t )
-  => Theory mode s task t -> String -> ST s ()
+  => TheoryState mode s task t -> String -> ST s ()
 debugAssertCitability t ctx = go 0
   where
     n = numTasks ( atoms t )
@@ -1778,7 +1954,7 @@ debugAssertCitability t ctx = go 0
 -- An empty body is a genuine ground-level inconsistency (handled by 'markFalse',
 -- never passed to 'analyse') and is exempt.
 debugAssertCurrentLevelLit
-  :: forall s. Text -> SAT.Solver s -> [ Lit ] -> ST s ()
+  :: forall s. Text -> SAT.SolverState s -> [ Lit ] -> ST s ()
 debugAssertCurrentLevelLit _     _ []   = pure ()
 debugAssertCurrentLevelLit label s body = do
   cur   <- SAT.currentLevel s

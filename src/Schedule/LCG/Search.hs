@@ -86,36 +86,22 @@ data SearchOptions = SearchOptions
   , optTheoryOpts :: !TheoryOptions
   , -- | Base Luby restart window, in conflicts: the @k@-th window allows
     -- @optRestartUnit * 'SAT.Restart.luby' k@ conflicts before restarting to the
-    -- ground level (keeping learnt clauses). @<= 0@ disables restarts — a single
-    -- unbounded window, so the search never alternates off its first mode.
+    -- ground level (keeping learnt clauses and the matured failure-directed
+    -- ratings).
     --
-    -- The Luby schedule makes this scale-free: there is no constant tied to the
-    -- problem size, and the window count (not a decision count) is what drives
-    -- the structural↔VSIDS alternation.
+    -- @<= 0@ disables restarts.
     optRestartUnit    :: !Int
-  , -- | Alternate the decision strategy between restart windows: the first
-    -- window is structural (good at /finding/ a schedule), the next is VSIDS
-    -- (good at /proving/ infeasibility), and so on. This is how conflict-driven
-    -- learning regains control of the search order without a hard, size-blind
-    -- handoff. Only meaningful with 'optTheoryDecide' on; 'False' keeps every
-    -- window on the structural heuristic.
-    --
-    -- A feasible instance that the structural dive cracks within the first
-    -- window never reaches a VSIDS window, so it is unaffected.
-    optAlternateSearch :: !Bool
   }
 
 defaultSearchOptions :: SearchOptions
 defaultSearchOptions = SearchOptions
   { optSolver          = SAT.defaultOptions
   , optRestartUnit     = 100
-  , optAlternateSearch = True
   , optTheoryOpts =
       TheoryOptions
         { maxPropRounds = 1000
         , useBoundDecisions = True
         , useTheoryDecide = True
-        , useConflictOrdering = False
         }
   }
 
@@ -169,7 +155,7 @@ data SearchStats = SearchStats
 -- unsatisfiability witness, together with cumulative statistics.
 lcgSearch
   :: forall mode taskData task t
-  .  ( Num t, Measurable t, Bounded t
+  .  ( Real t, Num t, Measurable t, Bounded t
      , Show t, Show task
      , SchedulableData taskData task t
      , MonitorMode mode
@@ -190,7 +176,6 @@ lcgSearch opts props givenTasks = runST do
   finalVerdict <-
     driveLoop
       ( optRestartUnit opts )
-      ( optAlternateSearch opts )
       theory
 
   -- Build the result.
@@ -229,16 +214,6 @@ lcgSearch opts props givenTasks = runST do
     , monitorReport = report
     }
 
--- | Which decision strategy drives the current restart window.
-data SearchMode
-  = -- | The theory's structural heuristic ('theoryDecide') gets first refusal;
-    -- VSIDS only picks when it abstains. Good at /finding/ a schedule.
-    Structural
-  | -- | VSIDS alone. Good at /proving/ infeasibility (conflict-driven learning
-    -- steers the order).
-    Activity
-  deriving stock Eq
-
 -- | The outcome of one restart window.
 data WindowResult
   = -- | A final verdict was reached inside the window.
@@ -248,65 +223,55 @@ data WindowResult
 
 {-# SPECIALISE driveLoop @MonitoringOff #-}
 
--- | The DPLL(T) loop proper, run as a sequence of Luby restart windows that
--- alternate the decision strategy (see 'SearchMode').
+-- | The DPLL(T) loop proper, run as a sequence of Luby restart windows.
+--
+-- Each decision is failure-directed ('theoryDecide' over the structural atom
+-- pool, falling through to VSIDS), and its measured reduction matures the branch
+-- ratings: 'measureSpace' before the decision is its rating denominator, settled
+-- against the post-propagation measure at the next decision ('settlePending') or
+-- as a wipeout on conflict ('settleConflict'). Restarts let ratings matured deep
+-- in the tree re-steer its top. With 'useTheoryDecide' off, the ratings stay
+-- inert and the search is pure VSIDS.
 driveLoop
   :: forall mode s task t
-  .  ( Num t, Measurable t, Bounded t
+  .  ( Real t, Num t, Measurable t, Bounded t
      , Show t, Show task
      , MonitorMode mode
      )
   => Int                      -- ^ base Luby restart window, in conflicts (@<= 0@: no restarts)
-  -> Bool                     -- ^ alternate structural / VSIDS between windows
   -> TheoryState mode s task t
   -> ST s SAT.Verdict
-driveLoop restartUnit alternate theoryState = driveRestarts 1 initialMode
+driveLoop restartUnit theoryState = driveRestarts 1
   where
     solverState :: SAT.SolverState s
     solverState = theorySolverState theoryState
     restartEnabled :: Bool
     restartEnabled = restartUnit > 0
 
-    -- The structural heuristic only runs when enabled; otherwise every window
-    -- is pure VSIDS.
-    initialMode :: SearchMode
-    initialMode =
-      if useTheoryDecide $ theoryOptions theoryState
-      then Structural
-      else Activity
-
-    -- Flip the mode for the next window, but only when both alternation and the
-    -- structural heuristic are on; otherwise every window keeps 'initialMode'.
-    nextMode :: SearchMode -> SearchMode
-    nextMode m
-      | alternate && useTheoryDecide ( theoryOptions theoryState )
-      = case m of
-          Structural -> Activity
-          Activity -> Structural
-      | otherwise
-      = m
+    fdsEnabled :: Bool
+    fdsEnabled = useTheoryDecide ( theoryOptions theoryState )
 
     -- Run window @k@; on a restart, roll back to ground and open window @k + 1@.
-    driveRestarts :: Int -> SearchMode -> ST s SAT.Verdict
-    driveRestarts !k mode = do
+    driveRestarts :: Int -> ST s SAT.Verdict
+    driveRestarts !k = do
       let limit = restartUnit * Restart.luby k
-      res <- searchWindow limit mode
+      res <- searchWindow limit
       case res of
         Solved v -> pure v
         Restart  -> do
-          -- Restart all the way to ground, keeping learnt clauses. Guard the
-          -- theory rollback: the triggering conflict may have already backjumped
-          -- to ground (so there is no level to pop).
+          -- Restart all the way to ground, keeping learnt clauses and the matured
+          -- ratings. Guard the theory rollback: the triggering conflict may have
+          -- already backjumped to ground (so there is no level to pop).
           cur <- SAT.currentLevel ( theorySolverState theoryState )
           when ( cur > SAT.GroundLevel ) do
             SAT.cancelUntil solverState SAT.GroundLevel
             popToLevel theoryState SAT.GroundLevel
-          driveRestarts ( k + 1 ) ( nextMode mode )
+          driveRestarts ( k + 1 )
 
     -- One restart window: the inner BCP/theory/decide loop, bounded by @limit@
     -- conflicts. @confs@ counts conflicts resolved in this window.
-    searchWindow :: Int -> SearchMode -> ST s WindowResult
-    searchWindow !limit mode = step 0
+    searchWindow :: Int -> ST s WindowResult
+    searchWindow !limit = step 0
       where
         step :: Int -> ST s WindowResult
         step !confs = do
@@ -337,20 +302,23 @@ driveLoop restartUnit alternate theoryState = driveRestarts 1 initialMode
                       then step confs
                       else decideStep confs
 
-        -- Pick the next decision (or stop if everything is assigned). In a
-        -- 'Structural' window the theory heuristic gets first refusal and VSIDS
-        -- picks only when it abstains; in an 'Activity' window VSIDS drives.
+        -- Pick the next decision (or stop if everything is assigned): the
+        -- failure-directed heuristic gets first refusal, VSIDS picks when it
+        -- abstains.
         decideStep :: Int -> ST s WindowResult
         decideStep !confs = do
 #ifdef DEBUG
           -- Propagation has claimed a fixpoint with no conflict; before branching,
           -- assert a fresh full sweep agrees (no stranded propagator left work undone).
-          debugAuditPropagationFixpoint theory
+          debugAuditPropagationFixpoint theoryState
 #endif
+          -- The size of this node is both the post-propagation measure settling
+          -- the decision that led here and the denominator of the decision taken
+          -- now (measured once and reused).
+          szNow <- if fdsEnabled then measureSpace theoryState else pure 0
+          when fdsEnabled ( settlePending theoryState szNow )
           mbLit <- withPhaseTiming ( monitor theoryState ) "decide" do
-            mbTheory <- case mode of
-              Structural -> theoryDecide theoryState
-              Activity   -> pure Nothing
+            mbTheory <- theoryDecide theoryState
             case mbTheory of
               -- A theory-proposed branch is still a decision: count it so that
               -- 'numDecisions' reflects the full search-tree size.
@@ -359,8 +327,7 @@ driveLoop restartUnit alternate theoryState = driveRestarts 1 initialMode
           case mbLit of
             Nothing  -> pure ( Solved SAT.Sat )
             Just lit -> do
-              -- Remember the culprit for conflict-ordering (no-op when off).
-              noteDecision theoryState lit
+              when fdsEnabled ( noteDecision theoryState lit szNow )
               SAT.pushNewLevel solverState
               pushLevel theoryState
               SAT.enqueueUndef solverState lit RDecision
@@ -375,9 +342,9 @@ driveLoop restartUnit alternate theoryState = driveRestarts 1 initialMode
             SAT.markFalse solverState
             pure ( Solved SAT.Unsat )
           else do
-            -- Stamp the culprit for conflict-ordering (no-op when off), then
-            -- analyse/backjump/install/decay.
-            recordConflict theoryState
+            -- Settle the pending decision as a wipeout (no-op when nothing is
+            -- pending, e.g. with FDS off), then analyse/backjump/install/decay.
+            settleConflict theoryState
             withPhaseTiming ( monitor theoryState ) "analysis"
               ( SAT.resolveConflict solverState c ( popToLevel theoryState ) )
             if restartEnabled && confs + 1 >= limit

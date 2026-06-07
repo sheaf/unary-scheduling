@@ -46,7 +46,7 @@ import Schedule.Time
 
 -- Time of day in minutes.
 newtype Minutes = Minutes { minutes :: Int }
-  deriving newtype ( Eq, Ord, Measurable, Num )
+  deriving newtype ( Eq, Ord, Measurable, Num, Real )
 instance Bounded Minutes where
   minBound = 0
   maxBound = 24 * 60

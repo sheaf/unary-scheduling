@@ -63,7 +63,7 @@ import Schedule.Z3
 -- A small, bounded time type so generated instances stay cheap for Z3.
 
 newtype TestTime = TestTime Int
-  deriving newtype ( Eq, Ord, Num, Measurable )
+  deriving newtype ( Eq, Ord, Num, Real, Measurable )
 
 instance Bounded TestTime where
   minBound = TestTime 0

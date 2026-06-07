@@ -63,10 +63,9 @@ import qualified Schedule.Bench.Instances as Instances
 -- Configuration under test.
 
 -- | The fixed instance for the A\/B matrix. A near-boundary feasible rehearsal
--- that /forces conflicts/ (≈38 under the pure structural dive), so the
--- decision-strategy knobs (restart alternation, conflict-ordering) actually
--- diverge — a slacker instance solves at 0 conflicts and makes every structural
--- configuration identical.
+-- that /forces conflicts/, so the decision-strategy knobs (FDS vs VSIDS,
+-- interval-commitment, restarts) actually diverge — a slacker instance solves at
+-- 0 conflicts and makes every configuration identical.
 theInstance :: Instance
 theInstance = Instances.rehearsalInstance 1.0 0.4 6 24 8 9
 
@@ -88,19 +87,16 @@ data Cfg = Cfg
 -- | Decision-strategy configurations.
 abConfigs :: [ Cfg ]
 abConfigs =
-  [ Cfg "struct (no restart)" $ setCOS False $ base { optRestartUnit = 0, optAlternateSearch = False }
-  , Cfg "+restart+alt"        $ setCOS False $ base { optAlternateSearch = True }
-  , Cfg "+COS (no alt)"       $ setCOS True  $ base { optAlternateSearch = False }
-  , Cfg "default (alt+COS)"   base
-  , Cfg "VSIDS only"          $ setDecide False $ base
-  , Cfg "BA decisions off"    $ setBoundDecisions False $ base
+  [ Cfg "FDS (default)"     base
+  , Cfg "FDS no-restart"    $ base { optRestartUnit = 0 }
+  , Cfg "FDS no-interval"   $ setBoundDecisions False base
+  , Cfg "VSIDS only"        $ setDecide False base
   ]
   where
 
     base = defaultSearchOptions
 
-setCOS, setDecide, setBoundDecisions :: Bool -> SearchOptions -> SearchOptions
-setCOS b opts = opts { optTheoryOpts = ( optTheoryOpts opts ) { useConflictOrdering = b } }
+setDecide, setBoundDecisions :: Bool -> SearchOptions -> SearchOptions
 setDecide b opts = opts { optTheoryOpts = ( optTheoryOpts opts ) { useTheoryDecide = b } }
 setBoundDecisions b opts = opts { optTheoryOpts = ( optTheoryOpts opts ) { useBoundDecisions = b } }
 
@@ -255,14 +251,14 @@ propagatorSubsetExperiment = do
 
 -- | Sweep the search-option toggles across the representative instance families,
 -- to tell an instance-specific win from a broad one (guards against tuning to a
--- single hand-picked instance). Columns: default, day-assignment branching off,
+-- single hand-picked instance). Columns: default, interval commitment branching off,
 -- channel-out learning off.
 optionToggleExperiment :: IO ()
 optionToggleExperiment = do
   printf "Option-toggle sweep (time / dec / conf / tprop; verdict must not change):\n\n"
   printf "  %-22s %-22s %-22s\n"
     ( "instance" :: String ) ( "default" :: String )
-    ( "no-day-decisions" :: String )
+    ( "no-interval-commitment" :: String )
   forM_ optInstances \ ( iname, inst ) -> do
     _ <- evaluate ( force inst )
     cells <- forM optConfigs \ ( _, opts ) -> do
@@ -281,8 +277,8 @@ optionToggleExperiment = do
   where
     optConfigs :: [ ( String, SearchOptions ) ]
     optConfigs =
-      [ ( "default",          defaultSearchOptions )
-      , ( "no-day-decisions", setBoundDecisions False $ defaultSearchOptions ) 
+      [ ( "default"               , defaultSearchOptions )
+      , ( "no-interval-commitment", setBoundDecisions False $ defaultSearchOptions )
       ]
     optInstances :: [ ( String, Instance ) ]
     optInstances =
@@ -313,9 +309,9 @@ abMatrix = do
       cfgLabel ( fmtNs t ) ( verdict res )
       ( numDecisions st ) ( numConflicts st ) ( numLearnts st ) ( numTheoryPropagations st )
   putStrLn ""
-  putStrLn "default-config (alt+COS) instrumentation:"
+  putStrLn "FDS default-config instrumentation:"
   -- One instrumented solve, just for the detailed report (cheap on this config).
-  case [ cfgOpts c | c <- abConfigs, cfgLabel c == "default (alt+COS)" ] of
+  case [ cfgOpts c | c <- abConfigs, cfgLabel c == "FDS (default)" ] of
     ( dfltOpts : _ ) -> do
       t0  <- getMonotonicTimeNSec
       rep <- evaluate ( force ( lcgSearch @MonitoringOn dfltOpts basicPropagators theInstance ) )
@@ -355,7 +351,7 @@ sizeSweeps = do
   -- Tight feasible rehearsal (util=1.0 avail=0.4): near the feasibility boundary,
   -- where even the structural heuristic backtracks. Seeds chosen per size so each
   -- is feasible /and/ forces conflicts (most feasible rehearsals are 0-conflict
-  -- under the day-first-fail + critical-pair heuristic).
+  -- under the interval-commitment-first + critical-pair heuristic).
   sweep "tight feasible rehearsal (util=1.0 avail=0.4; forces backtracking)"
     [ ( "days=" ++ show d ++ " songs=" ++ show s ++ " seed=" ++ show sd
       , Instances.rehearsalInstance 1.0 0.4 d s 8 sd )
@@ -397,10 +393,9 @@ sizeSweeps = do
 
 strategyConfigs :: [ ( String, SearchOptions ) ]
 strategyConfigs =
-  [ ( "struct(no-rs)", setCOS False $ defaultSearchOptions { optRestartUnit = 0, optAlternateSearch = False } )
-  , ( "alt(no-COS)",   setCOS False $ defaultSearchOptions )
-  , ( "default",       defaultSearchOptions )
-  , ( "VSIDS",         setDecide False $ defaultSearchOptions )
+  [ ( "FDS",       defaultSearchOptions )
+  , ( "FDS(no-rs)", defaultSearchOptions { optRestartUnit = 0 } )
+  , ( "VSIDS",     setDecide False $ defaultSearchOptions )
   ]
 
 -- | Run every 'strategyConfigs' column on each instance, holding propagators and

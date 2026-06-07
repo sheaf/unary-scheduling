@@ -74,7 +74,7 @@ import Schedule.Time
 -- A small, bounded time type matching the test suite.
 
 newtype BenchTime = BenchTime Int
-  deriving newtype ( Eq, Ord, Num, Measurable, NFData )
+  deriving newtype ( Eq, Ord, Num, Real, Measurable, NFData )
 
 instance Show BenchTime where
   show ( BenchTime t ) = show t

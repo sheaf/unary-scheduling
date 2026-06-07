@@ -504,17 +504,16 @@ newSolver = do
 numVariables :: PrimMonad m => SolverState ( PrimState m ) -> m Int
 numVariables s = Growable.length ( assigns s )
 
+-- | Add one activity bump to a variable (and re-heapify it). Exposed so a
+-- theory can bias the decision order towards variables it considers
+-- structurally important.
+bumpVarActivity :: PrimMonad m => SolverState ( PrimState m ) -> Var -> m ()
+bumpVarActivity s = VarOrder.bumpActivity ( varOrder s )
+
 -- | Allocate a fresh /decision/ variable. All per-variable and per-literal
 -- tables grow to accommodate it; the new variable is initially unassigned
 -- with zero activity and no saved phase. It is registered at the bottom of
 -- the activity heap and is eligible to be branched on by 'decide'.
--- | Add one activity bump to a variable (and re-heapify it). Exposed so a
--- theory can bias the decision order towards variables it considers
--- structurally important — e.g. the day-assignment bound atoms of the
--- scheduler, which we want decided before the within-day sequencing.
-bumpVarActivity :: PrimMonad m => SolverState ( PrimState m ) -> Var -> m ()
-bumpVarActivity s = VarOrder.bumpActivity ( varOrder s )
-
 newVar :: PrimMonad m => SolverState ( PrimState m ) -> m Var
 newVar s = newVarWith s True
 
@@ -731,7 +730,27 @@ enqueueUndef s l rsn = do
   cur <- valueOf s ( litVar l )
   case cur of
     LUndef -> performAssignment s l rsn
-    _      -> error "SAT.Solver.enqueueUndef: variable already assigned"
+    _      -> do
+      lvl     <- currentLevel s
+      vlvl    <- levelOfAssignedVar s ( litVar l )
+      oldRsn  <- Growable.read ( reason s ) ( varIndex ( litVar l ) )
+      error $ unlines
+        [ "SAT.Solver.enqueueUndef: variable already assigned"
+        , "  literal:            " <> show l
+        , "  variable:           " <> show ( litVar l )
+        , "  current value:      " <> show cur
+        , "  assigned at level:  " <> show vlvl <> " (existing reason: " <> describeReason oldRsn <> ")"
+        , "  current level:      " <> show lvl
+        , "  attempted reason:   " <> describeReason rsn
+        ]
+  where
+    describeReason :: Clause.Reason -> String
+    describeReason = \case
+      Clause.RFact     -> "RFact"
+      Clause.RDecision -> "RDecision"
+      Clause.RBinary o -> "RBinary " <> show o
+      Clause.RClause _ -> "RClause"
+      Clause.RLazy r   -> "RLazy " <> show r
 
 -- | Attempt to assign a literal whose variable may already be set.
 --
