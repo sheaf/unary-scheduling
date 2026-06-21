@@ -2,47 +2,27 @@
 {-# LANGUAGE ScopedTypeVariables  #-}
 {-# LANGUAGE UndecidableInstances #-}
 
--- | A minimal Clause-Driven Conflict Learning core.
+-- | A Conflict-Driven Clause-Learning (CDCL) SAT core, in the style of
+-- MiniSat (Eén \& Sörensson 2003).
 --
--- The search loop is the standard MiniSat skeleton:
+-- The module plays two roles:
 --
---   * decide a literal using VSIDS plus saved-phase,
---   * BCP with two-literal watches on the trail until either a falsified
---     clause is found or no further propagation is possible,
---   * on a conflict, run 1-UIP conflict analysis to produce an asserting
---     learnt clause, backjump, and resume.
+--   * a self-contained solver, 'solve' / 'solveWith', running the search
+--     loop to a 'Verdict'; and
+--   * a set of lower-level driver primitives that expose each step of the loop
+--     ('decide', 'propagate', 'analyse', 'cancelUntil', 'installLearnt') so
+--     that a DPLL(T) theory can interleave its own propagation and decisions
+--     over the shared trail.
 --
--- A Luby schedule throttles restarts.
+-- The loop is the standard CDCL skeleton:
 --
--- = Known limitations
+--  - decide a literal by VSIDS activity at its saved phase
+--  - propagate by two-watched-literal BCP until a clause is falsified or
+--    no unit propagation remains
+--  - on a conflict, learn an asserting clause by 1-UIP analysis, backjump,
+--    and resume.
 --
---
---   * /No learnt-clause minimisation./ 'analyse' returns the 1-UIP clause
---     as produced by resolution, without recursive or local self-subsumption
---     (Sörensson \& Biere 2009).
---
---   * /No learnt-clause deletion or DB reduction./ The learnt-clause set
---     grows monotonically.
---
---   * /No LBD (Literal Block Distance) score, no per-clause activity./
---
---   * /No hyper-binary resolution, no on-the-fly subsumption./ Input
---     clauses are normalised only per-clause (duplicates, tautology,
---     level-0 satisfaction); no cross-clause preprocessing happens.
---
---   * /Coarse conflict budget./ 'optConflictBudget' is a single global
---     count with no per-restart accounting and no time-based fallback.
---
--- = References
---
---   * Eén, Sörensson (2003), /An Extensible SAT-solver/ (MiniSat).
---   * Marques-Silva, Sakallah (1996), /GRASP/.
---   * Moskewicz et al. (2001), /Chaff/.
---   * Pipatsrisawat, Darwiche (2007), /A Lightweight Component Caching Scheme/
---     (phase saving).
---   * Sörensson, Biere (2009), /Minimizing Learned Clauses/.
---   * Audemard, Simon (2009), /Predicting Learnt Clauses Quality in Modern
---     SAT Solvers/ (LBD).
+-- A Luby sequence schedules restarts.
 module SAT.Solver
   ( -- * Solver
     SolverState
@@ -310,8 +290,9 @@ data SolverOptions = SolverOptions
   , -- | Base unit of conflicts per restart cycle: the @k@-th window allows
     -- @optRestartUnit * luby k@ conflicts before a restart.
     optRestartUnit    :: !Int
-  , -- | Hard ceiling on the total number of conflicts before the search
-    -- gives up and reports 'Unknown'. @0@ disables the budget.
+  , -- | Hard ceiling on the cumulative number of conflicts across the whole
+    -- 'solveWith' call, tested once per resolved conflict; when reached, the
+    -- search gives up and reports 'Unknown'. @0@ disables the budget.
     optConflictBudget :: !Int
   }
 
@@ -385,25 +366,25 @@ data SolverState s = SolverState
     qhead     :: !( MutVar s TrailPos )
   , -- | Storage for long clauses (size @>= 3@).
     clauseStore :: !( ClauseStore s )
-  , -- | References of all learnt clauses (kept separate from input
-    -- clauses so a future deletion policy can target only learnt material).
+  , -- | References of all learnt clauses, tracked separately from the input
+    -- clauses so the two sets can be managed independently.
     learnts   :: !( Growable Primitive.MVector s ClauseRef )
   , -- | Lazy-reason closures attached to theory-propagated literals via
-    -- 'Clause.RLazy'. Indexed by 'Clause.LazyRef'. Forced by 'walkUIP' when
-    -- 1-UIP analysis crosses a theory-propagated literal.
+    -- 'Clause.RLazy'. Indexed by 'Clause.LazyRef'. Forced during 1-UIP
+    -- conflict analysis when it crosses a theory-propagated literal.
     lazyReasons :: !( Growable Boxed.MVector s ( Clause.LazyReason s ) )
   , -- | Total conflicts encountered.
     confCount :: !( MutVar s Int )
   , -- | Total decisions taken.
     decCount  :: !( MutVar s Int )
-  , -- | Number of lazy reasons forced by 1-UIP ('walkUIP' crossing a
-    -- theory-propagated literal).
+  , -- | Number of lazy reasons forced during 1-UIP conflict analysis (each
+    -- time it crosses a theory-propagated literal).
     --
     -- Instrumentation only.
     lazyForceCount :: !( MutVar s Int )
-  , -- | Total literals returned by forced lazy reasons. A large
-    -- @lazyForceLits \/ lazyForceCount@ ratio means resolution is crossing
-    -- coarse (trail-snapshot) reasons, the expensive 1-UIP path.
+  , -- | Total literals across all forced lazy reasons. A large
+    -- @lazyForceLits \/ lazyForceCount@ ratio means the forced reasons are
+    -- large, so 1-UIP resolution does more work each time it crosses one.
     --
     -- Instrumentation only.
     lazyForceLits :: !( MutVar s Int )
@@ -1243,7 +1224,7 @@ minimiseLearnt s = do
   -- ('abstractLevel'). A literal can only be self-subsumed if every other
   -- literal of its reason resolves into a level already in the clause; a reason
   -- literal whose level is absent from this mask is therefore not coverable, and
-  -- the redundancy check fails fast without forcing the (possibly large, coarse)
+  -- the redundancy check fails fast without forcing the (possibly large)
   -- reason. (MiniSat's abstraction-levels optimisation; conservative under hash
   -- collisions, never unsound.)
   abstraction <- collectAbstraction n
@@ -1368,6 +1349,26 @@ minimiseLearnt s = do
                 loop ( i + 1 )
       loop 0
 
+{- Note [Citability invariant]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A lazy reason ('Clause.RLazy') is a deferred clause @propLit ∨ ¬a₁ ∨ … ∨ ¬aₙ@:
+the propagated literal together with the negations of the /antecedents/ @aᵢ@
+that forced it. Whoever produces the reason must maintain:
+
+  /citability invariant/
+    every antecedent is true on the trail at the moment the reason is forced
+
+1-UIP relies on this invariant: when it resolves the conflict backwards through
+a reason (see walkUIP), it reads the decision level each antecedent was assigned
+at, until it reaches an antecedent assigned at an earlier decision level,
+placing it into the learnt clause.
+An antecedent not on the trail has no level ('levelOfAssignedVar' fails), so
+the resolution is ill-defined and the learnt clause unsound.
+
+A reason is forced only during conflict analysis, so the invariant need hold
+only then, not when the reason is built.
+-}
+
 -- | Walk backwards along the trail at the current level, popping seen
 -- variables and resolving against their reason clauses, until a single
 -- current-level literal remains. That literal is the 1-UIP.
@@ -1422,6 +1423,8 @@ walkUIP s visit visitLit ( TrailPos start ) = go start
                   ls <- forceLazy s lref
                   modifyMutVar' ( lazyForceCount s ) ( + 1 )
                   modifyMutVar' ( lazyForceLits  s ) ( + length ls )
+                  -- Each forced literal must be currently assigned, so 'visitLit'
+                  -- can read its decision level. See Note [Citability invariant].
                   visitLits vi ls
                   go ( idx - 1 )
 
@@ -1539,10 +1542,10 @@ decide s = do
 --
 -- Unlike 'decide', this neither consults the VSIDS heap nor counts the decision
 -- (the caller is expected to count it via 'countDecision'), so a theory
--- heuristic can propose any variable — e.g. one chosen by conflict-ordering —
--- while still honouring phase saving. The variable need not be removed from the
--- VSIDS heap: 'decide' filters out already-assigned variables, and 'cancelUntil'
--- reinserts it once it becomes unassigned again.
+-- heuristic can propose any variable while still honouring phase saving. The
+-- variable need not be removed from the VSIDS heap: 'decide' filters out
+-- already-assigned variables, and 'cancelUntil' reinserts it once it becomes
+-- unassigned again.
 decideVar
   :: forall m
   .  PrimMonad m
@@ -1726,7 +1729,7 @@ trailAt s ( TrailPos i ) = Growable.read ( trail s ) i
 --
 -- The closure can later be attached to a theory-propagated literal as a
 -- 'Clause.RLazy' reason. It is forced only if 1-UIP analysis crosses the
--- literal.
+-- literal, and must then satisfy Note [Citability invariant].
 recordLazyReason
   :: PrimMonad m
   => SolverState ( PrimState m ) -> Clause.LazyReason ( PrimState m ) -> m Clause.LazyRef

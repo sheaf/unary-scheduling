@@ -433,11 +433,11 @@ data Applied = Applied
 -- Smart constructors for emitting constraints.
 
 -- | Constrain a single task, recording a structured explanation for the
--- inference.
+-- inference but /no/ responsible task subset.
 --
--- Records no responsible subset, so the LCG theory falls back to a coarse
--- reason for the resulting bound literal. Use 'tightenBecause' (no new edges)
--- or 'tightenWithPrecedences' (new edges) when the subset is known.
+-- When the subset is known, prefer 'tightenBecause' (no new edges) or
+-- 'tightenWithPrecedences' (new edges), so the resulting bound literal's reason
+-- can cite it directly.
 tighten :: Int -> Constraint t -> Justification t -> Constraints t
 tighten taskNb ct justification =
   Constraints
@@ -460,11 +460,9 @@ tightenWithPrecedences taskNb ct precs justification =
     }
 
 -- | Like 'tighten', but records the responsible task subset for the bound
--- tightening, /without/ adding any precedence edge to the matrix.
---
--- Used by propagators whose inference rests on a subset of tasks that does not
--- correspond to fresh precedence edges (the precedence-matrix and
--- not-first\/not-last propagators).
+-- tightening /without/ adding any precedence edge to the matrix — for an
+-- inference that rests on a subset of tasks not corresponding to any fresh
+-- precedence edge.
 tightenBecause :: Int -> Constraint t -> ( IntSet, IntSet ) -> Justification t -> Constraints t
 tightenBecause taskNb ct why justification =
   Constraints

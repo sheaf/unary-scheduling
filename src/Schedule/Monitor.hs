@@ -208,11 +208,8 @@ data MonitorReport = MonitorReport
     derivedEdges    :: !Int
   , -- | Theory conflicts broken down by source label.
     conflictBreakdown :: !( Map Text Int )
-  , -- | Number of reason clauses whose length was recorded.
-    --
-    -- Currently this counts eagerly-materialised theory-conflict clauses;
-    -- lazily-built propagation reasons are only measured if forced, which would
-    -- require a hook at the force site in @SAT.Solver.walkUIP@ (not yet wired).
+  , -- | Number of reason clauses whose length was recorded (the
+    -- eagerly-materialised theory-conflict clauses).
     reasonCount     :: !Int
   , -- | Sum of recorded reason-clause lengths (for the mean).
     reasonTotalLen  :: !Int

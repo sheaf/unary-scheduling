@@ -1,4 +1,4 @@
--- | A small Clause-Driven Conflict Learning core.
+-- | A Conflict-Driven Clause-Learning (CDCL) SAT core.
 module SAT
   ( -- * Literals
     module SAT.Base

@@ -180,8 +180,7 @@ data TheoryState mode s task t = TheoryState
     theorySolverState  :: !( SAT.SolverState s )
   , -- | The bijection between task pairs and SAT decision variables.
     atoms          :: !PrecedenceAtoms
-  , -- | The lazily-grown registry of start-time bound atoms (auxiliary,
-    -- non-decision variables).
+  , -- | The lazily-grown registry of start-time bound atoms.
     boundAtoms     :: !( BoundAtoms s t )
   , -- | The borrowed shared scheduler state (in-place mutated).
     tasks          :: !( MutableTaskInfos s task t )
@@ -218,10 +217,9 @@ data TheoryState mode s task t = TheoryState
     -- decision is taken ('settlePending') or a conflict fires ('settleConflict',
     -- a wipeout), then cleared.
     pendingDecision :: !( MutVar s ( Maybe ( Lit, Double ) ) )
-  , -- | Per gappy task, its interval commitment decision atoms in ascending
-    -- threshold order (the positive literal @start ≤ boundary@), as seeded by
-    -- 'seedDecisionBounds'. Read by 'theoryDecide' for interval commitment
-    -- branching; written once at construction and never mutated thereafter.
+  , -- | Per gappy task, its interval-commitment decision atoms in ascending
+    -- threshold order (the positive literal @start ≤ boundary@). Written once at
+    -- construction and never mutated thereafter.
     decisionBounds :: !( MutVar s ( IntMap [ Lit ] ) )
   , -- | Next SAT trail position to channel into the scheduler.
     --
@@ -244,12 +242,12 @@ data TheoryState mode s task t = TheoryState
     -- since the last 'runPropagators'. These wake /all/ propagators (a domain
     -- change can feed any of them), unlike the matrix-only 'dirtySeed'.
     boundDirty     :: !( MutVar s IntSet )
-  , -- | Inference-time antecedent snapshot of the propagation pass currently
+  , -- | Inference-time antecedent capture of the propagation pass currently
     -- being applied (see 'capturePass'). Written before each pass is applied and
     -- read when channelling it (or when a pass empties a domain).
     passCapture    :: !( MutVar s ( PassCapture t ) )
-  , -- | Conflict produced while channelling a propagation pass to the SAT trail,
-    -- if any. Set by 'channelPass', read by 'runPropagators' after the loop.
+  , -- | A conflict produced while channelling a propagation pass to the SAT
+    -- trail, if any; held until the propagation loop ends, then consumed.
     pendingConflict :: !( MutVar s ( Maybe SAT.Conflict ) )
   , -- | Cumulative count of theory propagations: literals the theory has
     -- promoted onto the SAT trail (derived transitive edges, propagator
@@ -442,11 +440,10 @@ numPrecedenceDecisions t = do
 -- Failure-Directed Search (Vilím, Laborie & Shaw, CPAIOR 2015) rates each
 -- /branch/ (a variable+polarity) by how close it tends to come to a wipeout, and
 -- dives the branch most likely to fail first — provably shrinking the space
--- fastest, which is what closes a search on feasible and infeasible alike. The
--- ratings ('branchRating') live over the precedence tournament (the primary,
--- complete choice set), with interval-commit bound atoms as completion choices
--- (see 'theoryDecide'), and mature via an EMA of per-decision local ratings (see
--- 'settlePending' \/ 'settleConflict').
+-- fastest, which is what closes a search on feasible and infeasible alike. Each
+-- branch's rating ('branchRating') matures via an EMA of its per-decision local
+-- ratings (see 'settlePending' \/ 'settleConflict'); 'theoryDecide' is what
+-- consults the ratings to choose a branch.
 --
 -- Two deviations from the paper, both order-only:
 --
@@ -562,7 +559,7 @@ measureSpace t = go 0 0
 -- hurts the infeasible families without helping the feasible ones.
 --
 -- 'Nothing' once every structural atom is decided (or when 'useTheoryDecide' is
--- off): the leftover auxiliary\/bound atoms fall through to VSIDS, so search
+-- off): any remaining decision variables fall through to VSIDS, so search
 -- stays complete.
 theoryDecide
   :: forall mode s task t
@@ -995,8 +992,10 @@ channelBound t task l pol = do
     -- BCP conflict first; here we build the tight crossing conflict. The
     -- enforced bounds pit the channelled bound against the surviving one
     -- (@est0@\/@lct0@); 'emptyDomainConflict' cites both crossing bound atoms
-    -- (each already on the trail) plus any carvers. The current state is the
-    -- previous round's fixpoint, captured by 'currentCapture'.
+    -- (each already on the trail as per Note [Upholding the citability invariant])
+    -- plus any carvers.
+    -- The current state is the previous round's fixpoint, captured by
+    -- 'currentCapture'.
     let ( lo, hi ) = case pol of
           Positive -> ( est0, completionFromLatestStart dur l )
           Negative -> ( startUpperToEstLower l, lct0 )
@@ -1006,11 +1005,11 @@ channelBound t task l pol = do
     -- Wake every propagator on this task next round, but only if the domain
     -- actually moved: a no-op re-drain must not re-trigger the full sweep.
     when ( isJust moved ) ( markBoundDirty t task )
-    -- Citability invariant: a channel-in /jump/ over a gap leaves the new
-    -- canonical @est@\/@lst@ at a threshold whose atom is not the channelled-in
-    -- one, so reify and assert it here with a tight reason (the channelled-in
-    -- literal, plus carvers for any non-ground gap skipped). An /exact/ move
-    -- lands on the channelled-in atom itself.
+    -- See Note [Upholding the citability invariant]: a channel-in /jump/ over a
+    -- gap leaves the new canonical @est@\/@lst@ at a threshold whose atom is
+    -- not the channelled-in one, so reify and assert it here with a tight reason
+    -- (the channelled-in literal, plus carvers for any non-ground gap skipped).
+    -- An /exact/ move lands on the channelled-in atom itself.
     case moved of
       Just MovedJumped -> do
         ( channelAtom, _ ) <- internBoundAtomWith t ( SAT.newAuxVar ( theorySolverState t ) ) task l
@@ -1097,7 +1096,7 @@ runPropagators t = do
       Right () -> do
 #ifdef DEBUG
         checkMatrixTrailInvariant t "runPropagators (end, no conflict)"
-        debugAssertCitability t "runPropagators (end, no conflict)"
+        checkCitabilityInvariant t "runPropagators (end, no conflict)"
 #endif
         pure Nothing
       Left infeasible ->
@@ -1158,7 +1157,7 @@ runSchedule tis action =
 -- | Assert each propagator-detected precedence as a theory propagation. The
 -- precedence @p ≺ i@ is an energetic consequence of the responsible subset's
 -- bounds, so its reason cites those tasks' pre-pass bound atoms (from @cap@),
--- all already on the trail.
+-- all already on the trail (see Note [Upholding the citability invariant]).
 assertEmittedPrecedences
   :: forall mode s task t
   .  ( Num t, Measurable t, Bounded t, MonitorMode mode )
@@ -1192,7 +1191,7 @@ assertEmittedPrecedences t cap precsMap = goEntries ( IntMap.toList precsMap )
 
 -- | Assert @a ≺ b@ with a tight reason built from the pre-pass bound atoms of
 -- @reasonTasks@ — the energetic antecedents the propagator read to detect the
--- precedence, all already on the trail.
+-- precedence, all already on the trail (as per Note [Upholding the citability invariant]).
 assertOnePrecedence
   :: forall mode s task t
   .  ( Num t, Measurable t, Bounded t, MonitorMode mode )
@@ -1227,9 +1226,7 @@ readTask t i = Boxed.MVector.unsafeRead ( taskAvails ( tasks t ) ) i
 
 -- | Get-or-create a latest-start atom via the given variable allocator, wiring
 -- its monotonicity links to the task's neighbouring thresholds the first time
--- it is created. Returns whether the atom was freshly created. The allocator
--- chooses the atom's role: an auxiliary (theory-only) variable, or a decision
--- variable for interval commitment branching.
+-- it is created. Returns whether the atom was freshly created.
 internBoundAtomWith
   :: Measurable t
   => TheoryState mode s task t -> ST s Var -> Int -> Endpoint ( LatestTime t ) -> ST s ( Lit, Bool )
@@ -1247,9 +1244,8 @@ internBoundAtomWith t allocVar i thr = do
     -- 'RFact' at the current (non-ground) level, corrupting conflict analysis.
     imply a b = SAT.addBinaryLemma ( theorySolverState t ) ( negateLit a ) b
 
--- | Get-or-create a /decision/ latest-start atom (placed in the VSIDS heap),
--- bumping its activity on first creation (so interval commitment is decided
--- ahead of precedence branching).
+-- | Get-or-create a bound atom as a /decision/ variable (in the VSIDS heap),
+-- bumping its activity on first creation.
 internDecisionBoundAtom
   :: Measurable t
   => TheoryState mode s task t -> Int -> Endpoint ( LatestTime t ) -> ST s Lit
@@ -1309,16 +1305,48 @@ sideLit
 sideLit t Earliest i = currentEstLit t i
 sideLit t Latest   i = currentLctLit t i
 
+{- Note [Upholding the citability invariant]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The unary-scheduling theory's lazy reasons cite the atoms responsible for an
+inference. Note [Citability invariant] (in SAT.Solver) requires every cited atom
+to be true on the trail when the reason is forced; this is how the theory
+ensures it.
+
+Cited atoms come in two kinds, and the invariant holds for each:
+
+  * Bound atoms: the current est/lst of a task involved in the inference.
+
+    Every bound the theory holds is matched by a corresponding atom on the trail.
+    This atom is asserted at seeding (seedInitialBounds) and on channel-out
+    (channelPass) as theory propagations, and on channel-in (channelBound)
+    reflecting the SAT assignment that is already there.
+
+  * Precedence atoms.
+
+    Every edge of the precedence matrix is on the trail: it was either
+    channelled in from a SAT precedence assignment, or derived by transitive
+    closure and asserted as a theory propagation (see precEdgeLit).
+
+This invariant is a post-condition of a *completed* channel pass, not a per-cite
+invariant: within channel-out, a reason may cite a bound that is only asserted
+later in the same pass. That is still sound, because a reason is forced only
+during a *subsequent* 1-UIP, by which point the pass has finished and all its
+bounds are on the trail. The post-condition is checked by the debug assertion
+checkCitabilityInvariant.
+
+Example:
+
+  - Given a ≺ b and b ≺ c, transitivity deduces a ≺ c.
+    The associated reason is ¬p(a≺b) ∨ ¬p(b≺c) ∨ p(a≺c), where 'p' denotes the
+    precedence atom associated with a precedence.
+    The two antecedents of this reason are matrix edges: they are already true
+    on the trail, allowing 1-UIP to resolve through them.
+-}
+
 -- | The current lower- and upper-bound literals of every task in the list
 -- (two per task: @start ≥ est@ and @start ≤ lst@), interning their atoms.
 --
--- /Citability invariant:/ each is already asserted true on the trail. A
--- propagator only ever reads a task's current @est@\/@lst@ to make an
--- inference, and every bound that is set — by 'seedInitialBounds', by
--- 'channelBound' (channel-in), or by 'channelOutBounds' (channel-out) — reifies
--- and asserts its atom at the new threshold, jumps included. So citing these is
--- sound, and the lazy reason capturing them resolves against on-trail literals
--- when 1-UIP forces it.
+-- See also Note [Upholding the citability invariant].
 boundLits
   :: ( Num t, Measurable t, Bounded t )
   => TheoryState mode s task t -> [ Int ] -> ST s [ Lit ]
@@ -1331,8 +1359,10 @@ boundLits t = fmap concat . traverse one
 
 -- | Assemble a tight lazy reason for a theory propagation: the @propLit@,
 -- resolved against the negations of its @antecedents@ (all currently true on
--- the trail). The closure captures the literals directly (interned atoms are
--- stable), so forcing it during 1-UIP yields the supporting clause.
+-- the trail as per Note [Upholding the citability invariant]).
+--
+-- The closure captures the literals directly (interned atoms are stable), so
+-- forcing it during 1-UIP yields the supporting clause.
 boundReasonLits
   :: Lit -> [ Lit ] -> ST s ( LazyReason s )
 boundReasonLits propLit antecedents = do
@@ -1411,9 +1441,10 @@ collectCarversWith compOf n i window0 = go ( n - 1 ) window0 []
 
 -- | Carver bound literals (current state) justifying that the bound on @side@
 -- /jumped/ to @i@'s current bound: the tasks whose /current/ compulsory parts
--- removed @i@'s ground availability across the skipped span. Used by the
--- channel-in path, where the current domain is the previous round's fixpoint and
--- every cited bound is already on the trail.
+-- removed @i@'s ground availability across the skipped span.
+--
+-- Cites current bounds, so it is sound only at a propagation fixpoint, where
+-- every cited bound is then on the trail (see Note [Upholding the citability invariant]).
 jumpCarverLits
   :: ( Num t, Measurable t, Bounded t )
   => TheoryState mode s task t -> Handedness -> Int -> ST s [ Lit ]
@@ -1434,7 +1465,7 @@ jumpCarverLits t side i = do
 -- both thresholds, see 'Schedule.Interval.canonicalStartUpper'), so it is already
 -- on the trail. A jump lands on a further threshold whose atom must be asserted.
 -- The current state is the previous round's fixpoint, so every cited literal is
--- already on the trail.
+-- already on the trail (as per Note [Upholding the citability invariant]).
 assertChannelInJump
   :: forall mode s task t
   .  ( Num t, Measurable t, Bounded t, MonitorMode mode )
@@ -1450,13 +1481,14 @@ assertChannelInJump t side i base = do
 --
 -- A propagation /pass/ (one propagator's emitted constraints) is channelled to
 -- the SAT trail right after it is applied. Reasons cite the antecedents the
--- propagator read — the /pre-pass/ bounds and matrix edges, captured by
+-- propagator read: the /pre-pass/ bounds and matrix edges, captured by
 -- 'capturePass' before 'Schedule.Constraint.applyConstraints' mutates anything.
--- Pre-pass antecedents were asserted by earlier passes (or seeded), so they sit
--- strictly earlier on the trail than this pass's freshly-asserted bounds; the
--- implication graph stays acyclic and 1-UIP resolves correctly.
+-- Pre-pass antecedents were asserted by earlier passes (or seeded), as per
+-- Note [Upholding the citability invariant], so they sit strictly earlier on the
+-- trail than this pass's freshly-asserted bounds; the implication graph stays
+-- acyclic and 1-UIP resolves correctly.
 
--- | Inference-time snapshot of a propagation pass, taken before it is applied.
+-- | Inference-time capture of a propagation pass, taken before it is applied.
 data PassCapture t = PassCapture
   { -- | Per task, its pre-pass @(est, lct, compulsory part)@. The bounds are
     -- re-interned (as on-trail atoms) when cited; the compulsory part drives
@@ -1500,9 +1532,10 @@ snapshotBounds t =
           else IntMap.insert i ( est task, lct task, compulsoryPart task ) acc
     ) IntMap.empty [ 0 .. numTasks ( atoms t ) - 1 ]
 
--- | A capture of the /current/ state, with no responsible subsets or precedence
--- edges: used by the channel-in path, where the current domain is stable and on
--- the trail, so a conflict it raises cites current atoms directly.
+-- | A capture of the /current/ state, carrying no responsible subsets or
+-- precedence edges, so a conflict raised from it cites the current atoms
+-- directly. Sound only when the current domain is stable and already on the
+-- trail (see Note [Upholding the citability invariant]).
 currentCapture
   :: forall mode s task t
   .  ( Num t, Measurable t, Bounded t )
@@ -1511,7 +1544,7 @@ currentCapture t = do
   bnds <- snapshotBounds t
   pure ( PassCapture bnds IntMap.empty IntMap.empty IntMap.empty )
 
--- | Snapshot the inference-time antecedents of a pass, before it is applied.
+-- | Capture the inference-time antecedents of a pass, before it is applied.
 capturePass
   :: forall mode s task t
   .  ( Num t, Measurable t, Bounded t )
@@ -1519,10 +1552,13 @@ capturePass
 capturePass t ( Constraints { boundReasons = brs } ) = do
 #ifdef DEBUG
   -- Capturing a task's pre-pass bound only yields an on-trail atom if the
-  -- citability invariant held coming into this pass. Check it here so a
-  -- violation is attributed to the prior pass that left a bound unasserted,
-  -- rather than surfacing later as an undef antecedent in some reason.
-  debugAssertCitability t "capturePass (start)"
+  -- citability invariant held coming into this pass.
+  -- Check it here so a violation is attributed to the prior pass that
+  -- left a bound unasserted, rather than surfacing later as an undef antecedent
+  -- in some reason.
+  --
+  -- See Note [Upholding the citability invariant].
+  checkCitabilityInvariant t "capturePass (start)"
 #endif
   bnds <- snapshotBounds t
   ( eP, lP ) <- foldM
@@ -1700,10 +1736,12 @@ debugMeaning ( Just ( MeansPrecedence p s ) ) = "precedence " <> show p <> " ≺
 debugMeaning ( Just ( MeansBound i _ pol ) )  = "bound task=" <> show i <> " pol=" <> show pol
 #endif
 
--- | Try to assert a theory-inferred literal whose reason is /self-contained/
--- (every cited literal is already on the trail), forcing the reason into a
--- conflict if the literal is already false. Used for transitive-closure
--- derived edges.
+-- | Try to assert a theory-inferred literal whose reason is /self-contained/,
+-- forcing the reason into a conflict if the literal is already false.
+--
+-- Used for transitive-closure derived edges.
+--
+-- NB: every cited literal is already on the trail as per Note [Upholding the citability invariant].
 assertTheoryLit
   :: forall mode s task t
   .  MonitorMode mode
@@ -1728,12 +1766,9 @@ assertTheoryLit t lit reason = do
 -- it (the common case), skip it if already true, or — if it is already false —
 -- turn it directly into a conflict by forcing its reason.
 --
--- The reason only cites antecedents already on the trail (the citability
--- invariant), so forcing it on the immediate-conflict path is sound: the bound
--- channel-out pass asserts every bound before precedences, so a precedence's
--- reason resolves against on-trail bound atoms even when it conflicts at once.
--- (Bound channel-out itself never reaches the false case — a bound that would
--- contradict the trail empties the domain first, surfaced as 'EmptyDomain'.)
+-- The reason only cites antecedents already on the trail, as per
+-- Note [Upholding the citability invariant], so forcing it on the
+-- immediate-conflict path is sound.
 assertBatch
   :: forall mode s task t
   .  MonitorMode mode
@@ -1765,9 +1800,11 @@ buildInfeasibleConflict
 buildInfeasibleConflict t = \ case
   Overloaded { culprit } -> do
     -- 'overloadCheck' reads (and never mutates) the current domains, so the
-    -- culprit's /current/ @est@\/@lst@ atoms are on the trail (channelled by
-    -- earlier passes). A conflict clause needs only that its literals are
-    -- currently false, so citing the current bounds directly is sound.
+    -- culprit's /current/ @est@\/@lst@ atoms are on the trail, as per
+    -- Note [Upholding the citability invariant].
+    --
+    -- A conflict clause needs only that its literals are currently false,
+    -- so citing the current bounds directly is sound.
     lits <- boundLits t ( IntSet.toList culprit )
     tickConflict ( monitor t ) "overload"
     recordReasonLen ( monitor t ) ( length lits )
@@ -1847,8 +1884,9 @@ emptyDomainConflict t cap i lo hi = do
 
 -- | Tight conflict for a matrix cycle closed by the new edge @predTask ≺
 -- succTask@: a path @succTask ≺ x₁ ≺ … ≺ predTask@ of precedence literals
--- already true on the trail. Together with the new edge (also true) they form a
--- cycle, so the negation of their conjunction is an all-false conflict clause.
+-- already true on the trail (as per Note [Upholding the citability invariant]).
+-- Together with the new edge (also true) they form a cycle, so the negation of
+-- their conjunction is an all-false conflict clause.
 reconstructCycle
   :: forall mode s task t
   .  MonitorMode mode
@@ -1912,21 +1950,16 @@ literalsAsConflict _label s body = do
     longer   -> Just . SAT.ConflictClause <$> SAT.recordTheoryClause s longer
 
 #ifdef DEBUG
--- | Verify the /citability invariant/ as a post-condition of bound channel-out:
--- every non-empty task's current @est@ and @lst@ atoms are asserted true on the
--- trail. This is what makes citing them in tight reasons sound — a reason built
--- in this round is only forced (during a later 1-UIP) once channel-out is
--- complete, at which point every bound it cites is on the trail. A violation
--- means a bound move failed to reify\/assert its atom (a bug).
+-- | Verify the citability invariant as a post-condition of a channel pass: every
+-- non-empty task's current @est@ and @lst@ atoms are asserted true on the trail.
+-- A violation means a bound move failed to reify\/assert its atom (a bug).
 --
--- (The check is a post-condition, not a per-cite check: within 'channelOutBounds'
--- a reason may cite a task whose bound is asserted later in the same pass, which
--- is sound precisely because the reason is forced only after the pass finishes.)
-debugAssertCitability
+-- See Note [Upholding the citability invariant].
+checkCitabilityInvariant
   :: forall mode s task t
   .  ( Num t, Measurable t, Bounded t )
   => TheoryState mode s task t -> String -> ST s ()
-debugAssertCitability t ctx = go 0
+checkCitabilityInvariant t ctx = go 0
   where
     n = numTasks ( atoms t )
     go i
@@ -1945,7 +1978,7 @@ debugAssertCitability t ctx = go 0
       v <- SAT.litValue ( theorySolverState t ) lit
       when ( v /= LTrue ) $ do
         dump <- SAT.dumpSolverState ( theorySolverState t )
-        error $ "Schedule.LCG.Theory.debugAssertCitability [" <> ctx <> "]: task "
+        error $ "Schedule.LCG.Theory.checkCitabilityInvariant [" <> ctx <> "]: task "
              <> show i <> "'s " <> which <> " bound atom " <> show lit <> " is " <> show v
              <> ", not LTrue (citability invariant violated)\n" <> dump
 

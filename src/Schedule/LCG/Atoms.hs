@@ -4,24 +4,14 @@
 --
 -- Two families of SAT atoms share one variable space:
 --
---   * /precedence atoms/ ('PrecedenceAtoms'): a fixed, contiguous block, one
---     variable per unordered task pair @{i, j}@ (the literal asserts
---     @T_i ≺ T_j@). These are the only /decision/ variables.
+--   * /precedence atoms/ ('PrecedenceAtoms'): one per unordered task pair,
+--     asserting an ordering @T_i ≺ T_j@.
 --
---   * /bound atoms/ ('BoundAtoms'): lazily-created auxiliary variables
---     reifying each task's start time on a /single/ latest-start axis. A bound
---     atom @(task, l)@ has positive literal @start_task ≤ l@ (@l@ a 'LatestTime'
---     endpoint, i.e. a latest start); its negation is @start_task > l@. A task's
---     /lower/ bound @start ≥ e@ is therefore the /negative/ literal of the atom
---     at threshold @'estLowerToStartUpper' e@, and its /upper/ bound
---     @start ≤ lst@ the /positive/ literal at threshold @lst@. Keeping both on
---     one axis (with both clusivities available) means a zero-slack task's lower
---     and upper bounds get distinct atoms — @start < v@ vs @start ≤ v@ — related
---     by monotonicity, with no clusivity clash.
+--   * /bound atoms/ ('BoundAtoms'): a task's start-time bounds, reified on a
+--     single latest-start axis. Created /lazily/, as the search needs them, so
+--     the time horizon is never enumerated.
 --
---     Atoms are allocated on demand (we never enumerate the time horizon) and
---     laid out /after/ the fixed precedence block, so a variable index alone
---     classifies the atom family.
+-- 'litMeaning' decodes the atom a literal denotes.
 module Schedule.LCG.Atoms
   ( -- * Precedence atoms
     PrecedenceAtoms
@@ -204,7 +194,7 @@ newBoundAtoms firstIx = do
 internStartUpper
   :: Measurable t
   => BoundAtoms s t
-  -> ST s Var                    -- ^ fresh auxiliary (non-decision) variable allocator
+  -> ST s Var                    -- ^ fresh-variable allocator (the caller chooses the atom's role)
   -> Int                         -- ^ task index
   -> Endpoint ( LatestTime t )   -- ^ latest-start threshold @l@
   -> ST s ( Lit, Bool )

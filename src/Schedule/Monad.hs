@@ -137,8 +137,7 @@ data TaskUpdates t
   { taskConstraints :: !(Constraints t)
   , tasksModified   :: !Modifications
   , -- | Per task, how its earliest start \/ latest completion bound moved as
-    -- constraints were applied this pass (exact vs jumped); the LCG theory uses
-    -- this to promote bound literals with tight or coarse reasons.
+    -- constraints were applied this pass (exact vs jumped).
     tightenedBounds :: !( IntMap ( Maybe BoundMove, Maybe BoundMove ) )
   , -- | Tasks /carved/ this pass (an 'Schedule.Constraint.Inside'\/
     -- 'Schedule.Constraint.Outside' tightening applied), which may introduce

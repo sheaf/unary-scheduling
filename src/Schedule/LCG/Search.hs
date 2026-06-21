@@ -6,14 +6,9 @@
 
 -- | DPLL(T) search for the unary-scheduling problem.
 --
--- The search interleaves the SAT core ("SAT.Solver") with the scheduling
--- theory ("Schedule.LCG.Theory") over a single shared trail. SAT decisions
--- assign precedence atoms; the theory channels each assignment into the
--- ordering matrix and runs the scheduling propagators, promoting any
--- emitted precedence inferences back to the SAT trail as theory
--- propagations with lazy clausal reasons. Conflicts (cycles, overloads,
--- contradictions) flow through 1-UIP analysis, which learns a clause and
--- backjumps both the SAT trail and the schedule trail in lockstep.
+-- Drives the search loop, interleaving the SAT core ("SAT.Solver") with the
+-- scheduling theory ("Schedule.LCG.Theory") over a single shared trail, and
+-- returns either a feasible schedule or a witness of infeasibility.
 module Schedule.LCG.Search
   ( -- * Search driver
     SearchResult(..)
@@ -290,8 +285,8 @@ driveLoop restartUnit theoryState = driveRestarts 1
                 case mbTConf of
                   Just c  -> onConflict confs c
                   Nothing -> do
-                    -- Theory may have marked the solver UNSAT via a ground-level
-                    -- snapshot conflict; re-check 'isOk' before continuing.
+                    -- Theory may have marked the solver UNSAT directly on a
+                    -- ground-level inconsistency; re-check 'isOk' before continuing.
                     okAfter <- SAT.isOk solverState
                     if not okAfter
                     then pure ( Solved SAT.Unsat )

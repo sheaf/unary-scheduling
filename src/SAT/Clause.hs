@@ -4,10 +4,9 @@
 
 -- | Clauses, clause references, clause storage, and reasons.
 --
--- Long clauses (size @>= 3@) live as contiguous @[header][lit_0]..[lit_{n-1}]@
--- blocks inside a single 'ClauseStore' arena. A 'ClauseRef' is the word
--- offset of the header in the arena; a 'Clause' is a transient view of
--- a clause's body, materialised by 'clauseAt' on demand.
+-- A 'ClauseStore' is an arena of clauses. Recording a clause returns a
+-- 'ClauseRef' identifying it; 'clauseAt' produces a 'Clause' — a transient,
+-- mutable view of that clause's literals — on demand.
 module SAT.Clause
   ( -- * Clauses (transient views)
     Clause
@@ -64,11 +63,8 @@ newtype ClauseRef = ClauseRef { unCRef :: Int }
 -------------------------------------------------------------------------------
 -- Clause storage.
 
--- | A bump-allocated arena holding the headers and literal bodies of
--- every long clause known to the solver.
---
--- Clauses are appended at the bump pointer and never moved except by an
--- explicit compaction pass (not yet implemented).
+-- | An append-only arena of clauses: a recorded clause is never relocated,
+-- so its 'ClauseRef' stays valid for the lifetime of the store.
 data ClauseStore s = ClauseStore
   { csArena :: !( Arena s )
       -- ^ Bump allocator over the backing 'MutableByteArray'.

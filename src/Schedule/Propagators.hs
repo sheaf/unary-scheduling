@@ -377,7 +377,7 @@ seedMatrixWatchers propagators dirty = DMap.fromList
 -- precedences) to an external store (the SAT trail).
 data PassChanneller s task t = PassChanneller
   { onCapture :: Constraints t -> ST s ()
-    -- ^ Runs /before/ a pass (e.g. to snapshot inference-time antecedents)
+    -- ^ Runs /before/ a pass (e.g. to capture inference-time antecedents)
   , onChannel :: Constraints t -> IntMap Applied -> ST s Bool
     -- ^ Runs /after/ a pass. Returning 'True' signals a conflict (stopping the loop).
   }
