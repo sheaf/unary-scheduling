@@ -340,23 +340,67 @@ defaultOptions = SolverOptions
   , optConflictBudget = 0
   }
 
--- | Information specific to 1-UIP conflict analysis.
---
--- Reused across every 'analyse' call so to keep allocations low.
+-- | State for 1-UIP conflict analysis and learnt clause minimisation.
 data AnalysisState s = AnalysisState
   { -- | Number of seen literals at the current decision level still on the
     -- implication path, decremented by each resolution step.
     analysePathC      :: !( MutVar s Int )
+  , -- | Transient per-variable marker tracking membership of the
+    -- clause in progress, used by 1-UIP analysis and by learnt-clause
+    -- minimisation.
+    --
+    -- Always @False@ outside of an 'analyse' call.
+    seen              :: !( Growable Unboxed.MVector s Bit )
   , -- | Variable indices that 'analyse' has marked in 'seen'; walked to
     -- clear the markers at the end of the call.
     analyseTouched    :: !( Growable Primitive.MVector s Int )
   , -- | Literals at strictly lower decision levels collected during
-    -- analysis; together with 'analyzeOtherLevels' these form the body of
+    -- analysis; together with 'analyseOtherLevels' these form the body of
     -- the learnt clause (the asserting literal is prepended afterwards).
     analyseOtherLits  :: !( Growable Primitive.MVector s Lit )
-  , -- | Levels matching 'analyzeOtherLits' in lockstep, used to find the
+  , -- | Levels matching 'analyseOtherLits' in lockstep, used to find the
     -- second-watch literal and the backjump level.
     analyseOtherLevels :: !( Growable Primitive.MVector s DecisionLevel )
+  , -- | Transient per-variable marker used by learnt-clause minimisation: a
+    -- variable proven /not/ self-subsumed (so its literal cannot be dropped).
+    -- Memoises failed redundancy checks so the recursion does not re-explore a
+    -- subtree. Always @False@ outside a 'minimiseLearnt' call.
+    --
+    -- The dual \"proven redundant\" state reuses the 'seen' marker (which also
+    -- marks clause membership): both make the redundancy check treat a variable
+    -- as covered, so they need not be distinguished.
+    minFailed          :: !( Growable Unboxed.MVector s Bit )
+  , -- | Variables whose 'minFailed' marker was set during minimisation; walked
+    -- to clear those markers at the end of the call.
+    minFailedTouched   :: !( Growable Primitive.MVector s Int )
+  }
+
+-- | The clause database: long clause storage, learnt clauses, and the
+-- per-literal watch lists.
+data ClauseDB s = ClauseDB
+  { -- | Storage for long clauses (size @>= 3@).
+    clauseStore :: !( ClauseStore s )
+  , -- | References of all learnt clauses, tracked separately from the input
+    -- clauses so the two sets can be managed independently.
+    learnts   :: !( Growable Primitive.MVector s ClauseRef )
+  , -- | Per-literal watch lists, indexed by 'litIndex' and sized to
+    -- @2 * numVars@. @watches[p]@ holds every watcher whose clause has
+    -- @negateLit p@ as a watched literal, so that enqueueing @p@ wakes
+    -- those clauses.
+    watches   :: !( Growable Boxed.MVector s ( Growable Primitive.MVector s Watcher ) )
+  }
+
+-- | Search statistics and instrumentation counters.
+data Statistics s = Statistics
+  { -- | Total conflicts encountered.
+    confCount :: !( MutVar s Int )
+  , -- | Total decisions taken.
+    decCount  :: !( MutVar s Int )
+  , -- | Number of lazy reasons forced during 1-UIP conflict analysis (each
+    -- time it crosses a theory-propagated literal).
+    lazyForceCount :: !( MutVar s Int )
+  , -- | Total literals across all forced lazy reasons.
+    lazyForceLits :: !( MutVar s Int )
   }
 
 -- | The mutable state of a running CDCL search.
@@ -378,10 +422,6 @@ data SolverState s = SolverState
   , -- | Activity-ordered priority queue over variables (also owns the
     -- VSIDS activity scores, current bump increment, and decay factor).
     varOrder  :: !( VarOrder s )
-  , -- | Transient per-variable marker used by 1-UIP analysis.
-    --
-    -- Always @False@ outside of an 'analyse' call.
-    seen      :: !( Growable Unboxed.MVector s Bit )
   , -- | Transient per-literal marker used by 'preprocessClause' to detect
     -- duplicate literals and tautologies in O(1) per literal.
     --
@@ -389,52 +429,17 @@ data SolverState s = SolverState
     --
     -- Always @False@ outside of a 'preprocessClause' call.
     seenLit   :: !( Growable Unboxed.MVector s Bit )
-  , -- | Per-literal watch lists, indexed by 'litIndex' and sized to
-    -- @2 * numVars@. @watches[p]@ holds every watcher whose clause has
-    -- @negateLit p@ as a watched literal, so that enqueueing @p@ wakes
-    -- those clauses.
-    watches   :: !( Growable Boxed.MVector s ( Growable Primitive.MVector s Watcher ) )
   , -- | The assignment trail, with the per-level bookkeeping needed for backjumping.
     trail     :: !( AssignmentTrail s )
-  , -- | Storage for long clauses (size @>= 3@).
-    clauseStore :: !( ClauseStore s )
-  , -- | References of all learnt clauses, tracked separately from the input
-    -- clauses so the two sets can be managed independently.
-    learnts   :: !( Growable Primitive.MVector s ClauseRef )
-  , -- | Total conflicts encountered.
-    confCount :: !( MutVar s Int )
-  , -- | Total decisions taken.
-    decCount  :: !( MutVar s Int )
-  , -- | Number of lazy reasons forced during 1-UIP conflict analysis (each
-    -- time it crosses a theory-propagated literal).
-    --
-    -- Instrumentation only.
-    lazyForceCount :: !( MutVar s Int )
-  , -- | Total literals across all forced lazy reasons. A large
-    -- @lazyForceLits \/ lazyForceCount@ ratio means the forced reasons are
-    -- large, so 1-UIP resolution does more work each time it crosses one.
-    --
-    -- Instrumentation only.
-    lazyForceLits :: !( MutVar s Int )
+  , -- | Long-clause storage, the learnt-clause set, and the watch-list index.
+    clauseDB  :: !( ClauseDB s )
+  , -- | Search statistics and instrumentation counters.
+    stats     :: !( Statistics s )
   , -- | Flips to 'False' as soon as a top-level inconsistency is detected;
     -- from then on the solver is permanently UNSAT.
     okFlag    :: !( MutVar s Bool )
-
-  , -- | Transient per-variable marker used by learnt-clause minimisation: a
-    -- variable proven /not/ self-subsumed (so its literal cannot be dropped).
-    -- Memoises failed redundancy checks so the recursion does not re-explore a
-    -- subtree. Always @False@ outside a 'minimiseLearnt' call.
-    --
-    -- The dual \"proven redundant\" state reuses the 'seen' marker (which also
-    -- marks clause membership): both make the redundancy check treat a variable
-    -- as covered, so they need not be distinguished.
-    minFailed          :: !( Growable Unboxed.MVector s Bit )
-  , -- | Variables whose 'minFailed' marker was set during minimisation; walked
-    -- to clear those markers at the end of the call.
-    minFailedTouched   :: !( Growable Primitive.MVector s Int )
-
-    -- | Conflict-analysis information.
-  , analysisState :: !( AnalysisState s )
+  , -- | Conflict-analysis and learnt-clause-minimisation state.
+    analysisState :: !( AnalysisState s )
   }
 
 -------------------------------------------------------------------------------
@@ -442,67 +447,56 @@ data SolverState s = SolverState
 
 newSolver :: PrimMonad m => m ( SolverState ( PrimState m ) )
 newSolver = do
-  asg   <- Growable.new 16
-  lvl   <- Growable.new 16
-  rsn   <- Growable.new 16
-  phs   <- Growable.new 16
-  dec   <- Growable.new 16
-  vo    <- newVarOrder 0.95
-  sen   <- Growable.new 16
-  senL  <- Growable.new 32
-  wts   <- Growable.new 32
-  trl   <- newAssignmentTrail
-  lns   <- Growable.new 16
-  cc    <- newMutVar 0
-  dc    <- newMutVar 0
-  lfc   <- newMutVar 0
-  lfl   <- newMutVar 0
-  ok    <- newMutVar True
-  -- Scratch space for 'analyse'.
-  -- Reset at the start of each 'analyse' call and grown on demand.
-  apc   <- newMutVar 0
-  ato   <- Growable.new 32
-  aol   <- Growable.new 16
-  aolv  <- Growable.new 16
-  mf    <- Growable.new 16
-  mft   <- Growable.new 16
+  assigns        <- Growable.new 16
+  level          <- Growable.new 16
+  reason         <- Growable.new 16
+  phase          <- Growable.new 16
+  decidable      <- Growable.new 16
+  varOrder       <- newVarOrder 0.95
+  seenLit        <- Growable.new 32
+  trail          <- newAssignmentTrail
+  clauseDB       <- newClauseDB
+  stats          <- newStatistics
+  okFlag         <- newMutVar True
+  analysisState  <- newAnalysisState
+  pure $ SolverState { .. }
+
+-- | Allocate an empty clause database.
+newClauseDB :: PrimMonad m => m ( ClauseDB ( PrimState m ) )
+newClauseDB = do
   -- TODO: expose the clause-store capacity via 'SolverOptions'. The
   -- default is a compromise (small enough to be cheap to preallocate,
   -- large enough that typical problems do not run out before we implement
   -- learnt-clause deletion + compaction).
-  cstore <- newClauseStore defaultStoreCapacityLits
-  pure SolverState
-    { assigns            = asg
-    , level              = lvl
-    , reason             = rsn
-    , phase              = phs
-    , decidable          = dec
-    , varOrder           = vo
-    , seen               = sen
-    , seenLit            = senL
-    , watches            = wts
-    , trail              = trl
-    , clauseStore        = cstore
-    , learnts            = lns
-    , confCount          = cc
-    , decCount           = dc
-    , lazyForceCount     = lfc
-    , lazyForceLits      = lfl
-    , okFlag             = ok
-    , minFailed          = mf
-    , minFailedTouched   = mft
-    , analysisState =
-        AnalysisState
-          { analysePathC       = apc
-          , analyseTouched     = ato
-          , analyseOtherLits   = aol
-          , analyseOtherLevels = aolv
-          }
-    }
+  clauseStore <- newClauseStore defaultStoreCapacityLits
+  learnts     <- Growable.new 16
+  watches     <- Growable.new 32
+  pure $ ClauseDB { .. }
   where
-
     defaultStoreCapacityLits :: Int
     defaultStoreCapacityLits = ( 1024 * 1024 * 1024 ) `div` 8
+
+-- | Allocate zeroed statistics counters.
+newStatistics :: PrimMonad m => m ( Statistics ( PrimState m ) )
+newStatistics = do
+  confCount      <- newMutVar 0
+  decCount       <- newMutVar 0
+  lazyForceCount <- newMutVar 0
+  lazyForceLits  <- newMutVar 0
+  pure $ Statistics { .. }
+
+-- | Allocate empty conflict-analysis scratch state. The buffers are reset at
+-- the start of each 'analyse' call and grown on demand.
+newAnalysisState :: PrimMonad m => m ( AnalysisState ( PrimState m ) )
+newAnalysisState = do
+  analysePathC      <- newMutVar 0
+  seen              <- Growable.new 16
+  analyseTouched    <- Growable.new 32
+  analyseOtherLits  <- Growable.new 16
+  analyseOtherLevels<- Growable.new 16
+  minFailed         <- Growable.new 16
+  minFailedTouched  <- Growable.new 16
+  pure $ AnalysisState { .. }
 
 numVariables :: PrimMonad m => SolverState ( PrimState m ) -> m Int
 numVariables s = Growable.length ( assigns s )
@@ -538,16 +532,16 @@ newVarWith s isDecision = do
   Growable.push ( reason s )    Clause.RDecision
   Growable.push ( phase s )     Positive
   Growable.push ( decidable s ) ( Bit isDecision )
-  Growable.push ( seen s )      ( Bit False )
-  Growable.push ( minFailed s ) ( Bit False )
+  Growable.push ( seen ( analysisState s ) )      ( Bit False )
+  Growable.push ( minFailed ( analysisState s ) ) ( Bit False )
   -- Two seenLit slots per variable (one per polarity).
   Growable.push ( seenLit s ) ( Bit False )
   Growable.push ( seenLit s ) ( Bit False )
   -- Two fresh empty watch lists per variable (one for each polarity).
   posWs <- Growable.new initialWatchListCapacity
   negWs <- Growable.new initialWatchListCapacity
-  Growable.push ( watches s ) posWs
-  Growable.push ( watches s ) negWs
+  Growable.push ( watches ( clauseDB s ) ) posWs
+  Growable.push ( watches ( clauseDB s ) ) negWs
   pure v
   where
     initialWatchListCapacity :: Int
@@ -646,7 +640,7 @@ describeConflict
   => SolverState ( PrimState m ) -> Conflict -> m String
 describeConflict s = \case
     ConflictClause cref -> do
-      c <- clauseAt s cref
+      c <- clauseAt ( clauseDB s ) cref
       let n = clauseSize c
           go :: Int -> m [ String ]
           go k
@@ -679,37 +673,37 @@ trailSize :: PrimMonad m => SolverState ( PrimState m ) -> m TrailPos
 trailSize s = TrailPos <$> Growable.length ( entries ( trail s ) )
 
 numConflicts, numDecisions :: PrimMonad m => SolverState ( PrimState m ) -> m Int
-numConflicts = readMutVar . confCount
-numDecisions = readMutVar . decCount
+numConflicts = readMutVar . confCount . stats
+numDecisions = readMutVar . decCount . stats
 
 numLazyForces, numLazyForceLits :: PrimMonad m => SolverState ( PrimState m ) -> m Int
 -- | Count of lazy reasons forced by 1-UIP.
-numLazyForces    = readMutVar . lazyForceCount
+numLazyForces    = readMutVar . lazyForceCount . stats
 -- | Count of total literals returned by lazy reasons forced by 1-UIP.
-numLazyForceLits = readMutVar . lazyForceLits
+numLazyForceLits = readMutVar . lazyForceLits . stats
 
 numLearnts :: PrimMonad m => SolverState ( PrimState m ) -> m Int
-numLearnts = Growable.length . learnts
+numLearnts = Growable.length . learnts . clauseDB
 
 -- | Look up a clause by its reference. Precondition: the reference came
--- from a previous 'recordClause' on this solver.
+-- from a previous 'recordClause' on this database.
 --
 -- This is a thin wrapper around 'Clause.clauseAt' that drops the
 -- 'clauseStore' indirection at call sites.
 clauseAt
   :: PrimMonad m
-  => SolverState ( PrimState m ) -> ClauseRef -> m ( Clause ( PrimState m ) )
-clauseAt s = Clause.clauseAt ( clauseStore s )
+  => ClauseDB ( PrimState m ) -> ClauseRef -> m ( Clause ( PrimState m ) )
+clauseAt cdb = Clause.clauseAt ( clauseStore cdb )
 
 -- | Build a fresh long clause in the store and return both its reference
 -- and a view over it. Does not attach watches.
 recordClause
   :: PrimMonad m
-  => SolverState ( PrimState m ) -> Bool -> [ Lit ] -> m ( ClauseRef, Clause ( PrimState m ) )
-recordClause s learnt ls = do
+  => ClauseDB ( PrimState m ) -> Bool -> [ Lit ] -> m ( ClauseRef, Clause ( PrimState m ) )
+recordClause cdb learnt ls = do
   ref <- ( if learnt then Clause.recordLearntClause else Clause.recordClause )
-           ( clauseStore s ) ls
-  c <- Clause.clauseAt ( clauseStore s ) ref
+           ( clauseStore cdb ) ls
+  c <- Clause.clauseAt ( clauseStore cdb ) ref
   pure ( ref, c )
 
 -------------------------------------------------------------------------------
@@ -785,33 +779,33 @@ tryEnqueue s l rsn = do
 -- | Append a watcher to the watch list of the given literal.
 pushWatcher
   :: PrimMonad m
-  => SolverState ( PrimState m ) -> Lit -> Watcher -> m ()
-pushWatcher s l w = do
-  inner <- Growable.read ( watches s ) ( litIndex l )
+  => ClauseDB ( PrimState m ) -> Lit -> Watcher -> m ()
+pushWatcher cdb l w = do
+  inner <- Growable.read ( watches cdb ) ( litIndex l )
   Growable.push inner w
 
 -- | Register a binary clause @[l, m]@ inline on both watch lists. No
 -- 'Clause' is allocated; the pair of watcher entries IS the clause.
 attachBinary
   :: PrimMonad m
-  => SolverState ( PrimState m ) -> Lit -> Lit -> m ()
-attachBinary s l m = do
-  pushWatcher s ( negateLit l ) ( WBinary m )
-  pushWatcher s ( negateLit m ) ( WBinary l )
+  => ClauseDB ( PrimState m ) -> Lit -> Lit -> m ()
+attachBinary cdb l m = do
+  pushWatcher cdb ( negateLit l ) ( WBinary m )
+  pushWatcher cdb ( negateLit m ) ( WBinary l )
 
 -- | Register a long clause (size @>= 3@) on the watch lists of its first
 -- two literals, using the other watched literal as the blocker hint.
 attachLong
   :: PrimMonad m
-  => SolverState ( PrimState m ) -> ClauseRef -> Clause ( PrimState m ) -> m ()
-attachLong s cref c
+  => ClauseDB ( PrimState m ) -> ClauseRef -> Clause ( PrimState m ) -> m ()
+attachLong cdb cref c
   | clauseSize c < 3
   = error $ "attachLong: expected clause of size >= 3, got " ++ show ( clauseSize c )
   | otherwise = do
       l0 <- clauseLit c 0
       l1 <- clauseLit c 1
-      pushWatcher s ( negateLit l0 ) ( WLong cref l1 )
-      pushWatcher s ( negateLit l1 ) ( WLong cref l0 )
+      pushWatcher cdb ( negateLit l0 ) ( WLong cref l1 )
+      pushWatcher cdb ( negateLit l1 ) ( WLong cref l0 )
 
 -- | The outcome of posting an input clause.
 data PostResult
@@ -855,11 +849,11 @@ addClause s ls0 = do
             Nothing -> pure Posted
         else markFalse s >> pure InstantUnsat
       Just [ l, m ] -> do
-        attachBinary s l m
+        attachBinary ( clauseDB s ) l m
         pure Posted
       Just ls -> do
-        ( cref, c ) <- recordClause s False ls
-        attachLong s cref c
+        ( cref, c ) <- recordClause ( clauseDB s ) False ls
+        attachLong ( clauseDB s ) cref c
         pure Posted
 
 -- | Attach a binary clause @[l, m]@ to the watch lists mid-search, /without/
@@ -890,7 +884,7 @@ addBinaryLemma s l m = do
   ok <- readMutVar ( okFlag s )
   when ok $ do
     -- Attach the clause.
-    attachBinary s l m
+    attachBinary ( clauseDB s ) l m
 
     -- If the clause is already unit, propagate immediately.
     val_l <- litValue s l
@@ -998,7 +992,7 @@ propagateLit
   .  PrimMonad m
   => SolverState ( PrimState m ) -> Lit -> m ( Maybe Conflict )
 propagateLit s p = do
-  ws <- Growable.read ( watches s ) ( litIndex p )
+  ws <- Growable.read ( watches ( clauseDB s ) ) ( litIndex p )
   total <- Growable.length ws
   loop ws total 0 0
   where
@@ -1038,7 +1032,7 @@ propagateLit s p = do
                 Growable.write ws wi w
                 loop ws total ( ri + 1 ) ( wi + 1 )
               else do
-                c <- clauseAt s cref
+                c <- clauseAt ( clauseDB s ) cref
                 r <- handleWatched s cref falseLit c
                 case r of
                   WatchReplaced -> loop ws total ( ri + 1 ) wi
@@ -1087,7 +1081,7 @@ handleWatched s cref falseLit c = do
           -- The clause now watches 'other' at position 0 and 'newWatched'
           -- at position 1. Register it on the new watch list with 'other'
           -- as the blocker.
-          pushWatcher s ( negateLit newWatched ) ( WLong cref other )
+          pushWatcher ( clauseDB s ) ( negateLit newWatched ) ( WLong cref other )
           pure WatchReplaced
         Nothing ->
           case otherV of
@@ -1142,6 +1136,7 @@ analyse s conflict0 = do
   let
     AnalysisState
       { analysePathC
+      , seen
       , analyseTouched
       , analyseOtherLits
       , analyseOtherLevels
@@ -1156,7 +1151,7 @@ analyse s conflict0 = do
     -- Mark a variable as seen and remember it for batch-clearance.
     markSeen :: Int -> m ()
     markSeen vi = do
-      Growable.write ( seen s ) vi ( Bit True )
+      Growable.write seen vi ( Bit True )
       Growable.push analyseTouched vi
 
     -- Process a single literal during analysis, skipping the resolution
@@ -1167,7 +1162,7 @@ analyse s conflict0 = do
     visitLit :: Int -> Lit -> m ()
     visitLit skipVi l = do
       let vi = varIndex ( litVar l )
-      Bit marker <- Growable.read ( seen s ) vi
+      Bit marker <- Growable.read seen vi
       if marker || vi == skipVi
       then pure ()
       else do
@@ -1198,7 +1193,7 @@ analyse s conflict0 = do
   -- Seed analysis from the conflict source.
   case conflict0 of
     ConflictClause cref -> do
-      c <- clauseAt s cref
+      c <- clauseAt ( clauseDB s ) cref
       visit ( -1 ) c
     ConflictBinary l1 l2 -> do
       visitLit ( -1 ) l1
@@ -1235,7 +1230,7 @@ analyse s conflict0 = do
           | i >= touchedN = pure ()
           | otherwise = do
               vi <- Growable.read analyseTouched i
-              Growable.write ( seen s ) vi ( Bit False )
+              Growable.write seen vi ( Bit False )
               clearLoop ( i + 1 )
     clearLoop 0
 
@@ -1264,7 +1259,7 @@ minimiseLearnt
   .  PrimMonad m
   => SolverState ( PrimState m ) -> m ()
 minimiseLearnt s = do
-  Growable.truncate ( minFailedTouched s )  0
+  Growable.truncate minFailedTouched  0
   n <- Growable.length analyseOtherLits
   -- The set of decision levels present in the body, hashed into a 64-bit mask
   -- ('abstractLevel'). A literal can only be self-subsumed if every other
@@ -1300,6 +1295,9 @@ minimiseLearnt s = do
       { analyseOtherLits
       , analyseOtherLevels
       , analyseTouched
+      , seen
+      , minFailed
+      , minFailedTouched
       } = analysisState s
     -- OR together the abstraction bits of every body literal's level.
     collectAbstraction :: Int -> m Word64
@@ -1334,11 +1332,11 @@ minimiseLearnt s = do
       if lvl <= GroundLevel
       then pure True
       else do
-        Bit isSeen <- Growable.read ( seen s ) vq
+        Bit isSeen <- Growable.read seen vq
         if isSeen
         then pure True
         else do
-          Bit isFailed <- Growable.read ( minFailed s ) vq
+          Bit isFailed <- Growable.read minFailed vq
           if isFailed
           then pure False
           else if abstractLevel lvl .&. abstraction == 0
@@ -1347,21 +1345,21 @@ minimiseLearnt s = do
             ok <- reasonRedundant abstraction vq
             if ok
             then do
-              Growable.write ( seen s ) vq ( Bit True )
+              Growable.write seen vq ( Bit True )
               Growable.push  analyseTouched vq
               pure True
             else markFailed vq
 
     markFailed :: Int -> m Bool
     markFailed vq = do
-      Growable.write ( minFailed s ) vq ( Bit True )
-      Growable.push  ( minFailedTouched s ) vq
+      Growable.write minFailed vq ( Bit True )
+      Growable.push  minFailedTouched vq
       pure False
 
     -- Every literal of the reason clause other than the resolved variable @vi@.
     clauseOthersCovered :: Word64 -> ClauseRef -> Int -> m Bool
     clauseOthersCovered abstraction cref vi = do
-      c <- clauseAt s cref
+      c <- clauseAt ( clauseDB s ) cref
       let sz = clauseSize c
           go !k
             | k >= sz   = pure True
@@ -1386,12 +1384,12 @@ minimiseLearnt s = do
 
     clearFailed :: m ()
     clearFailed = do
-      k <- Growable.length ( minFailedTouched s )
+      k <- Growable.length minFailedTouched
       let loop !i
             | i >= k = pure ()
             | otherwise = do
-                vi <- Growable.read ( minFailedTouched s ) i
-                Growable.write ( minFailed s ) vi ( Bit False )
+                vi <- Growable.read minFailedTouched i
+                Growable.write minFailed vi ( Bit False )
                 loop ( i + 1 )
       loop 0
 
@@ -1429,7 +1427,7 @@ walkUIP
 walkUIP s visit visitLit ( TrailPos start ) = go start
   where
     AnalysisState
-      { analysePathC }
+      { analysePathC, seen }
         = analysisState s
     go :: Int -> m Lit
     go !idx
@@ -1437,12 +1435,12 @@ walkUIP s visit visitLit ( TrailPos start ) = go start
       | otherwise = do
           lit <- Growable.read ( entries ( trail s ) ) idx
           let vi = varIndex ( litVar lit )
-          Bit marker <- Growable.read ( seen s ) vi
+          Bit marker <- Growable.read seen vi
           if not marker
           then go ( idx - 1 )
           else do
             modifyMutVar' analysePathC ( subtract 1 )
-            Growable.write ( seen s ) vi ( Bit False )
+            Growable.write seen vi ( Bit False )
             pc <- readMutVar analysePathC
             if pc == 0
             then pure lit
@@ -1460,15 +1458,15 @@ walkUIP s visit visitLit ( TrailPos start ) = go start
                   visitLit vi other
                   go ( idx - 1 )
                 Clause.RClause cref -> do
-                  c' <- clauseAt s cref
+                  c' <- clauseAt ( clauseDB s ) cref
                   visit vi c'
                   go ( idx - 1 )
                 Clause.RLazy lref -> do
                   -- Theory-propagated literal: force the deferred reason
                   -- closure to recover the supporting clause's literals.
                   ls <- forceLazy s lref
-                  modifyMutVar' ( lazyForceCount s ) ( + 1 )
-                  modifyMutVar' ( lazyForceLits  s ) ( + length ls )
+                  modifyMutVar' ( lazyForceCount ( stats s ) ) ( + 1 )
+                  modifyMutVar' ( lazyForceLits  ( stats s ) ) ( + length ls )
                   -- Each forced literal must be currently assigned, so 'visitLit'
                   -- can read its decision level. See Note [Citability invariant].
                   visitLits vi ls
@@ -1558,13 +1556,13 @@ cancelUntil s tgtLevel@( DecisionLevel tgt ) = do
             when dec ( VarOrder.reinsertVar ( varOrder s ) v )
             undo ( i - 1 )
     undo ( sz - 1 )
-    truncateToLevel s tgtLevel start
+    truncateToLevel ( trail s ) tgtLevel start
 
 -- | Snapshot the current lengths of every backjump-coupled array.
-captureLevelStart :: PrimMonad m => SolverState ( PrimState m ) -> m LevelStart
-captureLevelStart s = do
-  pos   <- trailSize s
-  nLazy <- Growable.length ( lazyReasons ( trail s ) )
+captureLevelStart :: PrimMonad m => AssignmentTrail ( PrimState m ) -> m LevelStart
+captureLevelStart trl = do
+  pos   <- TrailPos <$> Growable.length ( entries trl )
+  nLazy <- Growable.length ( lazyReasons trl )
   pure ( LevelStart { levelTrailPos = pos, levelLazyCount = nLazy } )
 
 -- | Roll every backjump-coupled array back to the watermarks captured for the
@@ -1575,13 +1573,18 @@ captureLevelStart s = do
 -- been undone.
 truncateToLevel
   :: PrimMonad m
-  => SolverState ( PrimState m ) -> DecisionLevel -> LevelStart -> m ()
-truncateToLevel s ( DecisionLevel tgt )
-                  ( LevelStart { levelTrailPos = pos@( TrailPos p ), levelLazyCount = nLazy } ) = do
-  Growable.truncate ( entries ( trail s ) )       p
-  Growable.truncate ( lazyReasons ( trail s ) ) nLazy
-  Growable.truncate ( levelStarts ( trail s ) ) tgt
-  writeMutVar ( qhead ( trail s ) ) pos
+  => AssignmentTrail ( PrimState m ) -> DecisionLevel -> LevelStart -> m ()
+truncateToLevel
+  trl
+  ( DecisionLevel tgt )
+  LevelStart
+    { levelTrailPos = pos@( TrailPos p )
+    , levelLazyCount = nLazy
+    } = do
+  Growable.truncate ( entries trl )     p
+  Growable.truncate ( lazyReasons trl ) nLazy
+  Growable.truncate ( levelStarts trl ) tgt
+  writeMutVar ( qhead trl ) pos
 
 -------------------------------------------------------------------------------
 -- Decisions.
@@ -1600,7 +1603,7 @@ decide s = do
   case mbV of
     Nothing -> pure Nothing
     Just v  -> do
-      modifyMutVar' ( decCount s ) ( + 1 )
+      modifyMutVar' ( decCount ( stats s ) ) ( + 1 )
       pol <- Growable.read ( phase s ) ( varIndex v )
       pure ( Just ( mkLit v pol ) )
   where
@@ -1709,7 +1712,7 @@ solveWith opts s = do
         checkBudget
           | optConflictBudget opts <= 0 = pure Nothing
           | otherwise = do
-              n <- readMutVar ( confCount s )
+              n <- readMutVar ( confCount ( stats s ) )
               pure $ if n >= optConflictBudget opts then Just Unknown else Nothing
 
 -------------------------------------------------------------------------------
@@ -1726,7 +1729,7 @@ pushNewLevel
   :: PrimMonad m
   => SolverState ( PrimState m ) -> m ()
 pushNewLevel s = do
-  start <- captureLevelStart s
+  start <- captureLevelStart ( trail s )
   Growable.push ( levelStarts ( trail s ) ) start
 
 -- | Record a branching decision taken /outside/ 'decide' — e.g. a literal
@@ -1735,7 +1738,7 @@ pushNewLevel s = do
 countDecision
   :: PrimMonad m
   => SolverState ( PrimState m ) -> m ()
-countDecision s = modifyMutVar' ( decCount s ) ( + 1 )
+countDecision s = modifyMutVar' ( decCount ( stats s ) ) ( + 1 )
 
 -- | Install a learnt clause and unit-assert its asserting literal.
 --
@@ -1752,12 +1755,12 @@ installLearnt s = \case
   [] -> markFalse s
   [ l ] -> enqueueUndef s l Clause.RFact
   [ l, m ] -> do
-    attachBinary s l m
+    attachBinary ( clauseDB s ) l m
     enqueueUndef s l ( Clause.RBinary m )
   ls@( l : _ ) -> do
-    ( cref, c ) <- recordClause s True ls
-    Growable.push ( learnts s ) cref
-    attachLong s cref c
+    ( cref, c ) <- recordClause ( clauseDB s ) True ls
+    Growable.push ( learnts ( clauseDB s ) ) cref
+    attachLong ( clauseDB s ) cref c
     enqueueUndef s l ( Clause.RClause cref )
 
 -- | Resolve a non-ground conflict.
@@ -1776,7 +1779,7 @@ resolveConflict
        -- 'installLearnt'; given the backjump level
   -> m ()
 resolveConflict s c onBackjump = do
-  modifyMutVar' ( confCount s ) ( + 1 )
+  modifyMutVar' ( confCount ( stats s ) ) ( + 1 )
   ( learnt, bj ) <- analyse s c
   cancelUntil s bj
   onBackjump bj
@@ -1834,7 +1837,7 @@ forceLazy s ( Clause.LazyRef i ) = do
 recordTheoryClause
   :: PrimMonad m
   => SolverState ( PrimState m ) -> [ Lit ] -> m ClauseRef
-recordTheoryClause s ls = fst <$> recordClause s False ls
+recordTheoryClause s ls = fst <$> recordClause ( clauseDB s ) False ls
   -- TODO: these clauses are stored permanently, never reclaimed.
 
 -------------------------------------------------------------------------------
