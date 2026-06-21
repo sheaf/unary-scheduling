@@ -1228,21 +1228,31 @@ readTask t i = Boxed.MVector.unsafeRead ( taskAvails ( tasks t ) ) i
 -- its monotonicity links to the task's neighbouring thresholds the first time
 -- it is created. Returns whether the atom was freshly created.
 internBoundAtomWith
-  :: Measurable t
-  => TheoryState mode s task t -> ST s Var -> Int -> Endpoint ( LatestTime t ) -> ST s ( Lit, Bool )
+  :: forall {s} t mode task
+  .  Measurable t
+  => TheoryState mode s task t
+  -> ST s Var -> Int -> Endpoint ( LatestTime t ) -> ST s ( Lit, Bool )
 internBoundAtomWith t allocVar i thr = do
   ( lit, isNew ) <- internStartUpper ( boundAtoms t ) allocVar i thr
   when isNew $ do
+#ifdef DEBUG
+    -- A freshly-interned atom owns a brand-new SAT variable, so it must
+    -- start off unassigned.
+    freshVal <- SAT.valueOf ( theorySolverState t ) ( litVar lit )
+    case freshVal of
+      LUndef -> pure ()
+      _      -> error $ "internBoundAtomWith: freshly-interned atom already assigned: "
+                     <> show lit <> " = " <> show freshVal
+#endif
     ( mbBelow, mbAbove ) <- boundNeighbours ( boundAtoms t ) i thr
-    for_ mbBelow \ belowLit -> imply belowLit lit   -- A_below ⟹ A_thr
-    for_ mbAbove \ aboveLit -> imply lit aboveLit   -- A_thr   ⟹ A_above
+    for_ mbBelow \ belowLit -> belowLit ⟹ lit
+    for_ mbAbove \ aboveLit -> lit ⟹ aboveLit
   pure ( lit, isNew )
   where
-    -- The binary monotonicity clause @a ⟹ b@ (i.e. @¬a ∨ b@), attached directly
-    -- as a lazily-generated lemma. /Not/ 'SAT.addClause': mid-search, a clause
-    -- with a ground-false literal would there collapse to a unit and enqueue an
-    -- 'RFact' at the current (non-ground) level, corrupting conflict analysis.
-    imply a b = SAT.addBinaryLemma ( theorySolverState t ) ( negateLit a ) b
+    -- The binary monotonicity clause @a ⟹ b@ (i.e. @¬a ∨ b@).
+    (⟹) :: Lit -> Lit -> ST s ()
+    a ⟹ b = SAT.addBinaryLemma ( theorySolverState t ) ( negateLit a ) b
+      -- NB: not 'addClause', as that is invalid mid-search.
 
 -- | Get-or-create a bound atom as a /decision/ variable (in the VSIDS heap),
 -- bumping its activity on first creation.

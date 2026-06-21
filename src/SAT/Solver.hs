@@ -865,28 +865,27 @@ addClause s ls0 = do
 -- | Attach a binary clause @[l, m]@ to the watch lists mid-search, /without/
 -- the unit-collapse and level-0 normalisation of 'addClause'.
 --
--- The caller must guarantee at least one literal is currently unassigned,
--- so that the clause is not already falsified at attach time.
+-- Precondition: the clause is not already /falsified/ (both literals false),
+-- since such a clause would be attached without its conflict being detected.
 addBinaryLemma
   :: PrimMonad m
   => SolverState ( PrimState m ) -> Lit -> Lit -> m ()
 addBinaryLemma s l m = do
 #ifdef DEBUG
-  -- Check precondition: at least one of the literals is unassigned.
-  assign_l <- Growable.read ( assigns s ) ( varIndex $ litVar l )
-  assign_m <- Growable.read ( assigns s ) ( varIndex $ litVar m )
+  -- Check precondition: the clause is not already falsified.
+  dbg_val_l <- litValue s l
+  dbg_val_m <- litValue s m
   if
-    | LUndef <- assign_l
-    -> return ()
-    | LUndef <- assign_m
-    -> return ()
-    | otherwise
+    | LFalse <- dbg_val_l
+    , LFalse <- dbg_val_m
     ->
-      error $ unlines
-        [ "addBinaryLemma: both literals already assigned"
-        , show l ++ ": " ++ show assign_l
-        , show m ++ ": " ++ show assign_m
-        ]
+     error $ unlines
+       [ "addBinaryLemma: clause already falsified"
+       , show l ++ " = " ++ show dbg_val_l
+       , show m ++ " = " ++ show dbg_val_m
+       ]
+    | otherwise
+    -> return ()
 #endif
   ok <- readMutVar ( okFlag s )
   when ok $ do
