@@ -385,7 +385,7 @@ seedInitialBounds t nT =
 -- | Snapshot the current schedule-trail mark to associate it with a fresh
 -- SAT decision level. Must be called immediately after 'SAT.pushNewLevel'.
 --
--- The semantics mirror 'SAT.Solver.trailLim': @levelMarks[k]@ holds the
+-- The semantics mirror 'SAT.Solver.levelStarts': @levelMarks[k]@ holds the
 -- schedule-trail mark captured at the start of level @k + 1@ (i.e. just
 -- before the level-@(k+1)@ decision is asserted), so undoing back to that
 -- mark restores the trail to the state right after level @k@'s effects.
@@ -399,7 +399,7 @@ pushLevel t = do
 --
 -- Precondition: @lvl@ is strictly less than the current SAT level
 -- (i.e. we are actually backjumping). This matches how
--- 'SAT.Solver.cancelUntil' itself indexes 'SAT.Solver.trailLim'.
+-- 'SAT.Solver.cancelUntil' itself indexes 'SAT.Solver.levelStarts'.
 popToLevel :: TheoryState mode s task t -> SAT.DecisionLevel -> ST s ()
 popToLevel t ( SAT.DecisionLevel lvl ) = do
 #ifdef DEBUG
@@ -1693,7 +1693,6 @@ enqueuePropagated t lit reason = do
 #ifdef DEBUG
     debugCheckReasonAntecedents t lit reason
 #endif
-    -- TODO: the lazy-reason table is never reclaimed on backjump.
     lref <- SAT.recordLazyReason ( theorySolverState t ) reason
     SAT.enqueueUndef ( theorySolverState t ) lit ( RLazy lref )
   modifyMutVar' ( theoryPropCount t ) ( + 1 )

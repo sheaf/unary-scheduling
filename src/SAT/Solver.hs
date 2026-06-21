@@ -215,6 +215,43 @@ deriving newtype instance Generic.MVector Unboxed.MVector TrailPos
 deriving newtype instance Generic.Vector  Unboxed.Vector  TrailPos
 deriving newtype instance Vector.Unbox TrailPos
 
+-- | Watermarks needed to restore an 'AssignmentTrail' on backjump.
+data LevelStart = LevelStart
+  { levelTrailPos  :: !TrailPos
+    -- ^ 'entries' length when the level opened
+    --
+    -- This is also where Boolean Constraint Propagation resumes, i.e.
+    -- the 'qhead' to restore on backjump.
+  , levelLazyCount :: !Int
+    -- ^ 'lazyReasons' length when the level opened
+  }
+  deriving stock Show
+
+-- | Assigned literals in chronological order, with the per-level bookkeeping
+-- needed to backtrack.
+data AssignmentTrail s = AssignmentTrail
+  { entries     :: !( Growable Unboxed.MVector s Lit )
+    -- ^ Assigned literals, in chronological assignment order.
+  , levelStarts :: !( Growable Boxed.MVector s LevelStart )
+    -- ^ Per-level watermarks, indexed by decision level minus one (level @k+1@
+    -- opens at @levelStarts[k]@).
+  , qhead       :: !( MutVar s TrailPos )
+    -- ^ Next trail position for Boolean Constraint Propagation.
+  , lazyReasons :: !( Growable Boxed.MVector s ( Clause.LazyReason s ) )
+    -- ^ Lazy-reason closures attached to theory-propagated literals via
+    -- 'Clause.RLazy', indexed by 'Clause.LazyRef'.
+  }
+
+-- | Allocate an empty assignment trail.
+newAssignmentTrail :: PrimMonad m => m ( AssignmentTrail ( PrimState m ) )
+newAssignmentTrail = do
+  ent <- Growable.new 16
+  lvl <- Growable.new 4
+  qh  <- newMutVar 0
+  lzs <- Growable.new 4
+  pure AssignmentTrail
+    { entries = ent, levelStarts = lvl, qhead = qh, lazyReasons = lzs }
+
 -------------------------------------------------------------------------------
 -- Watchers and conflicts.
 
@@ -357,22 +394,13 @@ data SolverState s = SolverState
     -- @negateLit p@ as a watched literal, so that enqueueing @p@ wakes
     -- those clauses.
     watches   :: !( Growable Boxed.MVector s ( Growable Primitive.MVector s Watcher ) )
-  , -- | Assigned literals (in chronological order).
-    trail     :: !( Growable Unboxed.MVector s Lit )
-  , -- | Trail position at which each decision level begins, indexed by
-    -- decision level minus one (level @k+1@ starts at @trailLim[k]@).
-    trailLim  :: !( Growable Unboxed.MVector s TrailPos )
-  , -- | Next trail position for Boolean Constraint Propagation.
-    qhead     :: !( MutVar s TrailPos )
+  , -- | The assignment trail, with the per-level bookkeeping needed for backjumping.
+    trail     :: !( AssignmentTrail s )
   , -- | Storage for long clauses (size @>= 3@).
     clauseStore :: !( ClauseStore s )
   , -- | References of all learnt clauses, tracked separately from the input
     -- clauses so the two sets can be managed independently.
     learnts   :: !( Growable Primitive.MVector s ClauseRef )
-  , -- | Lazy-reason closures attached to theory-propagated literals via
-    -- 'Clause.RLazy'. Indexed by 'Clause.LazyRef'. Forced during 1-UIP
-    -- conflict analysis when it crosses a theory-propagated literal.
-    lazyReasons :: !( Growable Boxed.MVector s ( Clause.LazyReason s ) )
   , -- | Total conflicts encountered.
     confCount :: !( MutVar s Int )
   , -- | Total decisions taken.
@@ -423,10 +451,8 @@ newSolver = do
   sen   <- Growable.new 16
   senL  <- Growable.new 32
   wts   <- Growable.new 32
-  trl   <- Growable.new 16
-  tlm   <- Growable.new 4
+  trl   <- newAssignmentTrail
   lns   <- Growable.new 16
-  qh    <- newMutVar 0
   cc    <- newMutVar 0
   dc    <- newMutVar 0
   lfc   <- newMutVar 0
@@ -445,7 +471,6 @@ newSolver = do
   -- large enough that typical problems do not run out before we implement
   -- learnt-clause deletion + compaction).
   cstore <- newClauseStore defaultStoreCapacityLits
-  lzs    <- Growable.new 4
   pure SolverState
     { assigns            = asg
     , level              = lvl
@@ -457,11 +482,8 @@ newSolver = do
     , seenLit            = senL
     , watches            = wts
     , trail              = trl
-    , trailLim           = tlm
-    , qhead              = qh
     , clauseStore        = cstore
     , learnts            = lns
-    , lazyReasons        = lzs
     , confCount          = cc
     , decCount           = dc
     , lazyForceCount     = lfc
@@ -548,7 +570,7 @@ litValue s l = litValueFromVar l <$> valueOf s ( litVar l )
 
 -- | The decision level we are currently exploring.
 currentLevel :: PrimMonad m => SolverState ( PrimState m ) -> m DecisionLevel
-currentLevel s = DecisionLevel <$> Growable.length ( trailLim s )
+currentLevel s = DecisionLevel <$> Growable.length ( levelStarts ( trail s ) )
 
 -- | The decision level at which the given variable was assigned.
 --
@@ -558,12 +580,15 @@ levelOfAssignedVar
   => SolverState ( PrimState m ) -> Var -> m DecisionLevel
 levelOfAssignedVar s v = do
   lvl <- Growable.read ( level s ) ( varIndex v )
+#ifdef DEBUG
   case lvl of
     UnassignedLevel -> do
       dump <- dumpSolverState s
       error $ "SAT.Solver.levelOfAssignedVar: unassigned variable "
            ++ show v ++ "\n" ++ dump
-    _ -> return lvl
+    _ -> pure ()
+#endif
+  return lvl
 
 -- | Render a snapshot of the trail (lits, levels, reasons) and the
 -- current decision-level stack, for inclusion in panic messages.
@@ -574,15 +599,18 @@ dumpSolverState
 dumpSolverState s = do
   TrailPos sz       <- trailSize s
   DecisionLevel cur <- currentLevel s
-  nLim              <- Growable.length ( trailLim s )
+  nLim              <- Growable.length ( levelStarts ( trail s ) )
   let
     readLim :: Int -> m Int
-    readLim k = do TrailPos p <- Growable.read ( trailLim s ) k; pure p
+    readLim k = do
+      LevelStart { levelTrailPos = TrailPos p }
+        <- Growable.read ( levelStarts ( trail s ) ) k
+      pure p
     showLits :: Int -> m [ String ]
     showLits k
       | k >= sz   = pure []
       | otherwise = do
-          l   <- Growable.read ( trail s ) k
+          l   <- Growable.read ( entries ( trail s ) ) k
           lvl <- Growable.read ( level s ) ( varIndex ( litVar l ) )
           val <- Growable.read ( assigns s ) ( varIndex ( litVar l ) )
           rsn <- Growable.read ( reason s ) ( varIndex ( litVar l ) )
@@ -601,7 +629,7 @@ dumpSolverState s = do
   trailLines <- showLits 0
   lims       <- limLine 0
   pure $ "  trailSize=" ++ show sz ++ " currentLevel=" ++ show cur
-      ++ "  trailLim=[" ++ intercalate "," lims ++ "]\n"
+      ++ "  levelStarts=[" ++ intercalate "," lims ++ "]\n"
       ++ "  trail:\n" ++ unlines trailLines
 
 showReason :: Clause.Reason -> String
@@ -648,7 +676,7 @@ describeConflict s = \case
           ++ "  reason=" ++ showReason rsn
 
 trailSize :: PrimMonad m => SolverState ( PrimState m ) -> m TrailPos
-trailSize s = TrailPos <$> Growable.length ( trail s )
+trailSize s = TrailPos <$> Growable.length ( entries ( trail s ) )
 
 numConflicts, numDecisions :: PrimMonad m => SolverState ( PrimState m ) -> m Int
 numConflicts = readMutVar . confCount
@@ -699,7 +727,7 @@ performAssignment s l rsn = do
   Growable.write ( assigns s ) vi val
   Growable.write ( level s )   vi lvl
   Growable.write  ( reason s )  vi rsn
-  Growable.push  ( trail s )   l
+  Growable.push  ( entries ( trail s ) )   l
 
 -- | Assign a literal at the current decision level.
 --
@@ -934,13 +962,13 @@ propagate s = loop
   where
     loop :: m ( Maybe Conflict )
     loop = do
-      q  <- readMutVar ( qhead s )
+      q  <- readMutVar ( qhead ( trail s ) )
       sz <- trailSize s
       if q >= sz
       then pure Nothing
       else do
-        p <- Growable.read ( trail s ) ( unTrailPos q )
-        writeMutVar ( qhead s ) ( q + 1 )
+        p <- Growable.read ( entries ( trail s ) ) ( unTrailPos q )
+        writeMutVar ( qhead ( trail s ) ) ( q + 1 )
         mbConf <- propagateLit s p
         case mbConf of
           Just c  -> pure ( Just c )
@@ -1408,7 +1436,7 @@ walkUIP s visit visitLit ( TrailPos start ) = go start
     go !idx
       | idx < 0 = error "SAT.Solver.analyse: trail underflow during UIP scan"
       | otherwise = do
-          lit <- Growable.read ( trail s ) idx
+          lit <- Growable.read ( entries ( trail s ) ) idx
           let vi = varIndex ( litVar lit )
           Bit marker <- Growable.read ( seen s ) vi
           if not marker
@@ -1502,14 +1530,15 @@ cancelUntil
 cancelUntil s tgtLevel@( DecisionLevel tgt ) = do
   cur <- currentLevel s
   when ( cur > tgtLevel ) do
-    TrailPos sz  <- trailSize s
-    lim@( TrailPos limI ) <- Growable.read ( trailLim s ) tgt
+    TrailPos sz <- trailSize s
+    start@( LevelStart { levelTrailPos = TrailPos limI } ) <-
+      Growable.read ( levelStarts ( trail s ) ) tgt
     let
       undo :: Int -> m ()
       undo !i
         | i < limI  = pure ()
         | otherwise = do
-            lit <- Growable.read ( trail s ) i
+            lit <- Growable.read ( entries ( trail s ) ) i
             let v  = litVar lit
                 vi = varIndex v
             -- The lit on the trail was the asserted-true literal, so its
@@ -1530,9 +1559,30 @@ cancelUntil s tgtLevel@( DecisionLevel tgt ) = do
             when dec ( VarOrder.reinsertVar ( varOrder s ) v )
             undo ( i - 1 )
     undo ( sz - 1 )
-    Growable.truncate ( trail s )    limI
-    Growable.truncate ( trailLim s ) tgt
-    writeMutVar ( qhead s )    lim
+    truncateToLevel s tgtLevel start
+
+-- | Snapshot the current lengths of every backjump-coupled array.
+captureLevelStart :: PrimMonad m => SolverState ( PrimState m ) -> m LevelStart
+captureLevelStart s = do
+  pos   <- trailSize s
+  nLazy <- Growable.length ( lazyReasons ( trail s ) )
+  pure ( LevelStart { levelTrailPos = pos, levelLazyCount = nLazy } )
+
+-- | Roll every backjump-coupled array back to the watermarks captured for the
+-- target level, drop the cancelled levels from 'levelStarts', and resume BCP
+-- at the level's trail position.
+--
+-- Precondition: the per-variable state of the dropped assignments has already
+-- been undone.
+truncateToLevel
+  :: PrimMonad m
+  => SolverState ( PrimState m ) -> DecisionLevel -> LevelStart -> m ()
+truncateToLevel s ( DecisionLevel tgt )
+                  ( LevelStart { levelTrailPos = pos@( TrailPos p ), levelLazyCount = nLazy } ) = do
+  Growable.truncate ( entries ( trail s ) )       p
+  Growable.truncate ( lazyReasons ( trail s ) ) nLazy
+  Growable.truncate ( levelStarts ( trail s ) ) tgt
+  writeMutVar ( qhead ( trail s ) ) pos
 
 -------------------------------------------------------------------------------
 -- Decisions.
@@ -1670,15 +1720,15 @@ solveWith opts s = do
 -- pieces, exposed for DPLL(T) consumers that interleave theory work with
 -- the SAT search.
 
--- | Open a fresh decision level by marking the current trail size as the
--- start of the new level. The next 'enqueueUndef' call will be the head
--- of the new level (typically a decision).
+-- | Open a fresh decision level by recording the current backjump watermarks
+-- as its starting point (see 'captureLevelStart'). The next 'enqueueUndef'
+-- call will be the head of the new level (typically a decision).
 pushNewLevel
   :: PrimMonad m
   => SolverState ( PrimState m ) -> m ()
 pushNewLevel s = do
-  n <- trailSize s
-  Growable.push ( trailLim s ) n
+  start <- captureLevelStart s
+  Growable.push ( levelStarts ( trail s ) ) start
 
 -- | Record a branching decision taken /outside/ 'decide' — e.g. a literal
 -- proposed by a DPLL(T) theory's own decision heuristic — so that
@@ -1744,7 +1794,7 @@ isOk = readMutVar . okFlag
 trailAt
   :: PrimMonad m
   => SolverState ( PrimState m ) -> TrailPos -> m Lit
-trailAt s ( TrailPos i ) = Growable.read ( trail s ) i
+trailAt s ( TrailPos i ) = Growable.read ( entries ( trail s ) ) i
 
 -- | Stash a lazy-reason closure in the solver and return its handle.
 --
@@ -1755,8 +1805,8 @@ recordLazyReason
   :: PrimMonad m
   => SolverState ( PrimState m ) -> Clause.LazyReason ( PrimState m ) -> m Clause.LazyRef
 recordLazyReason s lazy = do
-  i <- Growable.length ( lazyReasons s )
-  Growable.push ( lazyReasons s ) lazy
+  i <- Growable.length ( lazyReasons ( trail s ) )
+  Growable.push ( lazyReasons ( trail s ) ) lazy
   pure ( Clause.LazyRef i )
 
 -- | Force a previously-recorded 'Clause.LazyReason' to obtain its supporting
@@ -1766,12 +1816,12 @@ forceLazy
   => SolverState ( PrimState m ) -> Clause.LazyRef -> m [ Lit ]
 forceLazy s ( Clause.LazyRef i ) = do
 #ifdef DEBUG
-  n <- Growable.length ( lazyReasons s )
+  n <- Growable.length ( lazyReasons ( trail s ) )
   when ( i < 0 || i >= n ) $
     error $ "SAT.Solver.forceLazy: out-of-range LazyRef=" ++ show i
          ++ " lazyReasons.length=" ++ show n
 #endif
-  lazy <- Growable.read ( lazyReasons s ) i
+  lazy <- Growable.read ( lazyReasons ( trail s ) ) i
   Clause.forceLazyReason lazy
 
 -- | Record a long (size @≥ 3@) theory-supplied clause in the clause store
