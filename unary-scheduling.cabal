@@ -59,6 +59,7 @@ common common
     LambdaCase
     LexicalNegation
     MagicHash
+    MultiWayIf
     NamedFieldPuns
     NamedWildCards
     NumericUnderscores

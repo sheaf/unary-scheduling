@@ -802,8 +802,10 @@ data PostResult
     InstantUnsat
   deriving stock ( Eq, Show )
 
--- | Post an input clause to the solver. Duplicate literals and clauses
--- already satisfied by level-0 facts are normalised away.
+-- | Post an input clause to the solver, at the ground level.
+--
+-- Duplicate literals and clauses already satisfied by level-0 facts are
+-- normalised away.
 addClause
   :: PrimMonad m
   => SolverState ( PrimState m ) -> [ Lit ] -> m PostResult
@@ -835,24 +837,41 @@ addClause s ls0 = do
 -- | Attach a binary clause @[l, m]@ to the watch lists mid-search, /without/
 -- the unit-collapse and level-0 normalisation of 'addClause'.
 --
--- 'addClause' is meant for input clauses posted at the ground level: when
--- normalisation reduces a clause to a unit it enqueues the survivor as an
--- 'RFact', which is only sound at the ground level. A binary clause generated
--- lazily during the search — a theory lemma such as bound-atom monotonicity —
--- must therefore be attached directly: were it left to 'addClause', a literal
--- already false at the ground level would collapse it to a unit and enqueue an
--- 'RFact' at the /current/ level, which later trips conflict analysis.
---
--- The caller must guarantee at least one literal is currently unassigned (true
--- when one of them is a freshly created variable), so the clause is never
--- already falsified at attach time; any later violation is caught by the watch
--- on the second literal.
+-- The caller must guarantee at least one literal is currently unassigned,
+-- so that the clause is not already falsified at attach time.
 addBinaryLemma
   :: PrimMonad m
   => SolverState ( PrimState m ) -> Lit -> Lit -> m ()
 addBinaryLemma s l m = do
+#ifdef DEBUG
+  -- Check precondition: at least one of the literals is unassigned.
+  assign_l <- Growable.read ( assigns s ) ( varIndex $ litVar l )
+  assign_m <- Growable.read ( assigns s ) ( varIndex $ litVar m )
+  if
+    | LUndef <- assign_l
+    -> return ()
+    | LUndef <- assign_m
+    -> return ()
+    | otherwise
+    ->
+      error $ unlines
+        [ "addBinaryLemma: both literals already assigned"
+        , show l ++ ": " ++ show assign_l
+        , show m ++ ": " ++ show assign_m
+        ]
+#endif
   ok <- readMutVar ( okFlag s )
-  when ok ( attachBinary s l m )
+  when ok $ do
+    -- Attach the clause.
+    attachBinary s l m
+
+    -- If the clause is already unit, propagate immediately.
+    val_l <- litValue s l
+    val_m <- litValue s m
+    case (val_l, val_m) of
+      (LFalse, LUndef) -> enqueueUndef s m $ Clause.RBinary (negateLit l)
+      (LUndef, LFalse) -> enqueueUndef s l $ Clause.RBinary (negateLit m)
+      _                -> pure ()
 
 markFalse :: PrimMonad m => SolverState ( PrimState m ) -> m ()
 markFalse s = writeMutVar ( okFlag s ) False
@@ -1496,6 +1515,8 @@ cancelUntil s tgtLevel@( DecisionLevel tgt ) = do
             -- The lit on the trail was the asserted-true literal, so its
             -- polarity is exactly the polarity we want to save for the
             -- next decision touching this variable.
+            -- TODO: CaDiCaL vs MiniSat: do we want to save ALL phases or only
+            -- decision phases?
             Growable.write ( phase s )   vi ( litPolarity lit )
             Growable.write ( assigns s ) vi LUndef
             Growable.write ( level s )   vi UnassignedLevel
