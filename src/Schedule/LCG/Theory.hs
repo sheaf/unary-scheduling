@@ -99,6 +99,8 @@ import Control.Monad.Trans.State.Strict
   ( runStateT )
 
 -- primitive
+import Control.Monad.Primitive
+  ( stToPrim )
 import Data.Primitive.MutVar
   ( MutVar, newMutVar, readMutVar, writeMutVar, modifyMutVar' )
 
@@ -151,7 +153,7 @@ import Schedule.LCG.Atoms
 import Schedule.Monad
   ( ScheduleMonad, TaskUpdates(..) )
 import Schedule.Monitor
-  ( Monitoring(..), MonitorMode(..), Monitor, ReasonTag )
+  ( Monitoring(..), MonitorMode(..), Monitor )
 import Schedule.Ordering
   ( EdgeOrigin(..), CycleInfo
   , addIncidentEdgesTransitively
@@ -944,13 +946,9 @@ channelLit t predTask succTask = do
           let derived  = precLit ( atoms t ) a b
               antePred = precLit ( atoms t ) a u
               anteSucc = precLit ( atoms t ) u b
-              reason   =
-                LazyReason $
-                  pure
-                    [ negateLit antePred
-                    , negateLit anteSucc
-                    , derived
-                    ]
+              -- The 3-literal clause ¬p(a→u) ∨ ¬p(u→b) ∨ p(a→b); its antecedents
+              -- are already in hand, so nothing to defer.
+              reason   = boundReasonLits derived ( pure [ antePred, anteSucc ] )
           mbConf <- lift ( assertTheoryLit t derived reason )
           case mbConf of
             Nothing -> pure ()
@@ -1213,9 +1211,9 @@ assertOnePrecedence t cap a b reasonTasks = do
       error "Schedule.LCG.Theory.assertOnePrecedence: self-precedence"
 #endif
     let lit = precLit ( atoms t ) a b
-    bounds <- capSubsetLits t cap reasonTasks
-    reason <- boundReasonLits lit bounds
-    assertBatch t lit reason
+    -- The responsible subset's pre-pass bound atoms; deferred so the interning
+    -- only happens if 1-UIP forces this reason. See Note [Deferred reason construction].
+    assertBatch t lit ( boundReasonLits lit ( capSubsetLits t cap reasonTasks ) )
 
 -------------------------------------------------------------------------------
 -- Bound-atom literals.
@@ -1279,6 +1277,20 @@ estLitAt t i e = do
                   ( estLowerToStartUpper e )
   pure ( negateLit lit )
 
+-- | Intern the latest-start atom for the latest /completion/ @l@ under the
+-- duration of the given task snapshot, returning the positive literal
+-- @start ≤ lst@.
+internLatestStart
+  :: ( Num t, Measurable t, Bounded t )
+  => TheoryState mode s task t
+  -> Int
+  -> Task task t
+  -> Endpoint ( LatestTime t )
+  -> ST s Lit
+internLatestStart t i task l =
+  fst <$> internBoundAtomWith t ( SAT.newAuxVar ( theorySolverState t ) ) i
+            ( latestStartFromCompletion ( taskDuration task ) l )
+
 -- | The literal asserting the /upper/ bound @start_i ≤ lst@ for the given latest
 -- completion @l@: the /positive/ literal of the atom at the latest-start
 -- threshold.
@@ -1287,33 +1299,38 @@ estLitAt t i e = do
 lctLitAt
   :: ( Num t, Measurable t, Bounded t )
   => TheoryState mode s task t -> Int -> Endpoint ( LatestTime t ) -> ST s Lit
-lctLitAt t i l = do
-  task <- readTask t i
-  fst <$> internBoundAtomWith t ( SAT.newAuxVar ( theorySolverState t ) ) i
-            ( latestStartFromCompletion ( taskDuration task ) l )
+lctLitAt t i l = readTask t i >>= \ task -> internLatestStart t i task l
+
+-- | The bound literal on @side@ for an /already-read/ task snapshot, interning
+-- its atom: the lower bound @start ≥ est@ ('Earliest') or the upper bound
+-- @start ≤ lst@ ('Latest').
+boundLitOfTask
+  :: ( Num t, Measurable t, Bounded t )
+  => TheoryState mode s task t -> Handedness -> Int -> Task task t -> ST s Lit
+boundLitOfTask t Earliest i task = estLitAt t i ( est task )
+boundLitOfTask t Latest   i task = internLatestStart t i task ( lct task )
+
+-- | The current bound literal of task @i@ on the given side, reading its domain
+-- once and interning the atom if needed: @start ≥ est@ at 'Earliest', @start ≤ lst@
+-- at 'Latest'.
+sideLit
+  :: ( Num t, Measurable t, Bounded t )
+  => TheoryState mode s task t -> Handedness -> Int -> ST s Lit
+sideLit t side i = readTask t i >>= boundLitOfTask t side i
 
 -- | The literal asserting task @i@'s /current/ (domain) lower bound
 -- @start_i ≥ est_i@.
 currentEstLit
   :: ( Num t, Measurable t, Bounded t )
   => TheoryState mode s task t -> Int -> ST s Lit
-currentEstLit t i = readTask t i >>= estLitAt t i . est
+currentEstLit t i = sideLit t Earliest i
 
 -- | The literal asserting task @i@'s /current/ (domain) upper bound
 -- @start_i ≤ lst_i@.
 currentLctLit
   :: ( Num t, Measurable t, Bounded t )
   => TheoryState mode s task t -> Int -> ST s Lit
-currentLctLit t i = readTask t i >>= lctLitAt t i . lct
-
--- | The current bound literal of task @i@ on the given side, interning its atom
--- if needed: the lower bound @start ≥ est@ at 'Earliest' handedness, the upper
--- bound @start ≤ lst@ at 'Latest'.
-sideLit
-  :: ( Num t, Measurable t, Bounded t )
-  => TheoryState mode s task t -> Handedness -> Int -> ST s Lit
-sideLit t Earliest i = currentEstLit t i
-sideLit t Latest   i = currentLctLit t i
+currentLctLit t i = sideLit t Latest i
 
 {- Note [Upholding the citability invariant]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1367,16 +1384,25 @@ boundLits t = fmap concat . traverse one
       l <- currentLctLit t i
       pure [ e, l ]
 
--- | Assemble a tight lazy reason for a theory propagation: the @propLit@,
--- resolved against the negations of its @antecedents@ (all currently true on
--- the trail as per Note [Upholding the citability invariant]).
+{- Note [Deferred reason construction]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A channel-out theory propagation records a lazy reason that is forced only if a
+/later/ 1-UIP resolves through it. Most never are (a backjump discards the
+literal first), so building the supporting clause eagerly is wasted work.
+
+Soundness rule: the deferred action must not read mutable state that can change
+under it; it should rely on the immutable pass capture or never-mutated
+information (e.g. ground availabilities, task durations).
+-}
+
+-- | Assemble a tight lazy reason for a theory propagation: disjunction
+-- of @propLit@ and the negations of the antecedents produced by @mkAntecedents@.
 --
--- The closure captures the literals directly (interned atoms are stable), so
--- forcing it during 1-UIP yields the supporting clause.
+-- The antecedent action is lazy, run only when the reason is forced.
 boundReasonLits
-  :: Lit -> [ Lit ] -> ST s ( LazyReason s )
-boundReasonLits propLit antecedents = do
-  pure ( LazyReason ( pure ( propLit : map negateLit antecedents ) ) )
+  :: Lit -> ST s [ Lit ] -> LazyReason s
+boundReasonLits propLit mkAntecedents =
+  LazyReason ( stToPrim ( ( propLit : ) . map negateLit <$> mkAntecedents ) )
 
 -- | The precedence literal between @i@ and @p@ that the matrix currently holds
 -- (true on the trail), or 'Nothing' if they are unordered.
@@ -1450,16 +1476,16 @@ collectCarversWith compOf n i window0 = go ( n - 1 ) window0 []
                else go ( c - 1 ) acc' ( c : used )
 
 -- | Carver bound literals (current state) justifying that the bound on @side@
--- /jumped/ to @i@'s current bound: the tasks whose /current/ compulsory parts
--- removed @i@'s ground availability across the skipped span.
+-- /jumped/ to @i@'s current bound, given @i@'s post-jump snapshot @task@: the
+-- tasks whose /current/ compulsory parts removed @i@'s ground availability
+-- across the skipped span.
 --
 -- Cites current bounds, so it is sound only at a propagation fixpoint, where
 -- every cited bound is then on the trail (see Note [Upholding the citability invariant]).
 jumpCarverLits
   :: ( Num t, Measurable t, Bounded t )
-  => TheoryState mode s task t -> Handedness -> Int -> ST s [ Lit ]
-jumpCarverLits t side i = do
-  task <- readTask t i
+  => TheoryState mode s task t -> Handedness -> Int -> Task task t -> ST s [ Lit ]
+jumpCarverLits t side i task = do
   let window = jumpWindow t side i ( est task )
                  ( latestStartFromCompletion ( taskDuration task ) ( lct task ) )
   ( _residual, carvers ) <-
@@ -1481,10 +1507,14 @@ assertChannelInJump
   .  ( Num t, Measurable t, Bounded t, MonitorMode mode )
   => TheoryState mode s task t -> Handedness -> Int -> [ Lit ] -> ST s ( Maybe SAT.Conflict )
 assertChannelInJump t side i base = do
-  lit     <- sideLit t side i
-  carvers <- jumpCarverLits t side i
-  reason  <- boundReasonLits lit ( base ++ carvers )
-  assertBatch t lit reason
+  -- Read @i@'s post-channel-in snapshot once, for both the propagated literal and
+  -- the carver window. The carvers cite the /current/ (previous-fixpoint) state
+  -- and must be built eagerly: there is no shared pass capture to defer against,
+  -- and snapshotting one would merely duplicate this O(n) carver walk.
+  post    <- readTask t i
+  lit     <- boundLitOfTask t side i post
+  carvers <- jumpCarverLits t side i post
+  assertBatch t lit ( boundReasonLits lit ( pure ( base ++ carvers ) ) )
 
 -------------------------------------------------------------------------------
 -- Per-pass channelling (capture / channel).
@@ -1654,17 +1684,22 @@ channelPass t cts deltas = do
       -> ST s ( Maybe SAT.Conflict )
     channelMove _   _    _ Nothing       _      _    = pure Nothing
     channelMove cap side i ( Just move ) subset prec = do
-      lit        <- sideLit t side i
-      subsetLits <- capSubsetLits t cap subset
-      let precLits = IntMap.findWithDefault [] i prec
-      carvers <- case move of
-        MovedExact  -> pure []
-        MovedJumped -> do
-          task <- readTask t i
-          capCarverLits t cap side i ( est task )
-            ( latestStartFromCompletion ( taskDuration task ) ( lct task ) )
-      reason <- boundReasonLits lit ( subsetLits ++ precLits ++ carvers )
-      assertBatch t lit reason
+      -- Read the post-pass task once. It is an immutable snapshot, so both the
+      -- propagated literal and the post-pass bounds the deferred reason needs come
+      -- from it as pure values (captured like 'cap'); the closure never touches
+      -- the live domain. See Note [Deferred reason construction].
+      post <- readTask t i
+      lit  <- boundLitOfTask t side i post
+      let !newEst = est post
+          !newLst = latestStartFromCompletion ( taskDuration post ) ( lct post )
+          mkAntecedents = do
+            subsetLits <- capSubsetLits t cap subset
+            let precLits = IntMap.findWithDefault [] i prec
+            carvers <- case move of
+              MovedExact  -> pure []
+              MovedJumped -> capCarverLits t cap side i newEst newLst
+            pure ( subsetLits ++ precLits ++ carvers )
+      assertBatch t lit ( boundReasonLits lit mkAntecedents )
 
 -- | The per-pass channeller wiring 'capturePass' \/ 'channelPass' into
 -- 'propagationLoop'. A channel conflict is stashed in 'pendingConflict' and
@@ -1705,21 +1740,19 @@ enqueuePropagated t lit reason = do
     debugCheckReasonAntecedents t lit reason
 #endif
     tickLazyRecord ( monitor t )
-    tag  <- newReasonTag ( monitor t )
     lref <- SAT.recordLazyReason ( theorySolverState t )
-              ( instrumentedLazyReason ( monitor t ) tag reason )
+              ( instrumentedLazyReason ( monitor t ) reason )
     SAT.enqueueUndef ( theorySolverState t ) lit ( RLazy lref )
   modifyMutVar' ( theoryPropCount t ) ( + 1 )
 
--- | Wrap a recorded lazy reason so forcing it during conflict analysis is
--- counted.
+-- | Instrument a lazy reason to tick when it gets forced.
 instrumentedLazyReason
   :: MonitorMode mode
-  => Monitor mode s -> ReasonTag mode s -> LazyReason s -> LazyReason s
-instrumentedLazyReason mon tag reason =
+  => Monitor mode s -> LazyReason s -> LazyReason s
+instrumentedLazyReason mon reason =
   LazyReason do
     ls <- forceLazyReason reason
-    tickLazyForce mon tag ( length ls )
+    tickLazyForce mon ( length ls )
     pure ls
 {-# SPECIALISE instrumentedLazyReason @MonitoringOff #-}
 
@@ -1891,14 +1924,12 @@ emptyDomainConflict t cap i lo hi = do
   -- channel-out), each with a tight pre-pass reason: the squeezing subset plus
   -- the matrix precedence edges captured for that side.
   estAnte <- ( ++ IntMap.findWithDefault [] i ( capEstPrec cap ) ) <$> capSubsetLits t cap ( IntSet.toList estWhy )
-  loReason <- boundReasonLits lowerLit estAnte
-  mb1 <- assertBatch t lowerLit loReason
+  mb1 <- assertBatch t lowerLit ( boundReasonLits lowerLit ( pure estAnte ) )
   case mb1 of
     Just c  -> pure ( Just c )
     Nothing -> do
       lctAnte <- ( ++ IntMap.findWithDefault [] i ( capLctPrec cap ) ) <$> capSubsetLits t cap ( IntSet.toList lctWhy )
-      hiReason <- boundReasonLits upperLit lctAnte
-      mb2 <- assertBatch t upperLit hiReason
+      mb2 <- assertBatch t upperLit ( boundReasonLits upperLit ( pure lctAnte ) )
       case mb2 of
         Just c  -> pure ( Just c )
         Nothing -> do

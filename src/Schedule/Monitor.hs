@@ -12,8 +12,6 @@ module Schedule.Monitor
   where
 
 -- base
-import Control.Monad
-  ( when )
 import Data.Kind
   ( Type, Constraint )
 import Data.List
@@ -40,7 +38,7 @@ import Control.DeepSeq
 import Control.Monad.Primitive
   ( PrimMonad(PrimState), unsafeIOToPrim )
 import Data.Primitive.MutVar
-  ( MutVar, newMutVar, readMutVar, writeMutVar, modifyMutVar' )
+  ( MutVar, newMutVar, readMutVar, modifyMutVar' )
 
 -- text
 import Data.Text
@@ -98,24 +96,15 @@ class MonitorMode mode where
   -- | Record the length (number of literals) of a materialised reason clause.
   recordReasonLen :: PrimMonad m => Monitor mode ( PrimState m ) -> Int -> m ()
 
-  -- | A per-reason tag, attached to a recorded lazy reason so its /first/ force
-  -- can be told apart from later re-forces.
-  data ReasonTag mode :: Type -> Type
-
-  -- | Allocate a fresh 'ReasonTag' for a lazy reason about to be recorded.
-  newReasonTag
-    :: PrimMonad m => Monitor mode ( PrimState m ) -> m ( ReasonTag mode ( PrimState m ) )
-
   -- | Record that one lazy reason was recorded: a theory propagation above the
   -- ground level whose explanation is deferred ('SAT.Solver.recordLazyReason').
   tickLazyRecord :: PrimMonad m => Monitor mode ( PrimState m ) -> m ()
 
-  -- | Record one force of a recorded lazy reason during conflict analysis. The
-  -- 'ReasonTag' tells a first force (counted in the distinct total) from a
-  -- re-force; the 'Int' is the number of literals the forced reason produced.
+  -- | Record one force of a recorded lazy reason during conflict analysis; the
+  -- 'Int' is the number of literals the forced reason produced.
   tickLazyForce
     :: PrimMonad m
-    => Monitor mode ( PrimState m ) -> ReasonTag mode ( PrimState m ) -> Int -> m ()
+    => Monitor mode ( PrimState m ) -> Int -> m ()
 
   -- | Snapshot the accumulated counters into an immutable 'MonitorReport'.
   readReport :: PrimMonad m => Monitor mode ( PrimState m ) -> m MonitorReport
@@ -140,12 +129,9 @@ instance MonitorMode MonitoringOff where
   {-# INLINE tickConflict #-}
   recordReasonLen    _ _   = pure ()
   {-# INLINE recordReasonLen #-}
-  data ReasonTag MonitoringOff s = NoReasonTag
-  newReasonTag       _     = pure NoReasonTag
-  {-# INLINE newReasonTag #-}
   tickLazyRecord     _     = pure ()
   {-# INLINE tickLazyRecord #-}
-  tickLazyForce      _ _ _ = pure ()
+  tickLazyForce      _ _   = pure ()
   {-# INLINE tickLazyForce #-}
   readReport         _     = pure emptyReport
   {-# INLINE readReport #-}
@@ -163,8 +149,7 @@ instance MonitorMode MonitoringOn where
     , onReasonTotalLen  :: !( MutVar s Int )
     , onReasonMaxLen    :: !( MutVar s Int )
     , onLazyRecorded    :: !( MutVar s Int )
-    , onLazyForceCalls  :: !( MutVar s Int )
-    , onLazyForceDistinct :: !( MutVar s Int )
+    , onLazyForced      :: !( MutVar s Int )
     , onLazyForceLits   :: !( MutVar s Int )
     }
   newMonitor =
@@ -176,7 +161,6 @@ instance MonitorMode MonitoringOn where
       <*> newMutVar 0
       <*> newMutVar 0
       <*> newMutVar Map.empty
-      <*> newMutVar 0
       <*> newMutVar 0
       <*> newMutVar 0
       <*> newMutVar 0
@@ -211,16 +195,10 @@ instance MonitorMode MonitoringOn where
     modifyMutVar' ( onReasonCount mon )    ( + 1 )
     modifyMutVar' ( onReasonTotalLen mon ) ( + n )
     modifyMutVar' ( onReasonMaxLen mon )   ( max n )
-  data ReasonTag MonitoringOn s = ReasonTag !( MutVar s Bool )
-  newReasonTag _ = ReasonTag <$> newMutVar False
   tickLazyRecord mon = modifyMutVar' ( onLazyRecorded mon ) ( + 1 )
-  tickLazyForce mon ( ReasonTag forced ) n = do
-    modifyMutVar' ( onLazyForceCalls mon ) ( + 1 )
-    modifyMutVar' ( onLazyForceLits  mon ) ( + n )
-    wasForced <- readMutVar forced
-    when ( not wasForced ) do
-      writeMutVar forced True
-      modifyMutVar' ( onLazyForceDistinct mon ) ( + 1 )
+  tickLazyForce mon n = do
+    modifyMutVar' ( onLazyForced   mon ) ( + 1 )
+    modifyMutVar' ( onLazyForceLits mon ) ( + n )
   readReport mon =
     MonitorReport
       <$> readMutVar ( onPerProp mon )
@@ -234,8 +212,7 @@ instance MonitorMode MonitoringOn where
       <*> readMutVar ( onReasonTotalLen mon )
       <*> readMutVar ( onReasonMaxLen mon )
       <*> readMutVar ( onLazyRecorded mon )
-      <*> readMutVar ( onLazyForceCalls mon )
-      <*> readMutVar ( onLazyForceDistinct mon )
+      <*> readMutVar ( onLazyForced mon )
       <*> readMutVar ( onLazyForceLits mon )
 
 -------------------------------------------------------------------------------
@@ -276,15 +253,12 @@ data MonitorReport = MonitorReport
   , -- | Lazy reasons recorded (deferred theory propagations above the ground
     -- level). The denominator for lazy-reason utilisation.
     lazyRecorded    :: !Int
-  , -- | Force /calls/ on recorded lazy reasons during conflict analysis (counts
-    -- repeats: a low-level reason can be re-forced by a later conflict).
-    lazyForceCalls  :: !Int
-  , -- | Distinct lazy reasons forced at least once. @lazyForceDistinct \/
-    -- lazyRecorded@ is the utilisation; @lazyForceCalls \/ lazyForceDistinct@
-    -- the re-force factor (whether deferred reconstruction would need caching).
-    lazyForceDistinct :: !Int
-  , -- | Total literals across all force calls (sums repeats, matching
-    -- 'lazyForceCalls').
+  , -- | Lazy reasons forced during conflict analysis. @lazyForced \/
+    -- lazyRecorded@ is the utilisation. Memoisation in 'SAT.Solver.forceLazy'
+    -- means each distinct reason is forced (and so counted) at most once.
+    lazyForced      :: !Int
+  , -- | Total literals across all forced reasons (mean length is
+    -- @lazyForceLits \/ lazyForced@).
     lazyForceLits   :: !Int
   }
   deriving stock    ( Show, Generic )
@@ -304,8 +278,7 @@ emptyReport = MonitorReport
   , reasonTotalLen    = 0
   , reasonMaxLen      = 0
   , lazyRecorded      = 0
-  , lazyForceCalls    = 0
-  , lazyForceDistinct = 0
+  , lazyForced        = 0
   , lazyForceLits     = 0
   }
 
@@ -323,11 +296,10 @@ renderReport r = unlines $
       ( reasonMaxLen r )
   , "lazy reasons (deferred theory propagations):"
   , line "recorded"          ( lazyRecorded r )
-  , line "forced (distinct)" ( lazyForceDistinct r )
-  , line "force calls"       ( lazyForceCalls r )
-  , printf "  %-22s %.1f%% recorded ever forced  |  %.2fx re-force  |  %.1f mean lits/force"
+  , line "forced"            ( lazyForced r )
+  , printf "  %-22s %.1f%% recorded ever forced  |  %.1f mean lits/force"
       ( "utilisation" :: String )
-      ( utilisation :: Double ) ( reForce :: Double ) ( meanForceLen :: Double )
+      ( utilisation :: Double ) ( meanForceLen :: Double )
   , "conflicts by source:"
   ] ++ conflictLines ++
   [ "search phases (total ms; indented = sub-phase, ALREADY counted in its parent — do not sum):"
@@ -376,9 +348,8 @@ renderReport r = unlines $
     safeRatio :: Int -> Int -> Double
     safeRatio _ 0 = 0
     safeRatio a b = fromIntegral a / fromIntegral b
-    utilisation  = 100 * safeRatio ( lazyForceDistinct r ) ( lazyRecorded r )
-    reForce      = safeRatio ( lazyForceCalls r ) ( lazyForceDistinct r )
-    meanForceLen = safeRatio ( lazyForceLits r )  ( lazyForceCalls r )
+    utilisation  = 100 * safeRatio ( lazyForced r )    ( lazyRecorded r )
+    meanForceLen = safeRatio ( lazyForceLits r ) ( lazyForced r )
     propLines
       | Map.null ( perPropagator r ) = [ "  (none)" ]
       | otherwise =

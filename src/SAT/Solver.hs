@@ -1882,8 +1882,7 @@ recordLazyReason ( SolverState { solverAssignments = Assignments { trail } } ) l
   Growable.push ( lazyReasons trail ) lazy
   pure ( Clause.LazyRef i )
 
--- | Force a previously-recorded 'Clause.LazyReason' to obtain its supporting
--- clause's literals.
+-- | Force a 'Clause.LazyReason' to obtain its supporting clause's literals.
 forceLazy
   :: PrimMonad m
   => AssignmentTrail ( PrimState m ) -> Clause.LazyRef -> m [ Lit ]
@@ -1895,7 +1894,11 @@ forceLazy trail ( Clause.LazyRef i ) = do
          ++ " lazyReasons.length=" ++ show n
 #endif
   lazy <- Growable.read ( lazyReasons trail ) i
-  Clause.forceLazyReason lazy
+  ls   <- Clause.forceLazyReason lazy
+
+  -- Overwrite the thunk with what it evaluated to.
+  Growable.write ( lazyReasons trail ) i ( Clause.LazyReason ( pure ls ) )
+  pure ls
 
 -- | Record a long (size @≥ 3@) theory-supplied clause in the clause store
 -- without attaching watchers.

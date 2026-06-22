@@ -179,19 +179,12 @@ profRun name = do
     ( numDecisions st ) ( numConflicts st ) ( numLearnts st ) ( numTheoryPropagations st )
 
 -- | Two views of the lazy-reason machinery across representative instances, from
--- one 'MonitoringOn' solve each (the counters\/timers are zero-cost and absent
--- otherwise):
+-- one 'MonitoringOn' solve each:
 --
---   * /utilisation/ — of the deferred theory-propagation reasons /recorded/, how
---     many are ever actually /forced/ by conflict analysis, and the re-force
---     factor. This is the waste that deferring reason construction (Design B)
---     would reclaim; the counts are exact and meaningful even on small instances.
+--   * utilisation of the deferred theory-propagation reasons recorded,
+--     i.e. how many are ever actually forced by conflict analysis
 --
---   * /phase breakdown/ — what share of wall-clock the explanation machinery
---     costs ("channel-out" builds the reasons, "capture" is the eager pre-pass
---     snapshot), sizing the pie Design B draws from. Both nest inside
---     "propagators"; wall-clock has noise, so read only the rows whose solve is
---     well above a millisecond (the larger infeasible ones).
+--   * phase breakdown (wall-clock time)
 lazyReasonReport :: IO ()
 lazyReasonReport = do
   results <- forM lazyInstances \ ( iname, inst ) -> do
@@ -201,25 +194,22 @@ lazyReasonReport = do
     t1  <- getMonotonicTimeNSec
     pure ( iname, t1 - t0, rep )
 
-  printf "Lazy-reason utilisation (recorded = deferred theory props; forced = used by 1-UIP/minimise):\n\n"
-  printf "  %-22s %-11s %8s %8s %7s %8s %8s %8s\n"
+  printf "Lazy-reason utilisation (recorded = deferred theory props; forced = used by 1-UIP/minimise, memoised so at most once):\n\n"
+  printf "  %-22s %-11s %8s %8s %7s %8s\n"
     ( "instance" :: String ) ( "verdict" :: String )
     ( "recorded" :: String ) ( "forced" :: String ) ( "used%" :: String )
-    ( "calls" :: String ) ( "reforce" :: String ) ( "meanLen" :: String )
+    ( "meanLen" :: String )
   forM_ results \ ( iname, _t, rep ) -> do
-    let m     = monitorReport rep
-        recd  = lazyRecorded m
-        dist  = lazyForceDistinct m
-        calls = lazyForceCalls m
-        lits  = lazyForceLits m
-    printf "  %-22s %-11s %8d %8d %6.1f%% %8d %7.2fx %8.1f\n"
-      iname ( verdict rep ) recd dist ( 100 * ratio dist recd )
-      calls ( ratio calls dist ) ( ratio lits calls )
+    let m      = monitorReport rep
+        recd   = lazyRecorded m
+        forced = lazyForced m
+        lits   = lazyForceLits m
+    printf "  %-22s %-11s %8d %8d %6.1f%% %8.1f\n"
+      iname ( verdict rep ) recd forced ( 100 * ratio forced recd )
+      ( ratio lits forced )
   putStrLn ""
 
   printf "Phase breakdown (%% of instrumented wall-clock).\n"
-  printf "  capture/chanOut are SUB-phases of prop (already in prop%%); fixpoint = prop - capture - chanOut.\n"
-  printf "  Read sub-phases as an UPPER bound; never add them to prop%%.\n\n"
   printf "  %-22s %-10s %7s %9s %11s %10s %7s %10s\n"
     ( "instance" :: String ) ( "time" :: String ) ( "prop%" :: String )
     ( "·capture%" :: String ) ( "·chanOut%" :: String ) ( "·fixpoint%" :: String )
