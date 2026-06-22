@@ -415,7 +415,7 @@ popToLevel t ( SAT.DecisionLevel lvl ) = do
   Growable.truncate ( levelMarks t ) lvl
   undoTo ( schedTrail t ) ( tasks t ) m
   -- Rewind the theory head: any trail positions above the new top are gone.
-  newSize <- SAT.trailSize ( theorySolverState t )
+  newSize <- SAT.solverTrailSize ( theorySolverState t )
   writeMutVar ( theoryHead t ) newSize
 
 -- | Number of precedence literals currently on the SAT trail.
@@ -423,7 +423,7 @@ popToLevel t ( SAT.DecisionLevel lvl ) = do
 -- Used only for debugging/instrumentation.
 numPrecedenceDecisions :: TheoryState mode s task t -> ST s Int
 numPrecedenceDecisions t = do
-  SAT.TrailPos sz <- SAT.trailSize ( theorySolverState t )
+  SAT.TrailPos sz <- SAT.solverTrailSize ( theorySolverState t )
   let
     loop !i !acc
       | i >= sz   = pure acc
@@ -823,7 +823,7 @@ channelPending t = do
       then pure Nothing  -- theorySolverState already marked UNSAT; outer loop will bail.
       else do
         h@( SAT.TrailPos hi ) <- readMutVar ( theoryHead t )
-        SAT.TrailPos sz       <- SAT.trailSize ( theorySolverState t )
+        SAT.TrailPos sz       <- SAT.solverTrailSize ( theorySolverState t )
         if hi >= sz
         then pure Nothing
         else do

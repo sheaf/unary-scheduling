@@ -113,7 +113,9 @@ data SearchResult task t = SearchResult
     solution :: !( Either Text ( ImmutableTaskInfos task t ) )
   , -- | Cumulative search statistics.
     stats    :: !SearchStats
-  , -- | Instrumentation report. Empty ('Schedule.Monitor.emptyReport') unless
+  , -- | Instrumentation report.
+    --
+    -- Empty ('Schedule.Monitor.emptyReport') unless
     -- the search was run at @mode ~ 'Schedule.Monitor.MonitoringOn'@.
     monitorReport :: !MonitorReport
   }
@@ -280,7 +282,7 @@ driveLoop restartUnit theoryState = driveRestarts 1
               Just c  -> onConflict confs c
               Nothing -> do
                 -- 2. Theory propagation.
-                szBefore <- SAT.trailSize solverState
+                szBefore <- SAT.solverTrailSize solverState
                 mbTConf <- theoryPropagate theoryState
                 case mbTConf of
                   Just c  -> onConflict confs c
@@ -291,7 +293,7 @@ driveLoop restartUnit theoryState = driveRestarts 1
                     if not okAfter
                     then pure ( Solved SAT.Unsat )
                     else do
-                      szAfter <- SAT.trailSize solverState
+                      szAfter <- SAT.solverTrailSize solverState
                       if szAfter > szBefore
                       -- Theory pushed new literals — re-run BCP before deciding.
                       then step confs
