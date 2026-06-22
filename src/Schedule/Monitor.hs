@@ -12,6 +12,8 @@ module Schedule.Monitor
   where
 
 -- base
+import Control.Monad
+  ( when )
 import Data.Kind
   ( Type, Constraint )
 import Data.List
@@ -38,7 +40,7 @@ import Control.DeepSeq
 import Control.Monad.Primitive
   ( PrimMonad(PrimState), unsafeIOToPrim )
 import Data.Primitive.MutVar
-  ( MutVar, newMutVar, readMutVar, modifyMutVar' )
+  ( MutVar, newMutVar, readMutVar, writeMutVar, modifyMutVar' )
 
 -- text
 import Data.Text
@@ -75,8 +77,9 @@ class MonitorMode mode where
   withPropagatorTiming :: PrimMonad m => Monitor mode ( PrimState m ) -> Text -> m a -> m a
 
   -- | Like 'withPropagatorTiming', but accumulates against a named /search phase/
-  -- (BCP, channel-in, propagators, channel-out, conflict analysis, decide), to
-  -- localise where search time goes.
+  -- to localise where search time goes. A name of the form @\"parent\/child\"@
+  -- marks a sub-phase nested inside @parent@'s timed region (its time is included
+  -- in the parent); see the 'phaseTime' field doc for how that must be read.
   withPhaseTiming :: PrimMonad m => Monitor mode ( PrimState m ) -> Text -> m a -> m a
 
   -- | Record one productive round of the propagation fixpoint loop.
@@ -94,6 +97,25 @@ class MonitorMode mode where
 
   -- | Record the length (number of literals) of a materialised reason clause.
   recordReasonLen :: PrimMonad m => Monitor mode ( PrimState m ) -> Int -> m ()
+
+  -- | A per-reason tag, attached to a recorded lazy reason so its /first/ force
+  -- can be told apart from later re-forces.
+  data ReasonTag mode :: Type -> Type
+
+  -- | Allocate a fresh 'ReasonTag' for a lazy reason about to be recorded.
+  newReasonTag
+    :: PrimMonad m => Monitor mode ( PrimState m ) -> m ( ReasonTag mode ( PrimState m ) )
+
+  -- | Record that one lazy reason was recorded: a theory propagation above the
+  -- ground level whose explanation is deferred ('SAT.Solver.recordLazyReason').
+  tickLazyRecord :: PrimMonad m => Monitor mode ( PrimState m ) -> m ()
+
+  -- | Record one force of a recorded lazy reason during conflict analysis. The
+  -- 'ReasonTag' tells a first force (counted in the distinct total) from a
+  -- re-force; the 'Int' is the number of literals the forced reason produced.
+  tickLazyForce
+    :: PrimMonad m
+    => Monitor mode ( PrimState m ) -> ReasonTag mode ( PrimState m ) -> Int -> m ()
 
   -- | Snapshot the accumulated counters into an immutable 'MonitorReport'.
   readReport :: PrimMonad m => Monitor mode ( PrimState m ) -> m MonitorReport
@@ -118,6 +140,13 @@ instance MonitorMode MonitoringOff where
   {-# INLINE tickConflict #-}
   recordReasonLen    _ _   = pure ()
   {-# INLINE recordReasonLen #-}
+  data ReasonTag MonitoringOff s = NoReasonTag
+  newReasonTag       _     = pure NoReasonTag
+  {-# INLINE newReasonTag #-}
+  tickLazyRecord     _     = pure ()
+  {-# INLINE tickLazyRecord #-}
+  tickLazyForce      _ _ _ = pure ()
+  {-# INLINE tickLazyForce #-}
   readReport         _     = pure emptyReport
   {-# INLINE readReport #-}
 
@@ -133,6 +162,10 @@ instance MonitorMode MonitoringOn where
     , onReasonCount     :: !( MutVar s Int )
     , onReasonTotalLen  :: !( MutVar s Int )
     , onReasonMaxLen    :: !( MutVar s Int )
+    , onLazyRecorded    :: !( MutVar s Int )
+    , onLazyForceCalls  :: !( MutVar s Int )
+    , onLazyForceDistinct :: !( MutVar s Int )
+    , onLazyForceLits   :: !( MutVar s Int )
     }
   newMonitor =
     Monitor
@@ -143,6 +176,10 @@ instance MonitorMode MonitoringOn where
       <*> newMutVar 0
       <*> newMutVar 0
       <*> newMutVar Map.empty
+      <*> newMutVar 0
+      <*> newMutVar 0
+      <*> newMutVar 0
+      <*> newMutVar 0
       <*> newMutVar 0
       <*> newMutVar 0
       <*> newMutVar 0
@@ -174,6 +211,16 @@ instance MonitorMode MonitoringOn where
     modifyMutVar' ( onReasonCount mon )    ( + 1 )
     modifyMutVar' ( onReasonTotalLen mon ) ( + n )
     modifyMutVar' ( onReasonMaxLen mon )   ( max n )
+  data ReasonTag MonitoringOn s = ReasonTag !( MutVar s Bool )
+  newReasonTag _ = ReasonTag <$> newMutVar False
+  tickLazyRecord mon = modifyMutVar' ( onLazyRecorded mon ) ( + 1 )
+  tickLazyForce mon ( ReasonTag forced ) n = do
+    modifyMutVar' ( onLazyForceCalls mon ) ( + 1 )
+    modifyMutVar' ( onLazyForceLits  mon ) ( + n )
+    wasForced <- readMutVar forced
+    when ( not wasForced ) do
+      writeMutVar forced True
+      modifyMutVar' ( onLazyForceDistinct mon ) ( + 1 )
   readReport mon =
     MonitorReport
       <$> readMutVar ( onPerProp mon )
@@ -186,6 +233,10 @@ instance MonitorMode MonitoringOn where
       <*> readMutVar ( onReasonCount mon )
       <*> readMutVar ( onReasonTotalLen mon )
       <*> readMutVar ( onReasonMaxLen mon )
+      <*> readMutVar ( onLazyRecorded mon )
+      <*> readMutVar ( onLazyForceCalls mon )
+      <*> readMutVar ( onLazyForceDistinct mon )
+      <*> readMutVar ( onLazyForceLits mon )
 
 -------------------------------------------------------------------------------
 -- Report.
@@ -199,6 +250,13 @@ data MonitorReport = MonitorReport
     -- propagator's subscription name.
     perPropagatorTime :: !( Map Text Word64 )
   , -- | Per-search-phase cumulative wall-clock time (nanoseconds).
+    --
+    -- Remarks:
+    --
+    --   1. A key of the form @\"parent\/child\"@ is a /sub-phase/ whose time
+    --      is /already included/ in its parent's total.
+    --
+    --   2. Instrumentation adds a cost, so it can over-inflate sub-phases.
     phaseTime       :: !( Map Text Word64 )
   , -- | Productive rounds of the propagation fixpoint loop.
     rounds          :: !Int
@@ -215,6 +273,19 @@ data MonitorReport = MonitorReport
     reasonTotalLen  :: !Int
   , -- | Largest recorded reason-clause length.
     reasonMaxLen    :: !Int
+  , -- | Lazy reasons recorded (deferred theory propagations above the ground
+    -- level). The denominator for lazy-reason utilisation.
+    lazyRecorded    :: !Int
+  , -- | Force /calls/ on recorded lazy reasons during conflict analysis (counts
+    -- repeats: a low-level reason can be re-forced by a later conflict).
+    lazyForceCalls  :: !Int
+  , -- | Distinct lazy reasons forced at least once. @lazyForceDistinct \/
+    -- lazyRecorded@ is the utilisation; @lazyForceCalls \/ lazyForceDistinct@
+    -- the re-force factor (whether deferred reconstruction would need caching).
+    lazyForceDistinct :: !Int
+  , -- | Total literals across all force calls (sums repeats, matching
+    -- 'lazyForceCalls').
+    lazyForceLits   :: !Int
   }
   deriving stock    ( Show, Generic )
   deriving anyclass NFData
@@ -232,6 +303,10 @@ emptyReport = MonitorReport
   , reasonCount       = 0
   , reasonTotalLen    = 0
   , reasonMaxLen      = 0
+  , lazyRecorded      = 0
+  , lazyForceCalls    = 0
+  , lazyForceDistinct = 0
+  , lazyForceLits     = 0
   }
 
 -- | A human-readable multi-line rendering of a 'MonitorReport'.
@@ -246,22 +321,49 @@ renderReport r = unlines $
       ( reasonCount r )
       ( meanLen :: Double )
       ( reasonMaxLen r )
+  , "lazy reasons (deferred theory propagations):"
+  , line "recorded"          ( lazyRecorded r )
+  , line "forced (distinct)" ( lazyForceDistinct r )
+  , line "force calls"       ( lazyForceCalls r )
+  , printf "  %-22s %.1f%% recorded ever forced  |  %.2fx re-force  |  %.1f mean lits/force"
+      ( "utilisation" :: String )
+      ( utilisation :: Double ) ( reForce :: Double ) ( meanForceLen :: Double )
   , "conflicts by source:"
   ] ++ conflictLines ++
-  [ "search phases (total ms):"
+  [ "search phases (total ms; indented = sub-phase, ALREADY counted in its parent — do not sum):"
   ] ++ phaseLines ++
   [ "per-propagator (invocations / productive / total ms):"
   ] ++ propLines
   where
     line :: String -> Int -> String
     line name n = printf "  %-22s %d" name n
+    -- Phases are rendered as a one-level tree: a key @\"parent/child\"@ is a
+    -- sub-phase whose time is included in @parent@.
     phaseLines
       | Map.null ( phaseTime r ) = [ "  (none)" ]
-      | otherwise =
-          [ printf "  %-22s %.2f" ( Text.unpack name ) ( fromIntegral ns / 1e6 :: Double )
-          -- Most-time-consuming first.
-          | ( name, ns ) <- sortOn ( negate . snd ) ( Map.toList ( phaseTime r ) )
-          ]
+      | otherwise = concatMap renderTop topSorted
+      where
+        ms :: Word64 -> Double
+        ms ns = fromIntegral ns / 1e6
+        split :: Text -> ( Maybe Text, Text )
+        split k = case Text.breakOn "/" k of
+          ( top, rest )
+            | Text.null rest -> ( Nothing, top )
+            | otherwise      -> ( Just top, Text.drop 1 rest )
+        entries   = Map.toList ( phaseTime r )
+        topSorted =
+          sortOn ( negate . snd ) [ ( name, v ) | ( k, v ) <- entries, ( Nothing, name ) <- [ split k ] ]
+        childrenOf p =
+          sortOn ( negate . snd )
+            [ ( child, v ) | ( k, v ) <- entries, ( Just par, child ) <- [ split k ], par == p ]
+        phaseRow :: String -> Word64 -> String
+        phaseRow nm t = printf "  %-26s %8.2f" nm ( ms t )
+        renderTop ( name, total ) =
+          let kids = childrenOf name
+          in  phaseRow ( Text.unpack name ) total
+              :  [ phaseRow ( "  - " ++ Text.unpack cn ) cv | ( cn, cv ) <- kids ]
+              ++ [ phaseRow "  - (excl. above) " ( total - sum ( map snd kids ) )
+                 | not ( null kids ) ]
     conflictLines
       | Map.null ( conflictBreakdown r ) = [ "  (none)" ]
       | otherwise =
@@ -271,6 +373,12 @@ renderReport r = unlines $
     meanLen
       | reasonCount r == 0 = 0
       | otherwise          = fromIntegral ( reasonTotalLen r ) / fromIntegral ( reasonCount r )
+    safeRatio :: Int -> Int -> Double
+    safeRatio _ 0 = 0
+    safeRatio a b = fromIntegral a / fromIntegral b
+    utilisation  = 100 * safeRatio ( lazyForceDistinct r ) ( lazyRecorded r )
+    reForce      = safeRatio ( lazyForceCalls r ) ( lazyForceDistinct r )
+    meanForceLen = safeRatio ( lazyForceLits r )  ( lazyForceCalls r )
     propLines
       | Map.null ( perPropagator r ) = [ "  (none)" ]
       | otherwise =

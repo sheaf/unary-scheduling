@@ -151,7 +151,7 @@ import Schedule.LCG.Atoms
 import Schedule.Monad
   ( ScheduleMonad, TaskUpdates(..) )
 import Schedule.Monitor
-  ( Monitoring(..), MonitorMode(..), Monitor )
+  ( Monitoring(..), MonitorMode(..), Monitor, ReasonTag )
 import Schedule.Ordering
   ( EdgeOrigin(..), CycleInfo
   , addIncidentEdgesTransitively
@@ -1674,8 +1674,8 @@ passChanneller
   .  ( Num t, Measurable t, Bounded t, MonitorMode mode )
   => TheoryState mode s task t -> PassChanneller s task t
 passChanneller t = PassChanneller
-  { onCapture = capturePass t
-  , onChannel = \ cts applied -> do
+  { onCapture = \ cts -> withPhaseTiming ( monitor t ) "propagators/capture" ( capturePass t cts )
+  , onChannel = \ cts applied -> withPhaseTiming ( monitor t ) "propagators/channel-out" do
       let deltas = fmap ( \ a -> ( estMove a, lctMove a ) ) applied
       mbC <- channelPass t cts deltas
       case mbC of
@@ -1691,7 +1691,8 @@ passChanneller t = PassChanneller
 -- reason otherwise).
 enqueuePropagated
   :: forall mode s task t
-  .  TheoryState mode s task t -> Lit -> LazyReason s -> ST s ()
+  .  MonitorMode mode
+  => TheoryState mode s task t -> Lit -> LazyReason s -> ST s ()
 enqueuePropagated t lit reason = do
   lvl <- SAT.currentLevel ( theorySolverState t )
   if lvl == SAT.GroundLevel
@@ -1703,9 +1704,24 @@ enqueuePropagated t lit reason = do
 #ifdef DEBUG
     debugCheckReasonAntecedents t lit reason
 #endif
-    lref <- SAT.recordLazyReason ( theorySolverState t ) reason
+    tickLazyRecord ( monitor t )
+    tag  <- newReasonTag ( monitor t )
+    lref <- SAT.recordLazyReason ( theorySolverState t )
+              ( instrumentedLazyReason ( monitor t ) tag reason )
     SAT.enqueueUndef ( theorySolverState t ) lit ( RLazy lref )
   modifyMutVar' ( theoryPropCount t ) ( + 1 )
+
+-- | Wrap a recorded lazy reason so forcing it during conflict analysis is
+-- counted.
+instrumentedLazyReason
+  :: MonitorMode mode
+  => Monitor mode s -> ReasonTag mode s -> LazyReason s -> LazyReason s
+instrumentedLazyReason mon tag reason =
+  LazyReason do
+    ls <- forceLazyReason reason
+    tickLazyForce mon tag ( length ls )
+    pure ls
+{-# SPECIALISE instrumentedLazyReason @MonitoringOff #-}
 
 #ifdef DEBUG
 -- | Verify, at enqueue time, that a theory-propagation reason is a valid unit

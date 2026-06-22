@@ -34,6 +34,10 @@ import Text.Printf
 import System.IO.CodePage
   ( withCP65001 )
 
+-- containers
+import qualified Data.Map.Strict as Map
+  ( findWithDefault )
+
 -- deepseq
 import Control.DeepSeq
   ( force )
@@ -145,6 +149,7 @@ main = withCP65001 do
     ( "prof" : rest ) -> mapM_ profRun ( if null rest then [ "d6s24", "copies2" ] else rest )
     ( "exp" : _ )     -> propagatorSubsetExperiment
     ( "opts" : _ )    -> optionToggleExperiment
+    ( "lazy" : _ )    -> lazyReasonReport
     _ -> do
       _ <- evaluate ( force theInstance )
       printf "=== unary-scheduling LCG inspection harness ===\n\n"
@@ -172,6 +177,79 @@ profRun name = do
   printf "%-8s %-11s %-11s dec=%d conf=%d learnt=%d tprop=%d\n"
     name ( fmtNs ( t1 - t0 ) ) ( verdict res )
     ( numDecisions st ) ( numConflicts st ) ( numLearnts st ) ( numTheoryPropagations st )
+
+-- | Two views of the lazy-reason machinery across representative instances, from
+-- one 'MonitoringOn' solve each (the counters\/timers are zero-cost and absent
+-- otherwise):
+--
+--   * /utilisation/ — of the deferred theory-propagation reasons /recorded/, how
+--     many are ever actually /forced/ by conflict analysis, and the re-force
+--     factor. This is the waste that deferring reason construction (Design B)
+--     would reclaim; the counts are exact and meaningful even on small instances.
+--
+--   * /phase breakdown/ — what share of wall-clock the explanation machinery
+--     costs ("channel-out" builds the reasons, "capture" is the eager pre-pass
+--     snapshot), sizing the pie Design B draws from. Both nest inside
+--     "propagators"; wall-clock has noise, so read only the rows whose solve is
+--     well above a millisecond (the larger infeasible ones).
+lazyReasonReport :: IO ()
+lazyReasonReport = do
+  results <- forM lazyInstances \ ( iname, inst ) -> do
+    _   <- evaluate ( force inst )
+    t0  <- getMonotonicTimeNSec
+    rep <- evaluate ( force ( lcgSearch @MonitoringOn defaultSearchOptions basicPropagators inst ) )
+    t1  <- getMonotonicTimeNSec
+    pure ( iname, t1 - t0, rep )
+
+  printf "Lazy-reason utilisation (recorded = deferred theory props; forced = used by 1-UIP/minimise):\n\n"
+  printf "  %-22s %-11s %8s %8s %7s %8s %8s %8s\n"
+    ( "instance" :: String ) ( "verdict" :: String )
+    ( "recorded" :: String ) ( "forced" :: String ) ( "used%" :: String )
+    ( "calls" :: String ) ( "reforce" :: String ) ( "meanLen" :: String )
+  forM_ results \ ( iname, _t, rep ) -> do
+    let m     = monitorReport rep
+        recd  = lazyRecorded m
+        dist  = lazyForceDistinct m
+        calls = lazyForceCalls m
+        lits  = lazyForceLits m
+    printf "  %-22s %-11s %8d %8d %6.1f%% %8d %7.2fx %8.1f\n"
+      iname ( verdict rep ) recd dist ( 100 * ratio dist recd )
+      calls ( ratio calls dist ) ( ratio lits calls )
+  putStrLn ""
+
+  printf "Phase breakdown (%% of instrumented wall-clock).\n"
+  printf "  capture/chanOut are SUB-phases of prop (already in prop%%); fixpoint = prop - capture - chanOut.\n"
+  printf "  Read sub-phases as an UPPER bound; never add them to prop%%.\n\n"
+  printf "  %-22s %-10s %7s %9s %11s %10s %7s %10s\n"
+    ( "instance" :: String ) ( "time" :: String ) ( "prop%" :: String )
+    ( "·capture%" :: String ) ( "·chanOut%" :: String ) ( "·fixpoint%" :: String )
+    ( "BCP%" :: String ) ( "analysis%" :: String )
+  forM_ results \ ( iname, total, rep ) -> do
+    let m       = monitorReport rep
+        ph name = fromIntegral ( Map.findWithDefault 0 name ( phaseTime m ) ) :: Double
+        pct ns  = if total == 0 then 0 else 100 * ns / fromIntegral total
+        prop    = ph "propagators"
+        capt    = ph "propagators/capture"
+        chanOut = ph "propagators/channel-out"
+    printf "  %-22s %-10s %6.0f%% %8.0f%% %10.0f%% %9.0f%% %6.0f%% %9.0f%%\n"
+      iname ( fmtNs total )
+      ( pct prop ) ( pct capt ) ( pct chanOut ) ( pct ( prop - capt - chanOut ) )
+      ( pct ( ph "BCP" ) ) ( pct ( ph "analysis" ) )
+  putStrLn ""
+  where
+    ratio :: Int -> Int -> Double
+    ratio a b = if b == 0 then 0 else fromIntegral a / fromIntegral b
+    lazyInstances :: [ ( String, Instance ) ]
+    lazyInstances =
+      [ ( "d6s24 (feasible)",     profInstance "d6s24" )
+      , ( "reh tight 5x20/3",     Instances.rehearsalInstance 1.0 0.4 5 20 8 3 )
+      , ( "bin copies1 (inf)",    Instances.infeasibleRehearsalInstance 1 )
+      , ( "bin copies2 (inf)",    profInstance "copies2" )
+      , ( "bin copies3 (inf)",    Instances.infeasibleRehearsalInstance 3 )
+      , ( "bin copies4 (inf)",    Instances.infeasibleRehearsalInstance 4 )
+      , ( "pigeonhole m=5 (inf)", Instances.intervalPigeonholeInstance 5 2 )
+      , ( "pigeonhole m=6 (inf)", Instances.intervalPigeonholeInstance 6 2 )
+      ]
 
 -- | Measure how much each (group of) expensive global propagator earns its
 -- keep.
@@ -318,16 +396,10 @@ abMatrix = do
       t1  <- getMonotonicTimeNSec
       putStr ( renderReport ( monitorReport rep ) )
       let propSum = sum ( perPropagatorTime ( monitorReport rep ) )
-          st      = stats rep
-          forces  = numLazyForces st
-          lits    = numLazyForceLits st
       printf "  instrumented total %s  (propagator compute %.2f ms = %.0f%%)\n"
         ( fmtNs ( t1 - t0 ) )
         ( fromIntegral propSum / 1e6 :: Double )
         ( 100 * fromIntegral propSum / fromIntegral ( t1 - t0 ) :: Double )
-      printf "  1-UIP lazy-reason forces %d, total lits %d (mean %.1f lits/force)\n"
-        forces lits
-        ( if forces == 0 then 0 else fromIntegral lits / fromIntegral forces :: Double )
     [] -> pure ()
 
 -------------------------------------------------------------------------------

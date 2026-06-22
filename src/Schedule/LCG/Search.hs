@@ -132,10 +132,6 @@ data SearchStats = SearchStats
   , numDecisions :: !Int
   , numLearnts   :: !Int
   , numTheoryPropagations :: !Int
-  , -- | Lazy reasons forced by 1-UIP.
-    numLazyForces    :: !Int
-    -- | Total literals returned by lazy reasons forced by 1-UIP.
-  , numLazyForceLits :: !Int
   }
   deriving stock    ( Show, Generic )
   deriving anyclass NFData
@@ -194,15 +190,11 @@ lcgSearch opts props givenTasks = runST do
   dc <- SAT.numDecisions solverState
   lc <- SAT.numLearnts   solverState
   tp <- readMutVar ( theoryPropCount theory )
-  lf <- SAT.numLazyForces    solverState
-  ll <- SAT.numLazyForceLits solverState
   let !stats0 = SearchStats
         { numConflicts          = cc
         , numDecisions          = dc
         , numLearnts            = lc
         , numTheoryPropagations = tp
-        , numLazyForces         = lf
-        , numLazyForceLits      = ll
         }
   report <- readReport ( monitor theory )
   pure SearchResult

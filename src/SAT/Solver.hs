@@ -48,8 +48,6 @@ module SAT.Solver
   , numConflicts
   , numDecisions
   , numLearnts
-  , numLazyForces
-  , numLazyForceLits
 
     -- * Lower-level driver primitives
     --
@@ -425,17 +423,15 @@ data ClauseDB s = ClauseDB
     watches   :: !( Growable Boxed.MVector s ( Growable Primitive.MVector s Watcher ) )
   }
 
--- | Search statistics and instrumentation counters.
+-- | Search statistics that the search /logic/ depends on (restart scheduling).
+--
+-- Pure instrumentation lives in the zero-cost 'Schedule.Monitor.Monitor',
+-- not here.
 data Statistics s = Statistics
   { -- | Total conflicts encountered.
     confCount :: !( MutVar s Int )
   , -- | Total decisions taken.
     decCount  :: !( MutVar s Int )
-  , -- | Number of lazy reasons forced during 1-UIP conflict analysis (each
-    -- time it crosses a theory-propagated literal).
-    lazyForceCount :: !( MutVar s Int )
-  , -- | Total literals across all forced lazy reasons.
-    lazyForceLits :: !( MutVar s Int )
   }
 
 -- | Variable assignments and related metadata.
@@ -513,10 +509,8 @@ newVarData = do
 -- | Allocate zeroed statistics counters.
 newStatistics :: PrimMonad m => m ( Statistics ( PrimState m ) )
 newStatistics = do
-  confCount      <- newMutVar 0
-  decCount       <- newMutVar 0
-  lazyForceCount <- newMutVar 0
-  lazyForceLits  <- newMutVar 0
+  confCount <- newMutVar 0
+  decCount  <- newMutVar 0
   pure $ Statistics { .. }
 
 -- | Allocate empty conflict-analysis scratch state. The buffers are reset at
@@ -738,12 +732,6 @@ trailSize trail = TrailPos <$> Growable.length ( entries trail )
 numConflicts, numDecisions :: PrimMonad m => SolverState ( PrimState m ) -> m Int
 numConflicts = readMutVar . confCount . stats
 numDecisions = readMutVar . decCount . stats
-
-numLazyForces, numLazyForceLits :: PrimMonad m => SolverState ( PrimState m ) -> m Int
--- | Count of lazy reasons forced by 1-UIP.
-numLazyForces    = readMutVar . lazyForceCount . stats
--- | Count of total literals returned by lazy reasons forced by 1-UIP.
-numLazyForceLits = readMutVar . lazyForceLits . stats
 
 numLearnts :: PrimMonad m => SolverState ( PrimState m ) -> m Int
 numLearnts = Growable.length . learnts . clauseDB
@@ -1505,7 +1493,6 @@ walkUIP
       { analysisState = AnalysisState { analysePathC, seen }
       , solverAssignments = Assignments { trail, varData }
       , clauseDB
-      , stats
       }
     )
   visit visitLit
@@ -1546,8 +1533,6 @@ walkUIP
                   -- Theory-propagated literal: force the deferred reason
                   -- closure to recover the supporting clause's literals.
                   ls <- forceLazy trail lref
-                  modifyMutVar' ( lazyForceCount stats ) ( + 1 )
-                  modifyMutVar' ( lazyForceLits  stats ) ( + length ls )
                   -- Each forced literal must be currently assigned, so 'visitLit'
                   -- can read its decision level. See Note [Citability invariant].
                   visitLits lit_idx ls
