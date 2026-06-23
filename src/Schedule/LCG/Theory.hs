@@ -133,7 +133,8 @@ import qualified SAT.Solver as SAT
 import Data.Lattice
   ( BoundedLattice(top, bottom) )
 import Schedule.Constraint
-  ( Constraints(..), Infeasible(..)
+  ( Constraint(notEarlierThan, notLaterThan)
+  , Constraints(..), Infeasible(..)
   , BoundMove(..), Applied(..)
   , constrainToAfter, constrainToBefore
   )
@@ -1010,7 +1011,7 @@ channelBound t task l pol = do
         ( channelAtom, _ ) <- internBoundAtomWith t ( SAT.newAuxVar ( theorySolverState t ) ) task l
         let channelledLit = case pol of { Positive -> channelAtom; Negative -> negateLit channelAtom }
             side          = case pol of { Positive -> Latest;      Negative -> Earliest }
-        assertChannelInJump t side task [ channelledLit ]
+        assertChannelInJump t side task l [ channelledLit ]
       _ -> pure Nothing
 
 -- | Add a pair of task indices to the precedence-dirty set so the next
@@ -1424,38 +1425,17 @@ compulsoryPart taskC =
   Interval ( flipClusivity ( coerce ( lst taskC ) ) )
            ( flipClusivity ( coerce ( ect taskC ) ) )
 
--- | The window of @i@'s /ground/ availability that a bound jump on @side@
--- skipped, given the new (post-jump) bound: the span strictly below the new
--- earliest start ('Earliest'), or strictly above the new latest start
--- ('Latest'). The carvers covering this span explain the jump.
-jumpWindow
-  :: ( Num t, Measurable t, Bounded t )
-  => TheoryState mode s task t -> Handedness -> Int
-  -> Endpoint ( EarliestTime t )   -- ^ new earliest start (for 'Earliest')
-  -> Endpoint ( LatestTime t )     -- ^ new latest start  (for 'Latest')
-  -> Intervals t
-jumpWindow t side i newEst newLst =
-  case side of
-    Earliest -> cutAfter  ( estLowerToStartUpper newEst ) ground
-    Latest   -> cutBefore ( startUpperToEstLower newLst ) ground
-  where
-    ground = groundAvail t Boxed.Vector.! i
-
--- | Walk every task @c ≠ i@, removing its (non-empty) compulsory part — looked
--- up via @compOf@ — from the given window of @i@'s /ground/ availability; return
--- the residual together with the carvers whose compulsory part actually shrank
--- it.
+-- | Given a task, remove from its ground availability the compulsory part
+-- of all other tasks (timetabling).
 --
--- Ground gaps and prune-removed short slots are absent from the residual to
--- begin with, so they contribute no carver — they are ground facts (the
--- instance availability and @i@'s own duration). Only @timetable@ carvings
--- attribute to a (cited) carver, which is exactly the non-ground removals.
+-- Returns the residual availability of the task, together with the other tasks
+-- responsible for the carving.
 collectCarversWith
   :: ( Num t, Measurable t, Bounded t )
-  => ( Int -> ST s ( Interval t ) )   -- ^ compulsory part of a task
+  => ( Int -> ST s ( Interval t ) )   -- ^ get compulsory part of a task
   -> Int                              -- ^ number of tasks
-  -> Int                              -- ^ the carved task @i@ (excluded)
-  -> Intervals t                      -- ^ window of @i@'s ground availability
+  -> Int                              -- ^ task to carve
+  -> Intervals t                      -- ^ task's ground availability
   -> ST s ( Intervals t, [ Int ] )
 collectCarversWith compOf n i window0 = go ( n - 1 ) window0 []
   where
@@ -1472,46 +1452,39 @@ collectCarversWith compOf n i window0 = go ( n - 1 ) window0 []
                then go ( c - 1 ) acc  used          -- did not shrink: skip
                else go ( c - 1 ) acc' ( c : used )
 
--- | Carver bound literals (current state) justifying that the bound on @side@
--- /jumped/ to @i@'s current bound, given @i@'s post-jump snapshot @task@: the
--- tasks whose /current/ compulsory parts removed @i@'s ground availability
--- across the skipped span.
---
--- Cites current bounds, so it is sound only at a propagation fixpoint, where
--- every cited bound is then on the trail (see Note [Upholding the citability invariant]).
-jumpCarverLits
-  :: ( Num t, Measurable t, Bounded t )
-  => TheoryState mode s task t -> Handedness -> Int -> Task task t -> ST s [ Lit ]
-jumpCarverLits t side i task = do
-  let window = jumpWindow t side i ( est task )
-                 ( latestStartFromCompletion ( taskDuration task ) ( lct task ) )
-  ( _residual, carvers ) <-
-    collectCarversWith ( fmap compulsoryPart . readTask t ) ( precedenceAtomsNumTasks ( atoms t ) ) i window
-  boundLits t carvers
-
--- | Reify and assert task @i@'s current bound on @side@ after a /channel-in/
--- jump, with a tight reason: the @base@ antecedents (the channelled-in literal)
--- plus the carvers of the skipped span.
+-- | Reify and assert a task's current bound on the given @side@ after a
+-- /channel-in/ jump, with a tight reason.
 --
 -- Only jumps need this: an /exact/ channel-in move lands the canonical
--- @est@\/@lst@ atom on the channelled-in atom itself (the registry canonicalises
--- both thresholds, see 'Schedule.Interval.canonicalStartUpper'), so it is already
--- on the trail. A jump lands on a further threshold whose atom must be asserted.
+-- @est@\/@lst@ atom on the channelled-in atom itself, so it is already on the
+-- trail. A jump lands on a further threshold whose atom must be asserted.
+--
 -- The current state is the previous round's fixpoint, so every cited literal is
 -- already on the trail (as per Note [Upholding the citability invariant]).
 assertChannelInJump
   :: forall mode s task t
   .  ( Num t, Measurable t, Bounded t, MonitorMode mode )
-  => TheoryState mode s task t -> Handedness -> Int -> [ Lit ] -> ST s ( Maybe SAT.Conflict )
-assertChannelInJump t side i base = do
-  -- Read @i@'s post-channel-in snapshot once, for both the propagated literal and
-  -- the carver window. The carvers cite the /current/ (previous-fixpoint) state
-  -- and must be built eagerly: there is no shared pass capture to defer against,
-  -- and snapshotting one would merely duplicate this O(n) carver walk.
-  post    <- readTask t i
-  lit     <- boundLitOfTask t side i post
-  carvers <- jumpCarverLits t side i post
-  assertBatch t lit ( boundReasonLits lit ( pure ( base ++ carvers ) ) )
+  => TheoryState mode s task t -> Handedness -> Int
+  -> Endpoint ( LatestTime t )   -- ^ the channelled-in bound threshold @l@ (the anchor)
+  -> [ Lit ]                     -- ^ the channelled-in literal (the anchor's justification)
+  -> ST s ( Maybe SAT.Conflict )
+assertChannelInJump t side i l base = do
+  -- The carvers cite the /current/ (previous-fixpoint) state and are built
+  -- eagerly: there is no shared pass capture to defer against. The anchor is the
+  -- channelled-in bound @l@ (justified by @base@); see Note [Bound-move reason completeness].
+  post   <- readTask t i
+  lit    <- boundLitOfTask t side i post
+  let dur    = taskDuration post
+      newEst = est post
+      newLst = latestStartFromCompletion dur ( lct post )
+  reason <- case side of
+    Earliest ->
+      boundMoveReason t i dur ( Interval (startUpperToEstLower l ) ( estLowerToStartUpper newEst ) )
+        ( fmap compulsoryPart . readTask t ) ( boundLits t ) base
+    Latest   ->
+      boundMoveReason t i dur ( Interval ( startUpperToEstLower newLst ) l )
+        ( fmap compulsoryPart . readTask t ) ( boundLits t ) base
+  assertBatch t lit ( boundReasonLits lit ( pure reason ) )
 
 -------------------------------------------------------------------------------
 -- Per-pass channelling (capture / channel).
@@ -1622,19 +1595,65 @@ capSubsetLits t cap = fmap concat . traverse one
       -- which cannot happen for a task a live inference depends on.
       Nothing -> boundLits t [ s ]
 
--- | Carver bound literals (pre-pass) for a jump to @newBound@: reconstruct the
--- carvers from the /captured/ compulsory parts and cite their captured bounds.
-capCarverLits
-  :: ( Num t, Measurable t, Bounded t )
-  => TheoryState mode s task t -> PassCapture t -> Handedness -> Int
-  -> Endpoint ( EarliestTime t ) -> Endpoint ( LatestTime t ) -> ST s [ Lit ]
-capCarverLits t cap side i newEst newLst = do
-  let window = jumpWindow t side i newEst newLst
-      compOf c = pure $ case IntMap.lookup c ( capBounds cap ) of
-        Just ( _, _, comp ) -> comp
-        Nothing             -> Interval top bottom   -- empty (no compulsory part)
-  ( _residual, carvers ) <- collectCarversWith compOf ( precedenceAtomsNumTasks ( atoms t ) ) i window
-  capSubsetLits t cap carvers
+{- Note [Bound-move reason completeness]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Running propagators updates the bounds of tasks, providing an explanation
+for the SAT core. This happens in two steps; for example, the EST of a task is
+updated thusly:
+
+  old_est --> anchor
+  anchor  --> new_est
+
+where we update the old_est to the anchor by e.g. energetic reasoning, and then
+update the anchor to new_est by carving: the compulsory parts of other tasks
+cover [anchor, new_est).
+
+The explanation provided to the SAT core consists of the following antecedents:
+
+  anchor antecedents ++ carvers
+
+These are computed 'boundMoveReason'.
+-}
+
+-- | Assemble the antecedents of a bound move, as per Note [Bound-move reason completeness].
+boundMoveReason
+  :: forall mode s task t
+  .  ( Num t, Measurable t, Bounded t )
+  => TheoryState mode s task t
+  -> Int                              -- ^ task number
+  -> Delta t                          -- ^ task duration
+  -> Interval t                       -- ^ skipped start span
+  -> ( Int -> ST s ( Interval t ) )   -- ^ a task's compulsory part
+  -> ( [ Int ] -> ST s [ Lit ] )      -- ^ carver tasks to their bound literals
+  -> [ Lit ]                          -- ^ anchor antecedents (the imposed bound's justification)
+  -> ST s [ Lit ]
+boundMoveReason t i dur ( Interval lowerStart upperStart ) compOf carverLitsOf anchorLits = do
+  let ground   = groundAvail t Boxed.Vector.! i
+      window   = cutAfter upperStart ( cutBefore lowerStart ground )
+      holdsDur ivals = any ( \ iv -> measure iv >= dur ) ( toList ( intervals ivals ) )
+  if not ( holdsDur window )
+  then
+    -- The skipped span has no slot long enough for the task even before any
+    -- carving, so ground gaps + the anchor already entail the move: no carver is
+    -- load-bearing. (An exact move's span is a point, so this is the common case,
+    -- and it avoids the O(n) carver walk.) See Note [Bound-move reason completeness].
+    pure anchorLits
+  else do
+    ( _residual, carvers ) <- collectCarversWith compOf ( precedenceAtomsNumTasks ( atoms t ) ) i window
+#ifdef DEBUG
+    -- The anchor + carvers + ground gaps must genuinely leave no feasible slot in
+    -- the skipped span; otherwise the antecedents do not entail the bound and the
+    -- learnt clause would be unsound. See Note [Bound-move reason completeness].
+    when ( holdsDur _residual ) $ do
+      dump <- SAT.dumpSolverState ( theorySolverState t )
+      error $ unlines
+        [ "Schedule.LCG.Theory.boundMoveReason: incomplete reason (does not entail new bound)."
+        , "Cited antecedents leave a feasible slot in the skipped span for task " <> show i <> "."
+        , dump
+        ]
+#endif
+    carverLits <- carverLitsOf carvers
+    pure ( anchorLits ++ carverLits )
 
 -- | Channel a freshly-applied propagation pass: assert its bound tightenings,
 -- then its detected precedences, each with a tight pre-pass reason. Returns the
@@ -1667,35 +1686,56 @@ channelPass t cts deltas = do
         then channelBounds cap rest  -- empty domain: surfaced by the infeasibility conflict
         else do
           let ( estWhy, lctWhy ) = maybe ( IntSet.empty, IntSet.empty ) id ( IntMap.lookup i brs )
-          mb1 <- channelMove cap Earliest i estMv ( IntSet.toList estWhy ) ( capEstPrec cap )
+              ct = IntMap.findWithDefault mempty i ( constraints cts )
+          mb1 <- channelMove cap ct Earliest i estMv ( IntSet.toList estWhy ) ( capEstPrec cap )
           case mb1 of
             Just c  -> pure ( Just c )
             Nothing -> do
-              mb2 <- channelMove cap Latest i lctMv ( IntSet.toList lctWhy ) ( capLctPrec cap )
+              mb2 <- channelMove cap ct Latest i lctMv ( IntSet.toList lctWhy ) ( capLctPrec cap )
               case mb2 of
                 Just c  -> pure ( Just c )
                 Nothing -> channelBounds cap rest
 
     channelMove
-      :: PassCapture t -> Handedness -> Int -> Maybe BoundMove -> [ Int ] -> IntMap [ Lit ]
+      :: PassCapture t -> Constraint t -> Handedness -> Int -> Maybe BoundMove -> [ Int ] -> IntMap [ Lit ]
       -> ST s ( Maybe SAT.Conflict )
-    channelMove _   _    _ Nothing       _      _    = pure Nothing
-    channelMove cap side i ( Just move ) subset prec = do
+    channelMove _   _  _    _ Nothing _ _ = pure Nothing
+    channelMove cap ct side i ( Just _move ) subset prec = do
       -- Read the post-pass task once. It is an immutable snapshot, so both the
       -- propagated literal and the post-pass bounds the deferred reason needs come
       -- from it as pure values (captured like 'cap'); the closure never touches
       -- the live domain. See Note [Deferred reason construction].
       post <- readTask t i
       lit  <- boundLitOfTask t side i post
-      let !newEst = est post
-          !newLst = latestStartFromCompletion ( taskDuration post ) ( lct post )
-          mkAntecedents = do
-            subsetLits <- capSubsetLits t cap subset
-            let precLits = IntMap.findWithDefault [] i prec
-            carvers <- case move of
-              MovedExact  -> pure []
-              MovedJumped -> capCarverLits t cap side i newEst newLst
-            pure ( subsetLits ++ precLits ++ carvers )
+      let
+        dur      = taskDuration post
+        newEst   = est post
+        newLst   = latestStartFromCompletion dur ( lct post )
+        precLits = IntMap.findWithDefault [] i prec
+        -- @i@'s pre-pass bound, the anchor for an availability-only (prune\/
+        -- timetable) move (which imposes no @NotEarlierThan@\/@NotLaterThan@).
+        ( preEst, preLct ) = case IntMap.lookup i ( capBounds cap ) of
+          Just ( eV, lV, _ ) -> ( eV, lV )
+          Nothing            -> ( est post, lct post )
+        -- The anchor (the directly-imposed bound) and its justification, read
+        -- off the emitted constraint; see Note [Bound-move reason completeness].
+        mkAntecedents =
+          case side of
+            Earliest -> do
+              ( anchorLits, lowerStart ) <-
+                case notEarlierThan ct of
+                  Just v  -> do { ss <- capSubsetLits t cap subset; pure ( ss ++ precLits, v ) }
+                  Nothing -> do { pl <- estLitAt t i preEst;        pure ( [ pl ], preEst ) }
+              boundMoveReason t i dur
+                ( Interval lowerStart ( estLowerToStartUpper newEst ) )
+                ( pure . capCompOf cap ) ( capSubsetLits t cap ) anchorLits
+            Latest -> do
+              ( anchorLits, upperStart ) <- case notLaterThan ct of
+                Just v  -> do { ss <- capSubsetLits t cap subset; pure ( ss ++ precLits, v ) }
+                Nothing -> do { pl <- lctLitAt t i preLct;        pure ( [ pl ], latestStartFromCompletion dur preLct ) }
+              boundMoveReason t i dur
+                ( Interval ( startUpperToEstLower newLst ) upperStart )
+                ( pure . capCompOf cap ) ( capSubsetLits t cap ) anchorLits
       assertBatch t lit ( boundReasonLits lit mkAntecedents )
 
 -- | The per-pass channeller wiring 'capturePass' \/ 'channelPass' into

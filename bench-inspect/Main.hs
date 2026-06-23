@@ -18,7 +18,7 @@ module Main ( main ) where
 import Control.Exception
   ( SomeException, evaluate, try )
 import Control.Monad
-  ( forM, forM_ )
+  ( forM, forM_, when )
 import Data.Word
   ( Word64 )
 import GHC.Clock
@@ -250,26 +250,37 @@ lazyReasonReport = do
 -- keep.
 propagatorSubsetExperiment :: IO ()
 propagatorSubsetExperiment = do
-  printf "Propagator-subset experiment (verdict must not change vs full; per-solve timeout 8s):\n\n"
-  forM_ instances \ ( iname, inst ) -> do
+  printf "Propagator-subset experiment\n\n"
+  disagreements <- forM instances \ ( iname, inst ) -> do
     _ <- evaluate ( force inst )
     printf "%s:\n" iname
     printf "  %-12s %-11s %6s %6s %7s %-10s\n"
       ( "config" :: String ) ( "time" :: String )
       ( "dec" :: String ) ( "conf" :: String ) ( "tprop" :: String ) ( "verdict" :: String )
-    forM_ subsets \ ( label, props ) -> do
+    verdicts <- forM subsets \ ( label, props ) -> do
       t0  <- getMonotonicTimeNSec
       mbRes <- timeout 8_000_000 ( evaluate ( force ( lcgSearch @MonitoringOff defaultSearchOptions props inst ) ) )
       t1  <- getMonotonicTimeNSec
       case mbRes of
-        Nothing  -> printf "  %-12s %-11s %6s %6s %7s %-10s\n" label ( "TIMEOUT" :: String ) ( "-" :: String ) ( "-" :: String ) ( "-" :: String ) ( "-" :: String )
+        Nothing  -> do
+          printf "  %-12s %-11s %6s %6s %7s %-10s\n" label ( "TIMEOUT" :: String ) ( "-" :: String ) ( "-" :: String ) ( "-" :: String ) ( "-" :: String )
+          pure Nothing
         Just res -> do
           let st = stats res
           printf "  %-12s %-11s %6d %6d %7d %-10s\n"
             label ( fmtNs ( t1 - t0 ) )
             ( numDecisions st ) ( numConflicts st ) ( numTheoryPropagations st )
             ( verdict res )
+          pure ( Just ( verdict res ) )
+    let seen = [ v | Just v <- verdicts ]
+        disagree = case seen of { ( v0 : _ ) -> not ( all ( == v0 ) seen ); [] -> False }
+    when disagree $
+      printf "  *** VERDICT DISAGREEMENT: %s ***\n" ( show seen )
     putStrLn ""
+    pure ( if disagree then [ iname ] else [] )
+  case concat disagreements of
+    []    -> printf "All propagator subsets agreed on every instance.\n"
+    insts -> error ( "Unsoundness detected: propagator subsets disagreed on: " ++ show insts ++ "." )
   where
     instances :: [ ( String, Instance ) ]
     instances =
@@ -315,11 +326,11 @@ propagatorSubsetExperiment = do
     edge   = [ edgeLastPropagator, edgeFirstPropagator ]
     subsets :: [ ( String, [ Propagator () BenchTime ] ) ]
     subsets =
-      [ ( "full",        basicPropagators )
-      , ( "no-detect",   base ++ notExt ++ edge )
-      , ( "no-edge",     base ++ detect ++ notExt )
-      , ( "no-notExtr",  base ++ detect ++ edge )
-      , ( "base-only",   base )
+      [ ( "full",       basicPropagators )
+      , ( "no-detect",  base ++ notExt ++ edge )
+      , ( "no-edge",    base ++ detect ++ notExt )
+      , ( "no-notExtr", base ++ detect ++ edge )
+      , ( "base-only",  base )
       ]
 
 -- | Sweep the search-option toggles across the representative instance families,
