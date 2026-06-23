@@ -56,7 +56,11 @@ module Schedule.LCG.Theory
 
 -- base
 import Control.Monad
-  ( foldM, replicateM_, when )
+  ( foldM, replicateM_, when
+#ifdef DEBUG
+  , unless
+#endif
+  )
 import Control.Monad.ST
   ( ST )
 import Data.Bits
@@ -172,6 +176,7 @@ import Schedule.Task
   , est, ect, lst, lct )
 import Schedule.Time
   ( EarliestTime, LatestTime, Delta(getDelta), HandedTime(handedTime)
+  , Time(getTime)
   , Handedness(Earliest, Latest)
   )
 import Schedule.Trail
@@ -1887,6 +1892,31 @@ assertBatch t lit reason = do
 -------------------------------------------------------------------------------
 -- Conflict assembly.
 
+#ifdef DEBUG
+-- | Verify a reported overload is genuine: some time window @[a, b)@ is filled by
+-- culprit tasks confined to it (@est ≥ a@, @lct ≤ b@) whose total duration exceeds
+-- @b − a@, so they provably cannot all fit.
+assertValidOverload
+  :: forall mode s task t
+  .  ( Num t, Ord t, Measurable t, Bounded t )
+  => TheoryState mode s task t -> IntSet -> ST s ()
+assertValidOverload t culprit = do
+  rows <- for ( IntSet.toList culprit ) \ c -> do
+    tc <- readTask t c
+    pure ( getTime ( handedTime ( endpoint ( est tc ) ) )
+         , getTime ( handedTime ( endpoint ( lct tc ) ) )
+         , getDelta ( taskDuration tc ) )
+  let does_overload = or
+        [ sum [ d | ( e, l, d ) <- rows, e >= a, l <= b ] > b - a
+        | ( a, _, _ ) <- rows, ( _, b, _ ) <- rows, b > a ]
+  unless does_overload do
+    dump <- SAT.dumpSolverState ( theorySolverState t )
+    error $ unlines
+      [ "Schedule.LCG.Theory.buildInfeasibleConflict: invalid overload."
+      , dump
+      ]
+#endif
+
 -- | Turn a propagator-reported infeasibility into a tight SAT conflict.
 buildInfeasibleConflict
   :: forall mode s task t
@@ -1903,6 +1933,9 @@ buildInfeasibleConflict t = \ case
     -- A conflict clause needs only that its literals are currently false,
     -- so citing the current bounds directly is sound.
     lits <- boundLits t ( IntSet.toList culprit )
+#ifdef DEBUG
+    assertValidOverload t culprit
+#endif
     tickConflict ( monitor t ) "overload"
     recordReasonLen ( monitor t ) ( length lits )
     literalsAsConflict "overload" ( theorySolverState t ) ( map negateLit lits )
