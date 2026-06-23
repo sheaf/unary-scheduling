@@ -194,7 +194,7 @@ lazyReasonReport = do
     t1  <- getMonotonicTimeNSec
     pure ( iname, t1 - t0, rep )
 
-  printf "Lazy-reason utilisation (recorded = deferred theory props; forced = used by 1-UIP/minimise, memoised so at most once):\n\n"
+  printf "Lazy-reason utilisation (recorded = deferred theory props; forced = used by 1-UIP/minimise):\n\n"
   printf "  %-22s %-11s %8s %8s %7s %8s\n"
     ( "instance" :: String ) ( "verdict" :: String )
     ( "recorded" :: String ) ( "forced" :: String ) ( "used%" :: String )
@@ -210,20 +210,25 @@ lazyReasonReport = do
   putStrLn ""
 
   printf "Phase breakdown (%% of instrumented wall-clock).\n"
-  printf "  %-22s %-10s %7s %9s %11s %10s %7s %10s\n"
-    ( "instance" :: String ) ( "time" :: String ) ( "prop%" :: String )
-    ( "·capture%" :: String ) ( "·chanOut%" :: String ) ( "·fixpoint%" :: String )
+  printf "  %-22s %-10s %7s %9s %8s %7s %9s %11s %7s %10s\n"
+    ( "instance" :: String ) ( "time" :: String ) ( "chanIn%" :: String )
+    ( "·prec%" :: String ) ( "·bound%" :: String ) ( "prop%" :: String )
+    ( "·chanOut%" :: String ) ( "·fixpoint%" :: String )
     ( "BCP%" :: String ) ( "analysis%" :: String )
   forM_ results \ ( iname, total, rep ) -> do
     let m       = monitorReport rep
         ph name = fromIntegral ( Map.findWithDefault 0 name ( phaseTime m ) ) :: Double
         pct ns  = if total == 0 then 0 else 100 * ns / fromIntegral total
+        chanIn  = ph "channel-in"
+        chanPre = ph "channel-in/precedence"
+        chanBnd = ph "channel-in/bound"
         prop    = ph "propagators"
         capt    = ph "propagators/capture"
         chanOut = ph "propagators/channel-out"
-    printf "  %-22s %-10s %6.0f%% %8.0f%% %10.0f%% %9.0f%% %6.0f%% %9.0f%%\n"
+    printf "  %-22s %-10s %6.0f%% %7.0f%% %7.0f%% %6.0f%% %8.0f%% %10.0f%% %6.0f%% %9.0f%%\n"
       iname ( fmtNs total )
-      ( pct prop ) ( pct capt ) ( pct chanOut ) ( pct ( prop - capt - chanOut ) )
+      ( pct chanIn ) ( pct chanPre ) ( pct chanBnd )
+      ( pct prop ) ( pct chanOut ) ( pct ( prop - capt - chanOut ) )
       ( pct ( ph "BCP" ) ) ( pct ( ph "analysis" ) )
   putStrLn ""
   where

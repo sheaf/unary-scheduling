@@ -16,7 +16,7 @@ module Schedule.LCG.Atoms
   ( -- * Precedence atoms
     PrecedenceAtoms
   , mkPrecedenceAtoms
-  , numTasks
+  , precedenceAtomsNumTasks
   , numAtoms
   , precLit
   , litPrecedence
@@ -90,8 +90,8 @@ data PrecedenceAtoms = PrecedenceAtoms
   }
 
 -- | Number of tasks the registry covers.
-numTasks :: PrecedenceAtoms -> Int
-numTasks = dim
+precedenceAtomsNumTasks :: PrecedenceAtoms -> Int
+precedenceAtomsNumTasks = dim
 
 -- | Number of precedence atoms (one per unordered task pair).
 numAtoms :: PrecedenceAtoms -> Int

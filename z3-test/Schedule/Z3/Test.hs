@@ -113,7 +113,79 @@ genInstance = do
   pure $ zipWith ( \ i task -> ( task, "task" <> Text.pack ( show i ) ) ) [ 0 :: Int .. ] tasks
 
 --------------------------------------------------------------------------------
+-- A structured regression fixture (needs a longer horizon than 'TestTime').
+
+newtype RehTime = RehTime Int
+  deriving newtype ( Eq, Ord, Num, Real, Measurable )
+
+instance Bounded RehTime where
+  minBound = RehTime 0
+  maxBound = RehTime 128
+
+instance Show RehTime where
+  show ( RehTime t ) = show t
+
+-- | A concrete tight multi-day rehearsal.
+--
+-- Serves as a regression test for an ordering matrix double-write bug.
+rehearsalRegressionInstance :: [ ( Task () RehTime, Text ) ]
+rehearsalRegressionInstance =
+  zipWith ( \ i ( dur, wins ) -> ( mkTask dur wins, "song" <> Text.pack ( show i ) ) )
+    [ 0 :: Int .. ]
+    [ ( 6, [ (18,34), (36,52), (72,88) ] )
+    , ( 7, [ (0,16), (18,34), (36,52), (72,88) ] )
+    , ( 7, [ (0,16), (36,52) ] )
+    , ( 8, [ (54,70) ] )
+    , ( 2, [ (18,34), (36,52), (72,88) ] )
+    , ( 6, [ (0,16), (54,70) ] )
+    , ( 2, [ (72,88) ] )
+    , ( 4, [ (0,16), (54,70) ] )
+    , ( 2, [ (0,16), (36,52) ] )
+    , ( 1, [ (0,16) ] )
+    , ( 3, [ (0,16), (54,70), (72,88) ] )
+    , ( 3, [ (0,16), (36,52), (54,70), (72,88) ] )
+    , ( 1, [ (36,52), (54,70), (72,88) ] )
+    , ( 2, [ (72,88) ] )
+    , ( 5, [ (72,88) ] )
+    , ( 2, [ (0,16), (18,34), (36,52) ] )
+    , ( 7, [ (36,52), (72,88) ] )
+    , ( 8, [ (18,34), (72,88) ] )
+    , ( 4, [ (18,34) ] )
+    , ( 5, [ (36,52) ] )
+    ]
+  where
+    mkTask :: Int -> [ ( Int, Int ) ] -> Task () RehTime
+    mkTask dur wins =
+      Task
+        { taskAvailability = mkIntervals ( Seq.fromList ( map window wins ) )
+        , taskDuration     = Delta ( RehTime dur )
+        , taskInfo         = ()
+        }
+    window :: ( Int, Int ) -> Interval RehTime
+    window ( lo, hi ) =
+      Interval
+        ( Endpoint ( EarliestTime ( Time ( RehTime lo ) ) ) Inclusive )
+        ( Endpoint ( LatestTime   ( Time ( RehTime hi ) ) ) Inclusive )
+
+--------------------------------------------------------------------------------
 -- Properties.
+
+prop_rehearsal_regression :: Property
+prop_rehearsal_regression = withTests 1 $ property do
+  let named = rehearsalRegressionInstance
+  mbStarts <- evalIO ( z3Feasible ( map fst named ) )
+  let res = lcgSearch @MonitoringOff defaultSearchOptions basicPropagators named
+  case ( solution res, mbStarts ) of
+    ( Right _, Just _  ) -> success
+    ( Left _,  Nothing ) -> success
+    ( Left err, Just sts ) -> do
+      annotate "LCG reported infeasible but Z3 found a schedule."
+      annotateShow sts
+      annotate ( Text.unpack err )
+      failure
+    ( Right _, Nothing ) -> do
+      annotate "LCG found a schedule but Z3 reports infeasibility."
+      failure
 
 prop_propagation_sound_vs_z3 :: Property
 prop_propagation_sound_vs_z3 = withTests 1000 $ property do
@@ -216,14 +288,18 @@ tests = testGroup "Differential tests"
       "prop_fine_reaches_fixpoint"
       ( reachesFixpoint basicPropagators )
   , testGroup "confluence"
-      [ testPropertyNamed "core (prune+timetable+overload)"          "confluent_core"        ( confluentOn coreProps )
-      , testPropertyNamed "core + detectable precedences"            "confluent_detectable"  ( confluentOn withDetectableProps )
-      , testPropertyNamed "core + edge finding"                      "confluent_edge"        ( confluentOn withEdgeProps )
-      , testPropertyNamed "all but the precedence matrix"            "confluent_no_matrix"   ( confluentOn withoutMatrixProps )
-      , testPropertyNamed "all propagators (full set)"               "confluent_full"        ( confluentOn basicPropagators )
+      [ testPropertyNamed "core (prune+timetable+overload)" "confluent_core"       ( confluentOn coreProps )
+      , testPropertyNamed "core + detectable precedences"   "confluent_detectable" ( confluentOn withDetectableProps )
+      , testPropertyNamed "core + edge finding"             "confluent_edge"       ( confluentOn withEdgeProps )
+      , testPropertyNamed "all but the precedence matrix"   "confluent_no_matrix"  ( confluentOn withoutMatrixProps )
+      , testPropertyNamed "all propagators (full set)"      "confluent_full"       ( confluentOn basicPropagators )
       ]
   , testPropertyNamed
       "LCG search verdict matches Z3"
       "prop_lcg_matches_z3"
       prop_lcg_matches_z3
+  , testPropertyNamed
+      "LCG vs Z3: tight rehearsal instance"
+      "prop_rehearsal_regression"
+      prop_rehearsal_regression
   ]

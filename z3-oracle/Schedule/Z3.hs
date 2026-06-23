@@ -64,11 +64,11 @@ import Schedule.Monad
 import Schedule.Monitor
   ( Monitor(..) )
 import Schedule.Ordering
-  ( Order(Unknown), readOrdering )
+  ( Order(Unknown), readOrdering, newTransitiveClosureScratch )
 import Schedule.Precedence
   ( addEdge )
 import Schedule.Propagators
-  ( Propagator, propagationLoop, seedAllOf )
+  ( Propagator, propagationLoop, seedAllOf, matrixChanneller )
 import Schedule.Task
   ( Task(..), TaskInfos(..), ImmutableTaskInfos, est, lst )
 import Schedule.Time
@@ -190,8 +190,11 @@ verifyAgainstZ3 propagators namedTasks = do
             for_ chain \ ( a, b ) -> do
               o <- readOrdering orderings a b
               when ( o == Unknown ) ( addEdge trail a b )
-            let allTasks = IntSet.fromList [ 0 .. Boxed.Vector.length taskNames - 1 ]
-            propagationLoop NoMonitoring 1000 trail propagators Nothing ( seedAllOf propagators allTasks )
+            let nbTasks  = Boxed.Vector.length taskNames
+                allTasks = IntSet.fromList [ 0 .. nbTasks - 1 ]
+            scratch <- newTransitiveClosureScratch nbTasks
+            propagationLoop NoMonitoring 1000 trail propagators
+              ( matrixChanneller trail scratch ) ( seedAllOf propagators allTasks )
         -- Tasks whose Z3 start time no longer lies within the tightened window.
         violators :: [ Int ]
         violators =

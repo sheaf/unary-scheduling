@@ -159,7 +159,7 @@ import Schedule.Constraint
   ( Infeasible, renderInfeasible, renderJustifications )
 import Schedule.Propagators
   ( propagateConstraints, propagationLoop, seedAllOf, Propagator(..), basicPropagators
-  , makespan
+  , makespan, matrixChanneller
   )
 import Schedule.Interval
   ( Interval((:<=..<=)), Intervals(..)
@@ -173,7 +173,7 @@ import Schedule.Monad
 import Schedule.Monitor
   ( Monitoring(..), Monitor(..) )
 import Schedule.Ordering
-  ( visualiseEdges )
+  ( visualiseEdges, newTransitiveClosureScratch )
 import Schedule.Precedence
   ( addEdge )
 import Schedule.Task
@@ -306,9 +306,11 @@ scheduleSpreadsheet = do
               runScheduleMonad schedulingTasks
                 ( \ trail -> do
                     for_ chain ( \ ( a, b ) -> addEdge trail a b )
-                    let allTasks = IntSet.fromList [ 0 .. length schedulingTasks - 1 ]
-                    propagationLoop NoMonitoring 1000 trail propagators Nothing
-                      ( seedAllOf propagators allTasks ) )
+                    let nbTasks  = length schedulingTasks
+                        allTasks = IntSet.fromList [ 0 .. nbTasks - 1 ]
+                    scratch <- newTransitiveClosureScratch nbTasks
+                    propagationLoop NoMonitoring 1000 trail propagators
+                      ( matrixChanneller trail scratch ) ( seedAllOf propagators allTasks ) )
             -- Tasks for which the Z3 start no longer lies within the tightened window.
             violators :: [ Text ]
             violators =

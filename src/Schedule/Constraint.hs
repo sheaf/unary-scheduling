@@ -41,10 +41,6 @@ import Data.Sequence
 import qualified Data.Sequence as Seq
   ( singleton )
 
--- lens
-import Control.Lens
-  ( itraverse_ )
-
 -- mtl
 import Control.Monad.Except
   ( MonadError ( throwError ) )
@@ -81,14 +77,14 @@ import Schedule.Interval
   , cutBefore, cutAfter, remove
   )
 import Schedule.Ordering
-  ( addIncidentEdges, CycleInfo(..) )
+  ( CycleInfo(..) )
 import Schedule.Task
   ( Task(..), TaskInfos(..), MutableTaskInfos
   , est, lct, lst, ect
   )
 import Schedule.Trail
   ( Trail
-  , recordSetTask, rankSwapper, orderingCellWriter
+  , recordSetTask, rankSwapper
   , RankKind(..), RankVec(..)
   )
 import Schedule.Time
@@ -485,6 +481,11 @@ tightenMany cts =
 
 --------------------------------------------------------------------------------
 
+-- | Apply a batch of constraints to the task domains, returning how each
+-- task's bounds moved.
+--
+-- This touches task availabilities only; it does not maintain the precedence
+-- matrix (handled separately by the propagation loop's channeller, see 'PassChanneller').
 applyConstraints
   :: ( MonadReader ( MutableTaskInfos s task t ) m
      , MonadError ( Infeasible t ) m
@@ -496,9 +497,8 @@ applyConstraints
   => Trail s task t
   -> Constraints t
   -> m ( IntMap Applied )
-applyConstraints trail ( Constraints { constraints, precedences } ) = do
-  taskInfos@( TaskInfos { orderings } ) <- ask
-  itraverse_ ( uncurry . addIncidentEdges ( orderingCellWriter trail taskInfos ) orderings ) precedences
+applyConstraints trail ( Constraints { constraints } ) = do
+  taskInfos <- ask
   IntMap.traverseWithKey ( applyConstraint trail taskInfos ) constraints
 
 applyConstraint

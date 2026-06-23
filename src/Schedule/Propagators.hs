@@ -7,7 +7,7 @@ module Schedule.Propagators
     Propagator(..), basicPropagators
   , coarsen
   , propagateConstraints, propagationLoop
-  , PassChanneller(..)
+  , PassChanneller(..), matrixChanneller, nullChanneller
     -- * Constructing the initial 'Modifications' seed for 'propagationLoop'.
   , seedAllOf, seedMatrixWatchers
     -- * Local constraint propagators.
@@ -32,8 +32,6 @@ module Schedule.Propagators
 -- base
 import Control.Monad
   ( when, unless, void )
-import Control.Monad.ST
-  ( ST )
 import Data.Coerce
   ( coerce )
 import Data.Functor.Identity
@@ -55,7 +53,7 @@ import Data.Act
 import Data.IntMap.Strict
   ( IntMap )
 import qualified Data.IntMap.Strict as IntMap
-  ( unionWith )
+  ( unionWith, toList )
 import Data.IntSet
   ( IntSet )
 import qualified Data.IntSet as IntSet
@@ -101,7 +99,7 @@ import Control.Monad.State.Strict
 
 -- primitive
 import Control.Monad.Primitive
-  ( PrimMonad(PrimState), stToPrim )
+  ( PrimMonad(PrimState) )
 
 -- text
 import Data.Text
@@ -158,7 +156,11 @@ import Schedule.Monad
 import Schedule.Monitor
   ( Monitor(..), Monitoring(..), MonitorMode(..) )
 import Schedule.Ordering
-  ( Order, readOrdering )
+  ( Order, readOrdering
+  , EdgeOrigin, TransitiveClosureScratch, newTransitiveClosureScratch
+  )
+import Schedule.Precedence
+  ( addMatrixEdge )
 import Schedule.Task
   ( Task(..), TaskInfos(..)
   , ImmutableTaskInfos
@@ -333,9 +335,12 @@ propagateConstraints taskData maxLoopIterations propagators =
     run :: forall s. Trail s task t -> ScheduleMonad s task t ()
     run trail = do
       TaskInfos { taskNames } <- ask
-      let allTasks = IntSet.fromList [ 0 .. Boxed.Vector.length taskNames - 1 ]
-      -- The non-LCG fixpoint path is never instrumented and does no channelling.
-      propagationLoop NoMonitoring maxLoopIterations trail propagators Nothing
+      let
+        nbTasks  = Boxed.Vector.length taskNames
+        allTasks = IntSet.fromList [ 0 .. nbTasks - 1 ]
+      scratch <- newTransitiveClosureScratch nbTasks
+      propagationLoop NoMonitoring maxLoopIterations trail propagators
+        ( matrixChanneller trail scratch )
         ( seedAllOf propagators allTasks )
 
 -- | Seed for 'propagationLoop' that puts the given dirty task set into
@@ -372,20 +377,49 @@ seedMatrixWatchers propagators dirty = DMap.fromList
     matrixWatchers :: [ Text ]
     matrixWatchers = [ "predecessor", "successor" ]
 
--- | A per-pass channeller: a hook the propagation loop invokes around each
--- propagator pass, to promote that pass's inferences (bound tightenings and
--- precedences) to an external store (the SAT trail).
+-- | A description of how we take ownership of the results of running propagators.
+--
+-- In particular, this describes who takes responsibility for updating the
+-- ordering matrix.
 data PassChanneller s task t = PassChanneller
-  { onCapture :: Constraints t -> ST s ()
-    -- ^ Runs /before/ a pass (e.g. to capture inference-time antecedents)
-  , onChannel :: Constraints t -> IntMap Applied -> ST s Bool
-    -- ^ Runs /after/ a pass. Returning 'True' signals a conflict (stopping the loop).
+  { onCapture :: Constraints t -> ScheduleMonad s task t ()
+    -- ^ Runs /before/ a pass mutates the domains (e.g. to capture inference-time
+    -- antecedents).
+  , onChannel :: Constraints t -> IntMap Applied -> ScheduleMonad s task t Bool
+    -- ^ Runs /after/ the pass's domain tightenings are applied: takes ownership
+    -- of the pass's 'Schedule.Constraint.precedences'. Returning 'True' signals a
+    -- conflict (stopping the loop).
+  }
+
+-- | Direct ownership of the ordering matrix.
+matrixChanneller
+  :: Trail s task t
+  -> TransitiveClosureScratch s
+  -> PassChanneller s task t
+matrixChanneller trail scratch = PassChanneller
+  { onCapture = \ _cts -> pure ()
+  , onChannel = \ cts _applied -> do
+      for_ ( IntMap.toList ( precedences cts ) ) \ ( v, ( befores, afters ) ) -> do
+        forOf_ IntSet.members befores \ b -> addMatrixEdge trail scratch noReaction b v
+        forOf_ IntSet.members afters  \ a -> addMatrixEdge trail scratch noReaction v a
+      pure False
+  }
+  where
+    -- Recording the edge in the matrix is the whole job; bound consequences are
+    -- derived by 'precedenceMatrix'.
+    noReaction :: Applicative f => EdgeOrigin -> Int -> Int -> f ()
+    noReaction _ _ _ = pure ()
+
+nullChanneller :: PassChanneller s task t
+nullChanneller = PassChanneller
+  { onCapture = \ _cts        -> pure ()
+  , onChannel = \ _cts _applied -> pure False
   }
 
 {-# SPECIALISE propagationLoop @MonitoringOff NoMonitoring #-}
 
--- | Run the given propagators to a fixpoint (event-driven), channelling each
--- pass's inferences via the optional 'PassChanneller'.
+-- | Run the given propagators to a fixpoint (event-driven), handing each pass's
+-- inferences to the given 'PassChanneller'.
 propagationLoop
   :: forall mode s task t
   .  ( Num t, Measurable t, Bounded t
@@ -397,10 +431,10 @@ propagationLoop
   -> Int
   -> Trail s task t
   -> [ Propagator task t ]
-  -> Maybe ( PassChanneller s task t )  -- ^ optional per-pass channeller (for LCG)
+  -> PassChanneller s task t  -- ^ owns precedence-matrix maintenance for this run
   -> Modifications          -- ^ initial 'Modifications' used to kick off subscribed propagators
   -> ScheduleMonad s task t ()
-propagationLoop mon maxRounds trail propagators mbChan seed = do
+propagationLoop mon maxRounds trail propagators chan seed = do
   modify' ( set ( field' @"tasksModified" ) seed )
   -- Apply any constraints already posted (e.g. by a search decision) before the
   -- first propagator runs, so it sees the tightened domains.
@@ -454,12 +488,10 @@ propagationLoop mon maxRounds trail propagators mbChan seed = do
         -- Capture the pass's inference-time antecedents before it mutates the
         -- domains (so the reasons cite the bounds the propagator actually read,
         -- which are already on the trail).
-        for_ mbChan \ chan -> stToPrim ( onCapture chan cts )
+        onCapture chan cts
         applied <- applyConstraints trail cts
-        -- Channel the pass to the SAT trail with those pre-pass reasons.
-        stop <- case mbChan of
-          Nothing   -> pure False
-          Just chan -> stToPrim ( onChannel chan cts applied )
+        -- Hand the pass's precedences to the channeller (the matrix owner).
+        stop <- onChannel chan cts applied
         let
           -- How each task's bounds moved (exact vs jumped, or not at all).
           moves :: IntMap ( Maybe BoundMove, Maybe BoundMove )

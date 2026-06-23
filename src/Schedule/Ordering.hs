@@ -6,7 +6,8 @@ module Schedule.Ordering
   ( Order(Order, LessThan, GreaterThan, Unknown, Equal)
   , OrderingMatrix(..), upperTriangular
   , newOrderingMatrix
-  , addIncidentEdges, addIncidentEdgesTransitively
+  , TransitiveClosureScratch, newTransitiveClosureScratch
+  , insertEdgeTransitively
   , EdgeOrigin(..), CycleInfo(..)
   , readOrdering
 #ifdef VIZ
@@ -17,19 +18,13 @@ module Schedule.Ordering
 
 -- base
 import Control.Monad
-  ( when, unless )
+  ( when )
 import Data.Bits
   ( shiftR )
-import Data.Coerce
-  ( coerce )
 import Data.Foldable
   ( for_ )
 import Data.Functor
   ( (<&>) )
-import Data.Monoid
-  ( Any(..), Ap(..) )
-import Data.Traversable
-  ( for )
 import GHC.Generics
   ( Generic )
 
@@ -37,21 +32,9 @@ import GHC.Generics
 import Data.Bit
   ( Bit (..) )
 
--- containers
-import Data.IntSet
-  ( IntSet )
-import qualified Data.IntSet as IntSet
-  ( member, toList )
-
 -- deepseq
 import Control.DeepSeq
   ( NFData )
-
--- lens
-import Control.Lens.Fold
-  ( foldMapOf, forOf_ )
-import qualified Data.IntSet.Lens as IntSet
-  ( members )
 
 -- mtl
 import Control.Monad.Except
@@ -75,12 +58,10 @@ import qualified Data.Vector.Unboxed as Vector
   ( Unbox )
 import qualified Data.Vector.Unboxed as Unboxed
   ( Vector )
-import qualified Data.Vector.Unboxed as Unboxed.Vector
-  ( fromList, (!) )
 import qualified Data.Vector.Unboxed.Mutable as Unboxed
   ( MVector )
 import qualified Data.Vector.Unboxed.Mutable as Unboxed.MVector
-  ( unsafeNew, unsafeWrite )
+  ( unsafeNew, unsafeWrite, unsafeRead )
 
 #ifdef VIZ
 -- algebraic-graphs
@@ -213,158 +194,114 @@ readOrdering ( OrderingMatrix { dim, orderingMatrix } ) i j = case compare i j o
   LT -> unsafeIndex orderingMatrix ( upperTriangular dim i j )
   GT -> unsafeIndex orderingMatrix ( upperTriangular dim j i ) <&> reverseOrder
 
--- | Mutate edge in an ordering matrix.
-modify'Ordering
-  :: ( PrimMonad m, s ~ PrimState m )
-  => ( Int -> Order -> m () ) -- ^ physical cell write
-  -> OrderingMatrix ( Unboxed.MVector s ) -> ( Order -> Order ) -> Int -> Int -> m ()
-modify'Ordering writeCell mat f i j = do
-  o <- readOrdering mat i j
-  let
-    !o' = f o
-  -- Only write when the cell actually changes, to avoid bloating the trail
-  -- with no-ops.
-  when ( o' /= o ) $
-    writeOrdering writeCell mat o' i j
+-- | Reusable scratch buffer for 'insertEdgeTransitively'.
+newtype TransitiveClosureScratch s = TransitiveClosureScratch ( Unboxed.MVector s Int )
 
--- | Add edges incident to a given vertex (without computing a transitive closure).
-addIncidentEdges
-  :: ( PrimMonad m, s ~ PrimState m )
-  => ( Int -> Order -> m () ) -- ^ Physical cell write.
-  -> OrderingMatrix ( Unboxed.MVector s )
-  -> Int    -- ^ Fixed incidence vertex.
-  -> IntSet -- ^ New predecessors to the given vertex.
-  -> IntSet -- ^ New successors to the given vertex.
-  -> m ()
-addIncidentEdges writeCell mat v befores afters = do
-  forOf_ IntSet.members befores ( modify'Ordering writeCell mat ( GreaterThan \/ ) v )
-  forOf_ IntSet.members afters  ( modify'Ordering writeCell mat ( LessThan    \/ ) v )
+newTransitiveClosureScratch
+  :: ( PrimMonad m, PrimState m ~ s )
+  => Int -- ^ ordering matrix dimension
+  -> m ( TransitiveClosureScratch s )
+newTransitiveClosureScratch dim =
+  TransitiveClosureScratch <$> Unboxed.MVector.unsafeNew dim
 
--- | Whether a new edge was directly asserted (one of the seed edges of the
--- King–Sagert call) or computed by transitive closure.
+-- | Whether a newly-added edge was the directly-inserted edge or was computed by
+-- transitive closure.
 data EdgeOrigin
-  = -- | One of the directly-added edges incident to the central vertex.
+  = -- | The directly-inserted edge @u → w@.
     SeedEdge
   | -- | A transitively-derived edge. The carried 'Int' is the witness
     -- vertex @u@ such that the edge follows from @i → u@ and @u → j@.
     DerivedEdge !Int
   deriving stock ( Eq, Show )
 
--- | A cycle detected during the transitive-closure update.
---
--- All cycles pass through the central vertex @v@ of the call.
+-- | A cycle closed by inserting an edge @u → w@ into the precedence graph.
 data CycleInfo
-  = -- | Vertex @i@ became both a predecessor and a successor of @v@: the
-    -- cycle is @i → v → i@.
+  = -- | The inserted edge made vertex @i@ both a predecessor and a successor of
+    -- the head @w@: the cycle is @i → w → i@.
     SelfCycle !Int
-  | -- | Vertices @i@ and @j@ became bidirectionally connected via @v@:
-    -- the cycle threads @i → v → j → v → i@.
+  | -- | The inserted edge connected @i → j@ while @j → i@ already held: the
+    -- cycle is @i → j → i@.
     DoubleCycle !Int !Int
   deriving stock ( Eq, Show )
 
--- | King–Sagert insertion algorithm: add edges incident to a given vertex,
--- and compute the transitive closure.
-addIncidentEdgesTransitively
+-- | Whether @i@ precedes @j@, given their stored 'Order' (its first bit).
+isBefore :: Order -> Bool
+isBefore ( Order ( Bit lt, _ ) ) = lt
+
+-- | Insert a (non-self) edge into a transitively-closed, acyclic ordering matrix.
+--
+-- Uses Italiano's insertion-only transitive closure algorithm.
+insertEdgeTransitively
   :: forall m e s
   .  ( MonadError e m
      , PrimMonad m, s ~ PrimState m
      )
-  => ( Int -> Order -> m () )             -- ^ Physical cell write.
-  -> ( EdgeOrigin -> Int -> Int -> m () ) -- ^ Propagate a new edge @i → j@.
-  -> ( CycleInfo -> e )                   -- ^ Error to raise when a cycle is detected.
+  => TransitiveClosureScratch s           -- ^ scratch space
+  -> ( Int -> Order -> m () )             -- ^ trailed physical cell write
+  -> ( EdgeOrigin -> Int -> Int -> m () ) -- ^ new-edge notifiy action
+  -> ( CycleInfo -> e )                   -- ^ cycle error
   -> OrderingMatrix ( Unboxed.MVector s )
-  -> Int    -- ^ Fixed incidence vertex @v@.
-  -> IntSet -- ^ New predecessors of @v@.
-  -> IntSet -- ^ New successors of @v@.
+  -> Int -- ^ @u@: tail of the inserted edge (the new predecessor)
+  -> Int -- ^ @w@: head of the inserted edge (the new successor)
   -> m ()
-addIncidentEdgesTransitively writeCell onNewEdge cycleError mat@( OrderingMatrix { dim } ) v befores afters = do
-  -- Step 1: tally the new connections around vertex 'v' (predecessors and
-  -- successors reachable through a single new edge incident to 'v').
+insertEdgeTransitively ( TransitiveClosureScratch succBuf ) writeCell onNewEdge cycleError mat@( OrderingMatrix { dim } ) u w = do
+  -- This insertion only adds predecessors of 'w', so the successors of 'w' are
+  -- fixed: materialise succ(w) = { j : w → j } once and reuse it for every
+  -- new predecessor of 'w'.
+  nSucc <- collectSuccessors 0 0
+  let
+    -- Visit every vertex 'i' that newly reaches 'w'.
+    visit :: Int -> m ()
+    visit i
+      | i >= dim  = pure ()
+      | i == w    = visit ( i + 1 )
+      | otherwise = do
+          reachesU <- if i == u then pure True else isBefore <$> readOrdering mat i u
+          if not reachesU
+          then visit ( i + 1 )
+          else do
+            iw <- readOrdering mat i w
+            if isBefore iw
+            -- 'i' already precedes 'w', so the closure already holds every
+            -- through-w edge from 'i': nothing new here.
+            then visit ( i + 1 )
+            else do
+              let iw' = iw \/ LessThan
+              -- w → i was present, so i → w closes the 2-cycle i ↔ w.
+              when ( iw' == Equal ) $ throwError ( cycleError ( SelfCycle i ) )
+              writeOrdering writeCell mat iw' i w
+              onNewEdge ( if i == u then SeedEdge else DerivedEdge u ) i w
+              closeThrough i 0
+              visit ( i + 1 )
 
-  -- TODO: allocates a fresh length-'dim' vector on every call (i.e. per
-  -- channeled edge). A reusable scratch buffer would avoid the churn.
-  new <- Unboxed.Vector.fromList <$>
-    for [ 0 .. dim - 1 ] \ i ->
-      if i == v
-      then pure Unknown
-      else getAp do
-        let
-        -- New predecessors of 'v' (can reach 'v' from 'i' by making use of a new edge ending at 'v').
-        Any bef <- foldMapOf IntSet.members ( \ u -> coerce @( m Any ) $ Any . unBit . fst . getOrder <$> readOrdering mat i u ) befores
-        -- New successors of 'v' (can readch 'i' from 'v' by making use of a new edge starting at 'v').
-        Any aft <- foldMapOf IntSet.members ( \ w -> coerce @( m Any ) $ Any . unBit . fst . getOrder <$> readOrdering mat w i ) afters
-        let
-          res :: Order
-          res = Order ( Bit bef, Bit aft )
-        when ( res == Equal ) do
-          coerce @( m () ) $ throwError ( cycleError ( SelfCycle i ) )
-        pure res
-
-  -- Step 2: add the around-'v' edges to the matrix.
-  for_ [ i | i <- [ 0 .. dim - 1 ], i /= v ] \ i -> do
-    let
-      n :: Order
-      n = new Unboxed.Vector.! i
-      Order ( Bit bef_i, Bit aft_i ) = n
-    unless ( n == Unknown ) do
-      c <- readOrdering mat i v
-      let
-        Order ( Bit c_lt, Bit c_gt ) = c
-        !c'                          = c \/ n
-      writeOrdering writeCell mat c' i v
-      -- A through-'v' cycle: 'i' was already a successor of 'v' and is
-      -- now becoming a predecessor (or vice versa).
-      when ( c' == Equal ) $
-        throwError ( cycleError ( SelfCycle i ) )
-      -- Fire 'onNewEdge' for each genuinely-new direction.
-      when ( bef_i && not c_lt ) do
-        origin <- aroundEdgeOrigin i befores ( \ u -> readOrdering mat i u )
-        onNewEdge origin i v
-      when ( aft_i && not c_gt ) do
-        origin <- aroundEdgeOrigin i afters  ( \ w -> readOrdering mat w i )
-        onNewEdge origin v i
-
-  -- Step 3: derive transitive edges.
-  for_ [ ( i, j ) | i <- [ 0 .. dim - 1 ], i /= v, j <- [ i + 1 .. dim - 1 ], j /= v ] \ ( i, j ) -> do
-    c_ij <- readOrdering mat i j
-    Order ( Bit i_lt_v, Bit i_gt_v ) <- readOrdering mat i v
-    Order ( Bit v_lt_j, Bit v_gt_j ) <- readOrdering mat v j
-    let
-      p_ij :: Order
-      p_ij = Order ( Bit ( i_lt_v && v_lt_j ), Bit ( v_gt_j && i_gt_v ) )
-    unless ( p_ij == Unknown ) do
-      let
-        Order ( Bit c_lt, Bit c_gt ) = c_ij
-        res :: Order
-        res = c_ij \/ p_ij
-      writeOrdering writeCell mat res i j
-      if res == Equal
-      then throwError $ cycleError ( DoubleCycle i j )
-      else do
-        -- Propagate only edges that are genuinely new (not already in 'c_ij').
-        when ( i_lt_v && v_lt_j && not c_lt ) do
-          onNewEdge ( DerivedEdge v ) i j
-        when ( v_gt_j && i_gt_v && not c_gt ) do
-          onNewEdge ( DerivedEdge v ) j i
-
+    -- Close i → j for each successor 'j' of 'w' (the through-w edges i → w → j).
+    closeThrough :: Int -> Int -> m ()
+    closeThrough i k
+      | k >= nSucc = pure ()
+      | otherwise  = do
+          j  <- Unboxed.MVector.unsafeRead succBuf k
+          ij <- readOrdering mat i j
+          if isBefore ij
+          then closeThrough i ( k + 1 )
+          else do
+            let ij' = ij \/ LessThan
+            -- j → i was present, so i → j closes the 2-cycle i ↔ j.
+            when ( ij' == Equal ) $ throwError ( cycleError ( DoubleCycle i j ) )
+            writeOrdering writeCell mat ij' i j
+            onNewEdge ( DerivedEdge w ) i j
+            closeThrough i ( k + 1 )
+  visit 0
   where
-    -- Determine the 'EdgeOrigin' of a phase-2 around-'v' edge with endpoint
-    -- @i@: it is 'SeedEdge' iff @i@ is in the input set, and otherwise a
-    -- 'DerivedEdge' witnessed by some @u@ in the set with @check u@
-    -- returning 'LessThan' (or 'Equal') in its first bit.
-    aroundEdgeOrigin :: Int -> IntSet -> ( Int -> m Order ) -> m EdgeOrigin
-    aroundEdgeOrigin i inputs check
-      | IntSet.member i inputs = pure SeedEdge
-      | otherwise              = DerivedEdge <$> findWitness ( IntSet.toList inputs )
-      where
-        findWitness :: [ Int ] -> m Int
-        findWitness [] = error
-          "Schedule.Ordering.addIncidentEdgesTransitively: missing witness for derived around-v edge"
-        findWitness ( u : us ) = do
-          o <- check u
-          if unBit ( fst ( getOrder o ) )
-          then pure u
-          else findWitness us
+    -- Fill 'succBuf' with { j : w → j }, returning the count.
+    collectSuccessors :: Int -> Int -> m Int
+    collectSuccessors j n
+      | j >= dim  = pure n
+      | j == w    = collectSuccessors ( j + 1 ) n
+      | otherwise = do
+          o <- readOrdering mat w j
+          if isBefore o
+          then Unboxed.MVector.unsafeWrite succBuf n j *> collectSuccessors ( j + 1 ) ( n + 1 )
+          else collectSuccessors ( j + 1 ) n
 
 -------------------------------------------------------------------------------
 

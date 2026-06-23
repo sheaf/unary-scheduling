@@ -145,7 +145,7 @@ import Schedule.Interval
   )
 import Schedule.LCG.Atoms
   ( PrecedenceAtoms, mkPrecedenceAtoms, precLit
-  , isPrecedenceVar, numTasks
+  , isPrecedenceVar, precedenceAtomsNumTasks
   , BoundAtoms, newBoundAtoms, internStartUpper
   , boundNeighbours
   , AtomMeaning(..), litMeaning
@@ -156,12 +156,15 @@ import Schedule.Monitor
   ( Monitoring(..), MonitorMode(..), Monitor )
 import Schedule.Ordering
   ( EdgeOrigin(..), CycleInfo
-  , addIncidentEdgesTransitively
+  , TransitiveClosureScratch, newTransitiveClosureScratch, insertEdgeTransitively
   , Order(..), readOrdering
   )
 import Schedule.Propagators
   ( Propagator, propagationLoop, seedAllOf, seedMatrixWatchers
   , PassChanneller(..)
+#ifdef DEBUG
+  , nullChanneller
+#endif
   )
 import Schedule.Task
   ( MutableTaskInfos, TaskInfos(..), Task(..)
@@ -193,6 +196,8 @@ data TheoryState mode s task t = TheoryState
     groundAvail    :: !( Boxed.Vector.Vector ( Intervals t ) )
   , -- | The schedule trail for in-place undo.
     schedTrail     :: !( Trail s task t )
+  , -- | Reusable scratch space for transitive closure computations.
+    transitiveClosureScratch :: !( TransitiveClosureScratch s )
   , -- | Scheduling propagators run on each theory round.
     propagators    :: ![ Propagator task t ]
     -- | Configuration options.
@@ -285,58 +290,47 @@ newTheory
   -> TheoryOptions
   -> ST s ( TheoryState mode s task t )
 newTheory tis props opts = do
-  s     <- SAT.newSolver
-  let nT  = Boxed.Vector.length ( taskNames tis )
-      !nA = ( nT * ( nT - 1 ) ) `shiftR` 1
-  ps    <-
-    if nA == 0
-    then pure ( mkPrecedenceAtoms nT 0 )
+  theorySolverState <- SAT.newSolver
+  let
+    !numTasks = Boxed.Vector.length ( taskNames tis )
+    !numAtoms = ( numTasks * ( numTasks - 1 ) ) `shiftR` 1
+  atoms <-
+    if numAtoms == 0
+    then pure ( mkPrecedenceAtoms numTasks 0 )
     else do
-      v0 <- SAT.newVar s
-      replicateM_ ( nA - 1 ) ( SAT.newVar s )
-      pure ( mkPrecedenceAtoms nT ( varIndex v0 ) )
+      v0 <- SAT.newVar theorySolverState
+      replicateM_ ( numAtoms - 1 ) ( SAT.newVar theorySolverState )
+      pure ( mkPrecedenceAtoms numTasks ( varIndex v0 ) )
   -- Bound atoms occupy variable indices above the fixed precedence block.
-  ba    <- newBoundAtoms nA
-  trail <- newTrail
-  th    <- newMutVar 0
-  lms   <- Growable.new 16
-  ds    <- newMutVar Nothing
-  bd    <- newMutVar IntSet.empty
-  pcap  <- newMutVar emptyPassCapture
-  pconf <- newMutVar Nothing
-  tpc   <- newMutVar 0
-  db    <- newMutVar mempty
-  brat  <- Growable.new 16
-  avgr  <- Growable.new 16
-  pdec  <- newMutVar Nothing
+  boundAtoms               <- newBoundAtoms numAtoms
+  schedTrail               <- newTrail
+  transitiveClosureScratch <- newTransitiveClosureScratch numTasks
+  theoryHead               <- newMutVar 0
+  levelMarks               <- Growable.new 16
+  dirtySeed                <- newMutVar Nothing
+  boundDirty               <- newMutVar IntSet.empty
+  passCapture              <- newMutVar emptyPassCapture
+  pendingConflict          <- newMutVar Nothing
+  theoryPropCount          <- newMutVar 0
+  decisionBounds           <- newMutVar mempty
+  branchRating             <- Growable.new 16
+  avgRating                <- Growable.new 16
+  pendingDecision          <- newMutVar Nothing
   -- Snapshot ground availabilities now, before any propagation mutates them.
-  gav   <- Boxed.Vector.generateM nT \ i ->
-             taskAvailability <$> Boxed.MVector.unsafeRead ( taskAvails tis ) i
-  mon   <- newMonitor @mode
-  let t = TheoryState
-        { theorySolverState = s
-        , atoms             = ps
-        , boundAtoms        = ba
-        , tasks             = tis
-        , groundAvail       = gav
-        , schedTrail        = trail
-        , propagators       = props
-        , theoryOptions     = opts
-        , branchRating      = brat
-        , avgRating         = avgr
-        , pendingDecision   = pdec
-        , decisionBounds    = db
-        , theoryHead        = th
-        , levelMarks        = lms
-        , dirtySeed         = ds
-        , boundDirty        = bd
-        , passCapture       = pcap
-        , pendingConflict   = pconf
-        , theoryPropCount   = tpc
-        , monitor           = mon
+  groundAvail <-
+    Boxed.Vector.generateM numTasks \ i ->
+      taskAvailability <$> Boxed.MVector.unsafeRead ( taskAvails tis ) i
+  monitor <- newMonitor @mode
+  let
+    t =
+      TheoryState
+        { tasks         = tis
+        , propagators   = props
+        , theoryOptions = opts
+        , ..
         }
-  seedInitialBounds t nT
-  when ( useBoundDecisions opts ) ( seedDecisionBounds t nT )
+  seedInitialBounds t numTasks
+  when ( useBoundDecisions opts ) ( seedDecisionBounds t numTasks )
   pure t
 
 -- | Create initial inner-boundary bound atoms for decision making.
@@ -528,7 +522,7 @@ measureSpace
   => TheoryState mode s task t -> ST s Double
 measureSpace t = go 0 0
   where
-    n = numTasks ( atoms t )
+    n = precedenceAtomsNumTasks ( atoms t )
     go :: Int -> Double -> ST s Double
     go !i !acc
       | i >= n    = pure acc
@@ -613,7 +607,7 @@ scanPrecedences
 scanPrecedences t = go 0 1
   where
     ps  = atoms t
-    n   = numTasks ps
+    n   = precedenceAtomsNumTasks ps
     mat = orderings ( tasks t )
     go :: Int -> Int -> Maybe Candidate -> ST s ( Maybe Candidate )
     go i j best
@@ -835,12 +829,15 @@ channelPending t = do
           case meaning of
             Nothing                       -> loop
             Just ( MeansPrecedence p s )  -> do
-              mbConf <- channelLit t p s
+              -- The precedence path runs the O(dim²) transitive-closure
+              -- insertion ('addIncidentEdgesTransitively'); the bound path only
+              -- tightens one domain. Splitting them localises channel-in's cost.
+              mbConf <- withPhaseTiming ( monitor t ) "channel-in/precedence" ( channelLit t p s )
               case mbConf of
                 Just c  -> pure ( Just c )
                 Nothing -> loop
             Just ( MeansBound task thr pol ) -> do
-              mbConf <- channelBound t task thr pol
+              mbConf <- withPhaseTiming ( monitor t ) "channel-in/bound" ( channelBound t task thr pol )
               case mbConf of
                 Just c  -> pure ( Just c )
                 Nothing -> loop
@@ -857,7 +854,7 @@ checkMatrixTrailInvariant
 checkMatrixTrailInvariant t ctx = iterPairs 0 1
   where
     ps     = atoms t
-    nTasks = numTasks ps
+    nTasks = precedenceAtomsNumTasks ps
     mat    = orderings ( tasks t )
     bad :: Int -> Int -> Order -> LBool -> String -> ST s ()
     bad i j o val expected = do
@@ -905,7 +902,7 @@ channelLit t predTask succTask = do
   tickChannelCall ( monitor t )
 #ifdef DEBUG
   let ps = atoms t
-      d = numTasks ps
+      d = precedenceAtomsNumTasks ps
   when ( predTask < 0 || predTask >= d || succTask < 0 || succTask >= d ) $
     error $ "Schedule.LCG.Theory.channelLit: decoded pair=("
          <> show predTask <> "," <> show succTask <> ") out of range; dim="
@@ -914,14 +911,14 @@ channelLit t predTask succTask = do
     error "Schedule.LCG.Theory.channelLit: decoded pair has equal indices"
 #endif
   result <- runExceptT $
-    addIncidentEdgesTransitively
+    insertEdgeTransitively
+      ( transitiveClosureScratch t )
       ( orderingCellWriter ( schedTrail t ) tis )
       onNewEdge
       LiftedCycle
       ( orderings tis )
+      predTask
       succTask
-      ( IntSet.singleton predTask )
-      mempty
   case result of
     Right ()                      -> pure Nothing
     Left ( LiftedCycle _info )    ->
@@ -1069,7 +1066,7 @@ runPropagators t = do
   bDirty  <- readMutVar ( boundDirty t )
   let seed = case mbDirty of
         Nothing -> seedAllOf ( propagators t )
-                     ( IntSet.fromList [ 0 .. numTasks ( atoms t ) - 1 ] )
+                     ( IntSet.fromList [ 0 .. precedenceAtomsNumTasks ( atoms t ) - 1 ] )
         Just precDirty
           | IntSet.null bDirty -> seedMatrixWatchers ( propagators t ) precDirty
           | otherwise          -> seedAllOf ( propagators t ) ( precDirty <> bDirty )
@@ -1084,7 +1081,7 @@ runPropagators t = do
   ( eRes, _finalUpdates ) <- withPhaseTiming ( monitor t ) "propagators" $
     runSchedule ( tasks t )
       ( propagationLoop ( monitor t ) ( maxPropRounds $ theoryOptions t ) ( schedTrail t )
-          ( propagators t ) ( Just ( passChanneller t ) ) seed )
+          ( propagators t ) ( passChanneller t ) seed )
   -- TODO: 'propagationLoop' doesn't properly report 'GiveUp', which means we
   -- currently conflate "fixpoint, consistent" with "gave up early".
   mbChannelConf <- readMutVar ( pendingConflict t )
@@ -1111,10 +1108,10 @@ debugAuditPropagationFixpoint
   .  ( Num t, Measurable t, Bounded t, Show t, Show task, MonitorMode mode )
   => TheoryState mode s task t -> ST s ()
 debugAuditPropagationFixpoint t = do
-  let allTasks = IntSet.fromList [ 0 .. numTasks ( atoms t ) - 1 ]
+  let allTasks = IntSet.fromList [ 0 .. precedenceAtomsNumTasks ( atoms t ) - 1 ]
   ( eRes, updates ) <- runSchedule ( tasks t )
     ( propagationLoop ( monitor t ) ( maxPropRounds $ theoryOptions t ) ( schedTrail t )
-        ( propagators t ) Nothing ( seedAllOf ( propagators t ) allTasks ) )
+        ( propagators t ) nullChanneller ( seedAllOf ( propagators t ) allTasks ) )
   let movedTasks =
         IntMap.keysSet $
           IntMap.filter ( \ ( e, l ) -> isJust e || isJust l ) ( tightenedBounds updates )
@@ -1203,7 +1200,7 @@ assertOnePrecedence t cap a b reasonTasks = do
   if not ok then pure Nothing
   else do
 #ifdef DEBUG
-    let !d = numTasks ( atoms t )
+    let !d = precedenceAtomsNumTasks ( atoms t )
     when ( a < 0 || a >= d || b < 0 || b >= d ) $
       error $ "Schedule.LCG.Theory.assertOnePrecedence: pair=("
            <> show a <> "," <> show b <> ") out of range; dim=" <> show d
@@ -1489,7 +1486,7 @@ jumpCarverLits t side i task = do
   let window = jumpWindow t side i ( est task )
                  ( latestStartFromCompletion ( taskDuration task ) ( lct task ) )
   ( _residual, carvers ) <-
-    collectCarversWith ( fmap compulsoryPart . readTask t ) ( numTasks ( atoms t ) ) i window
+    collectCarversWith ( fmap compulsoryPart . readTask t ) ( precedenceAtomsNumTasks ( atoms t ) ) i window
   boundLits t carvers
 
 -- | Reify and assert task @i@'s current bound on @side@ after a /channel-in/
@@ -1570,7 +1567,7 @@ snapshotBounds t =
           if null ( intervals ( taskAvailability task ) )
           then acc
           else IntMap.insert i ( est task, lct task, compulsoryPart task ) acc
-    ) IntMap.empty [ 0 .. numTasks ( atoms t ) - 1 ]
+    ) IntMap.empty [ 0 .. precedenceAtomsNumTasks ( atoms t ) - 1 ]
 
 -- | A capture of the /current/ state, carrying no responsible subsets or
 -- precedence edges, so a conflict raised from it cites the current atoms
@@ -1636,7 +1633,7 @@ capCarverLits t cap side i newEst newLst = do
       compOf c = pure $ case IntMap.lookup c ( capBounds cap ) of
         Just ( _, _, comp ) -> comp
         Nothing             -> Interval top bottom   -- empty (no compulsory part)
-  ( _residual, carvers ) <- collectCarversWith compOf ( numTasks ( atoms t ) ) i window
+  ( _residual, carvers ) <- collectCarversWith compOf ( precedenceAtomsNumTasks ( atoms t ) ) i window
   capSubsetLits t cap carvers
 
 -- | Channel a freshly-applied propagation pass: assert its bound tightenings,
@@ -1709,13 +1706,15 @@ passChanneller
   .  ( Num t, Measurable t, Bounded t, MonitorMode mode )
   => TheoryState mode s task t -> PassChanneller s task t
 passChanneller t = PassChanneller
-  { onCapture = \ cts -> withPhaseTiming ( monitor t ) "propagators/capture" ( capturePass t cts )
-  , onChannel = \ cts applied -> withPhaseTiming ( monitor t ) "propagators/channel-out" do
-      let deltas = fmap ( \ a -> ( estMove a, lctMove a ) ) applied
-      mbC <- channelPass t cts deltas
-      case mbC of
-        Just c  -> writeMutVar ( pendingConflict t ) ( Just c ) *> pure True
-        Nothing -> pure False
+  { onCapture = \ cts -> stToPrim $
+      withPhaseTiming ( monitor t ) "propagators/capture" ( capturePass t cts )
+  , onChannel = \ cts applied -> stToPrim $
+      withPhaseTiming ( monitor t ) "propagators/channel-out" do
+        let deltas = fmap ( \ a -> ( estMove a, lctMove a ) ) applied
+        mbC <- channelPass t cts deltas
+        case mbC of
+          Just c  -> writeMutVar ( pendingConflict t ) ( Just c ) *> pure True
+          Nothing -> pure False
   }
 
 -------------------------------------------------------------------------------
@@ -1903,7 +1902,7 @@ emptyDomainConflict t cap i lo hi = do
   let dur    = taskDuration task
       lstThr = latestStartFromCompletion dur hi
       window = cutAfter hi ( cutBefore lo ( groundAvail t Boxed.Vector.! i ) )
-  ( residual, carvers ) <- collectCarversWith ( pure . capCompOf cap ) ( numTasks ( atoms t ) ) i window
+  ( residual, carvers ) <- collectCarversWith ( pure . capCompOf cap ) ( precedenceAtomsNumTasks ( atoms t ) ) i window
 #ifdef DEBUG
   -- The crossing bounds plus the carvers must genuinely leave no slot for @i@;
   -- otherwise the reconstruction (and hence the learnt clause) is unsound. With
@@ -1961,7 +1960,7 @@ reconstructCycle t predTask succTask = do
       recordReasonLen ( monitor t ) ( length body )
       literalsAsConflict "cycle" ( theorySolverState t ) body
   where
-    n = numTasks ( atoms t )
+    n = precedenceAtomsNumTasks ( atoms t )
     -- Depth-first search over the /true/ precedence edges from @x@ to
     -- @predTask@, returning the edge literals along a path (acyclic on the
     -- true-edge DAG, so the @visited@ set guarantees termination).
@@ -2017,7 +2016,7 @@ checkCitabilityInvariant
   => TheoryState mode s task t -> String -> ST s ()
 checkCitabilityInvariant t ctx = go 0
   where
-    n = numTasks ( atoms t )
+    n = precedenceAtomsNumTasks ( atoms t )
     go i
       | i >= n    = pure ()
       | otherwise = do
