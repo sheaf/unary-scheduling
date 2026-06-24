@@ -2054,15 +2054,15 @@ reconstructCycle t predTask succTask = do
                 Nothing   -> tryEdges visited x ( y + 1 )
             _     -> tryEdges visited x ( y + 1 )
 
--- | Emit a conflict from its clause body: literals all falsified by the current
--- assignment, whose disjunction is the conflicting clause.
+-- | Create a conflict from its clause body: literals all falsified by the
+-- current assignment. Their disjunction is the conflicting clause.
 --
 -- An empty body is a ground-level inconsistency (the solver is marked unsatisfiable).
 conflictClause
   :: forall mode s task t
   .  MonitorMode mode
   => TheoryState mode s task t
-  -> Text -- ^ label (instrumentation only)
+  -> Text -- ^ label of conflict (for instrumentation only)
   -> [ FalsifiedLit ]
   -> ST s ( Maybe SAT.Conflict )
 conflictClause t label body = do
@@ -2075,9 +2075,11 @@ conflictClause t label body = do
     []       -> SAT.markFalse ( theorySolverState t ) *> pure Nothing
     -- A unit conflict is encoded as 'ConflictBinary x x' (a fake 2-lit clause);
     -- this works because 'analyse' dedups via the 'seen' marker.
-    [ x ]    -> pure ( Just ( SAT.ConflictBinary x x ) )
-    [ a, b ] -> pure ( Just ( SAT.ConflictBinary a b ) )
-    longer   -> Just . SAT.ConflictClause <$> SAT.recordFalsifiedClause ( theorySolverState t ) longer
+    [ x ]    -> pure $ Just $ SAT.ConflictBinary x x
+    [ a, b ] -> pure $ Just $ SAT.ConflictBinary a b
+    longer   ->
+      Just . SAT.ConflictClause <$>
+        SAT.recordFalsifiedClause ( theorySolverState t ) longer
 
 -- | Emit a conflict from its antecedents (premises that cannot jointly hold).
 --
@@ -2086,7 +2088,7 @@ conflictFromAntecedents
   :: forall mode s task t
   .  MonitorMode mode
   => TheoryState mode s task t
-  -> Text -- ^ label (instrumentation only)
+  -> Text -- ^ label of conflict (for instrumentation only)
   -> [ SatisfiedLit ]
   -> ST s ( Maybe SAT.Conflict )
 conflictFromAntecedents t label =

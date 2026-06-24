@@ -834,12 +834,19 @@ tryEnqueue s l rsn = do
 -------------------------------------------------------------------------------
 -- Clause attachment and input.
 
--- | Append a watcher to the watch list of the given literal.
+-- | Register @watcher@ on the /watched literal/ @watched@, so the watcher fires
+-- when @watched@ is falsified.
 pushWatcher
   :: PrimMonad m
-  => ClauseDB ( PrimState m ) -> Lit -> Watcher -> m ()
-pushWatcher cdb l w = do
-  inner <- Growable.read ( watches cdb ) ( litIndex l )
+  => ClauseDB ( PrimState m )
+  -> Lit -- ^ literal to watch; watcher fires when this literal is falsified
+  -> Watcher
+  -> m ()
+pushWatcher cdb watched w = do
+  -- We want to watch the literal being falsified, so the trigger to wake-up
+  -- is when the negated literal is assigned true.
+  let trigger = negateLit watched
+  inner <- Growable.read ( watches cdb ) ( litIndex trigger )
   Growable.push inner w
 
 -- | Register a binary clause @[l, m]@ inline on both watch lists. No
@@ -848,8 +855,8 @@ attachBinary
   :: PrimMonad m
   => ClauseDB ( PrimState m ) -> Lit -> Lit -> m ()
 attachBinary cdb l m = do
-  pushWatcher cdb ( negateLit l ) ( WBinary m )
-  pushWatcher cdb ( negateLit m ) ( WBinary l )
+  pushWatcher cdb l ( WBinary m )
+  pushWatcher cdb m ( WBinary l )
 
 -- | Register a long clause (size @>= 3@) on the watch lists of its first
 -- two literals, using the other watched literal as the blocker hint.
@@ -862,8 +869,8 @@ attachLong cdb cref c
   | otherwise = do
       l0 <- clauseLit c 0
       l1 <- clauseLit c 1
-      pushWatcher cdb ( negateLit l0 ) ( WLong cref l1 )
-      pushWatcher cdb ( negateLit l1 ) ( WLong cref l0 )
+      pushWatcher cdb l0 ( WLong cref l1 )
+      pushWatcher cdb l1 ( WLong cref l0 )
 
 -- | The outcome of posting an input clause.
 data PostResult
@@ -1145,7 +1152,7 @@ handleWatched s cref ( FalsifiedLit falseLit ) c = do
           -- The clause now watches 'other' at position 0 and 'newWatched'
           -- at position 1. Register it on the new watch list with 'other'
           -- as the blocker.
-          pushWatcher ( clauseDB s ) ( negateLit newWatched ) ( WLong cref other )
+          pushWatcher ( clauseDB s ) newWatched ( WLong cref other )
           pure WatchReplaced
         Nothing ->
           case otherV of
@@ -1934,7 +1941,7 @@ forceLazy trail ( Clause.LazyRef i ) = do
   pure ls
 
 -- | Record a long (size @≥ 3@) theory-supplied clause in the clause store
--- without attaching watchers.
+-- (without attaching watchers).
 --
 -- Intended for materialising a theory conflict so that 'analyse' can read
 -- it via 'clauseAt'. Theory conflict clauses are consumed once by 1-UIP
