@@ -49,7 +49,7 @@ import qualified Data.Vector.Primitive.Mutable as PMV
 
 -- unary-scheduling
 import SAT.Base
-  ( Lit, litIndex, litFromIndex )
+  ( Lit, LitOfValue(..), litIndex, litFromIndex )
 
 -------------------------------------------------------------------------------
 -- Clause references.
@@ -193,7 +193,7 @@ data Reason
   -- | Literal that was unit-propagated from a binary clause whose other
   -- literal is given. No clause body is allocated for binary clauses; the
   -- pair @(propagated lit, other)@ /is/ the clause.
-  | RBinary !Lit
+  | RBinary !( LitOfValue False )
   -- | Literal that was unit-propagated from the clause at the given
   -- reference. At the moment of propagation, this clause had all other
   -- literals false.
@@ -246,18 +246,18 @@ instance Prim Reason where
 -- Five constructors need three tag bits; the remaining 61 bits hold the
 -- payload ('Lit' index, 'ClauseRef', or 'LazyRef').
 encodeReason :: Reason -> Int
-encodeReason RFact                         = 0
-encodeReason RDecision                     = 1
-encodeReason ( RBinary lit )               = 2 .|. ( litIndex lit `shiftL` 3 )
-encodeReason ( RClause ( ClauseRef ref ) ) = 3 .|. ( ref `shiftL` 3 )
-encodeReason ( RLazy   ( LazyRef   ref ) ) = 4 .|. ( ref `shiftL` 3 )
+encodeReason RFact                          = 0
+encodeReason RDecision                      = 1
+encodeReason ( RBinary ( LitOfValue lit ) ) = 2 .|. ( litIndex lit `shiftL` 3 )
+encodeReason ( RClause ( ClauseRef ref ) )  = 3 .|. ( ref `shiftL` 3 )
+encodeReason ( RLazy   ( LazyRef   ref ) )  = 4 .|. ( ref `shiftL` 3 )
 
 -- | Inverse of 'encodeReason'.
 decodeReason :: Int -> Reason
 decodeReason w = case w .&. 7 of
   0 -> RFact
   1 -> RDecision
-  2 -> RBinary ( litFromIndex ( w `shiftR` 3 ) )
-  3 -> RClause ( ClauseRef    ( w `shiftR` 3 ) )
-  4 -> RLazy   ( LazyRef      ( w `shiftR` 3 ) )
+  2 -> RBinary ( LitOfValue $ litFromIndex ( w `shiftR` 3 ) )
+  3 -> RClause ( ClauseRef ( w `shiftR` 3 ) )
+  4 -> RLazy   ( LazyRef   ( w `shiftR` 3 ) )
   _ -> error "SAT.Clause.decodeReason: invalid reason tag"

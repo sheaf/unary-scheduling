@@ -145,9 +145,11 @@ import SAT.Base
   , Lit, litIndex, mkLit, litVar, litPolarity, negateLit
   , LBool(..)
   , litValueFromVar
+  , LitOfValue(..)
   )
 import SAT.Clause
-  ( Clause, clauseSize, clauseLit, clauseSwap
+  ( Clause, clauseSize, clauseSwap
+  , clauseLit
   , ClauseRef(..)
   , ClauseStore, newClauseStore
   )
@@ -942,8 +944,10 @@ addBinaryLemma s l m = do
     val_l <- litValue s l
     val_m <- litValue s m
     case (val_l, val_m) of
-      (LFalse, LUndef) -> enqueueUndef s m $ Clause.RBinary (negateLit l)
-      (LUndef, LFalse) -> enqueueUndef s l $ Clause.RBinary (negateLit m)
+      -- 'RBinary' carries the clause's /other/ literal (false here), as in
+      -- 'installLearnt' and as consumed by 'walkUIP'.
+      (LFalse, LUndef) -> enqueueUndef s m $ Clause.RBinary ( FalseLit l )
+      (LUndef, LFalse) -> enqueueUndef s l $ Clause.RBinary ( FalseLit m )
       _                -> pure ()
 
 markFalse :: PrimMonad m => SolverState ( PrimState m ) -> m ()
@@ -1042,14 +1046,16 @@ data WatchOutcome
 propagateLit
   :: forall m
   .  PrimMonad m
-  => SolverState ( PrimState m ) -> Lit -> m ( Maybe Conflict )
+  => SolverState ( PrimState m )
+  -> Lit -- ^ the literal we have just assigned to be true
+  -> m ( Maybe Conflict )
 propagateLit s p = do
   ws <- Growable.read ( watches ( clauseDB s ) ) ( litIndex p )
   total <- Growable.length ws
   loop ws total 0 0
   where
-    falseLit :: Lit
-    falseLit = negateLit p
+    falseLit :: LitOfValue False
+    falseLit = FalseLit $ negateLit p
 
     loop
       :: Growable Primitive.MVector ( PrimState m ) Watcher
@@ -1069,13 +1075,15 @@ propagateLit s p = do
               case v of
                 LTrue  -> loop ws total ( ri + 1 ) ( wi + 1 )
                 LUndef -> do
-                  enqueueUndef s other ( Clause.RBinary p )
+                  -- 'RBinary' carries the clause's other (false) literal, here
+                  -- the just-falsified watched literal 'falseLit'.
+                  enqueueUndef s other ( Clause.RBinary falseLit )
                   loop ws total ( ri + 1 ) ( wi + 1 )
                 LFalse -> do
                   -- Restore unprocessed remainder so the watch invariant
                   -- holds when the search later backjumps and re-runs BCP.
                   compactRest ws total ( ri + 1 ) ( wi + 1 )
-                  pure ( Just ( ConflictBinary falseLit other ) )
+                  pure ( Just ( ConflictBinary ( underlyingLit falseLit ) other ) )
             WLong cref blocker -> do
               -- Try the blocker shortcut before fetching the clause.
               bv <- litValue s blocker
@@ -1112,16 +1120,16 @@ handleWatched
   :: forall m
   .  PrimMonad m
   => SolverState ( PrimState m )
-  -> ClauseRef                   -- ^ reference to the same clause; used for the new watch and the reason
-  -> Lit                    -- ^ the watched literal that just became false
+  -> ClauseRef        -- ^ reference to the same clause; used for the new watch and the reason
+  -> LitOfValue False -- ^ the watched literal that just became false
   -> Clause ( PrimState m )
   -> m WatchOutcome
-handleWatched s cref falseLit c = do
+handleWatched s cref ( LitOfValue @False falseLit ) c = do
   -- Normalise so 'falseLit' sits at position 1 and the other watched
   -- literal at position 0.
   c0 <- clauseLit c 0
   when ( c0 == falseLit ) ( clauseSwap c 0 1 )
-  other <- clauseLit c 0
+  other  <- clauseLit c 0
   otherV <- litValue s other
   case otherV of
     LTrue -> pure ( WatchKept other )
@@ -1211,13 +1219,23 @@ analyse s conflict0 = do
     -- previously-unseen literal at a non-zero level is either tallied on
     -- the path counter (if at the current level) or pushed onto the
     -- learnt-clause scratch buffers (if at a strictly lower level).
-    visitLit :: Int -> Lit -> m ()
-    visitLit skip l = do
+    visitLit :: Int -> LitOfValue False -> m ()
+    visitLit skip ( FalseLit l ) = do
       let i = varIndex ( litVar l )
       Bit marker <- Growable.read seen i
       if marker || i == skip
       then pure ()
       else do
+#ifdef DEBUG
+        -- Check that 'l' is indeed false on the current trail.
+        lv <- litValue s l
+        when ( lv /= LFalse ) $ do
+          dump <- dumpSolverState s
+          error $ unlines
+            [ "Non-false learnt clause literal " <> show lv
+            , dump
+            ]
+#endif
         lvl <- levelOfAssignedVar s ( litVar l )
         if lvl <= GroundLevel
         then pure ()
@@ -1238,7 +1256,7 @@ analyse s conflict0 = do
             | k >= n = pure ()
             | otherwise = do
                 l <- clauseLit c k
-                visitLit skipVi l
+                visitLit skipVi ( FalseLit l )
                 loopK ( k + 1 )
       loopK 0
 
@@ -1246,10 +1264,10 @@ analyse s conflict0 = do
   case conflict0 of
     ConflictClause cref -> do
       c <- clauseAt ( clauseDB s ) cref
-      visit ( -1 ) c
+      visit -1 c
     ConflictBinary l1 l2 -> do
-      visitLit ( -1 ) l1
-      visitLit ( -1 ) l2
+      visitLit -1 $ FalseLit l1
+      visitLit -1 $ FalseLit l2
 
   -- BCP only fires this analysis when the conflict was produced at the
   -- current level, so the conflict source must mention at least one
@@ -1315,7 +1333,6 @@ minimiseLearnt
   => Assignments ( PrimState m )
   -> ClauseDB ( PrimState m )
   -> AnalysisState ( PrimState m )
-
   -> m ()
 minimiseLearnt assig clauseDB
   ( AnalysisState
@@ -1363,11 +1380,13 @@ minimiseLearnt assig clauseDB
     collectAbstraction :: Int -> m Word64
     collectAbstraction n = go 0 0
       where
+        go :: Int -> Word64 -> m Word64
         go !j !acc
           | j >= n    = pure acc
           | otherwise = do
               lvl <- Growable.read analyseOtherLevels j
               go ( j + 1 ) ( acc .|. abstractLevel lvl )
+
     -- A variable's assignment is self-subsumed iff its reason exists and every
     -- /other/ literal of that reason is covered. A decision (no reason) is not.
     reasonRedundant :: Word64 -> Int -> m Bool
@@ -1378,15 +1397,18 @@ minimiseLearnt assig clauseDB
         Clause.RFact         -> pure True   -- a ground fact is unconditionally true
         Clause.RBinary other -> covered abstraction other
         Clause.RClause cref  -> clauseOthersCovered abstraction cref i
-        Clause.RLazy lref    -> forceLazy ( trail assig ) lref >>= othersCovered abstraction i
+        Clause.RLazy lref    ->
+          do { others <- forceLazy ( trail assig ) lref
+             ; othersCovered abstraction i $ map FalseLit others
+             }
 
     -- Whether reason-literal @q@ is covered: at the ground level, already a
     -- clause (or proven-redundant) variable, or recursively self-subsumed.
     -- Memoises both outcomes (success via 'seen', failure via 'minFailed'). A
     -- literal whose level is absent from the clause's @abstraction@ mask cannot
     -- be covered, so it fails fast without forcing its reason.
-    covered :: Word64 -> Lit -> m Bool
-    covered abstraction q = do
+    covered :: Word64 -> LitOfValue False -> m Bool
+    covered abstraction ( FalseLit q ) = do
       let vq = varIndex ( litVar q )
       lvl <- assignmentLevelOfAssignedVar assig ( litVar q )
       if lvl <= GroundLevel
@@ -1420,24 +1442,27 @@ minimiseLearnt assig clauseDB
     clauseOthersCovered :: Word64 -> ClauseRef -> Int -> m Bool
     clauseOthersCovered abstraction cref resolved_var_idx = do
       c <- clauseAt clauseDB cref
-      let sz = clauseSize c
-          go !k
-            | k >= sz   = pure True
-            | otherwise = do
-                l <- clauseLit c k
-                if varIndex ( litVar l ) == resolved_var_idx
-                then go ( k + 1 )
-                else do
-                  cov <- covered abstraction l
-                  if cov then go ( k + 1 ) else pure False
+      let
+        sz = clauseSize c
+        go :: Int -> m Bool
+        go !k
+          | k >= sz   = pure True
+          | otherwise = do
+              l <- clauseLit c k
+              if varIndex ( litVar l ) == resolved_var_idx
+              then go ( k + 1 )
+              else do
+                cov <- covered abstraction ( FalseLit l )
+                if cov then go ( k + 1 ) else pure False
       go 0
 
-    othersCovered :: Word64 -> Int -> [ Lit ] -> m Bool
+    othersCovered :: Word64 -> Int -> [ LitOfValue False ] -> m Bool
     othersCovered abstraction i = go
       where
+        go :: [ LitOfValue False ] -> m Bool
         go [] = pure True
         go ( l : ls )
-          | varIndex ( litVar l ) == i
+          | varIndex ( litVar $ underlyingLit l ) == i
           = go ls
           | otherwise
           = do
@@ -1449,12 +1474,14 @@ minimiseLearnt assig clauseDB
     clearFailed :: m ()
     clearFailed = do
       k <- Growable.length minFailedTouched
-      let loop !i
-            | i >= k = pure ()
-            | otherwise = do
-                var_idx <- Growable.read minFailedTouched i
-                Growable.write minFailed var_idx ( Bit False )
-                loop ( i + 1 )
+      let
+        loop :: Int -> m ()
+        loop !i
+          | i >= k = pure ()
+          | otherwise = do
+              var_idx <- Growable.read minFailedTouched i
+              Growable.write minFailed var_idx ( Bit False )
+              loop ( i + 1 )
       loop 0
 
 {- Note [Citability invariant]
@@ -1485,7 +1512,7 @@ walkUIP
   .  PrimMonad m
   => SolverState ( PrimState m )
   -> ( Int -> Clause ( PrimState m ) -> m () )
-  -> ( Int -> Lit -> m () )
+  -> ( Int -> LitOfValue False -> m () )
   -> TrailPos
   -> m Lit
 walkUIP
@@ -1521,8 +1548,8 @@ walkUIP
                 Clause.RFact ->
                   error "SAT.Solver.analyse: ground-level fact reached during UIP scan"
                 Clause.RBinary other -> do
-                  -- A binary reason [lit, other] resolves on 'lit'; only
-                  -- 'other' needs to be visited.
+                  -- A binary reason is the clause [lit, other], resolved on
+                  -- 'lit'; 'other' is its other (false) literal.
                   visitLit lit_idx other
                   go ( idx - 1 )
                 Clause.RClause cref -> do
@@ -1539,7 +1566,7 @@ walkUIP
                   go ( idx - 1 )
 
     visitLits :: Int -> [ Lit ] -> m ()
-    visitLits skipVi = mapM_ ( visitLit skipVi )
+    visitLits skipVi = mapM_ ( visitLit skipVi . FalseLit )
 
 -- | Pick the highest-level literal from the analyse-side scratch buffers;
 -- it becomes the learnt clause's second watch and its level the backjump
@@ -1824,7 +1851,7 @@ installLearnt s = \case
   [ l ] -> enqueueUndef s l Clause.RFact
   [ l, m ] -> do
     attachBinary ( clauseDB s ) l m
-    enqueueUndef s l ( Clause.RBinary m )
+    enqueueUndef s l ( Clause.RBinary $ FalseLit m )
   ls@( l : _ ) -> do
     ( cref, c ) <- recordClause ( clauseDB s ) True ls
     Growable.push ( learnts ( clauseDB s ) ) cref

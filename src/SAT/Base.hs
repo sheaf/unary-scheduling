@@ -18,6 +18,7 @@ module SAT.Base
   , litVar
   , litPolarity
   , negateLit
+  , LitOfValue(FalseLit, ..)
     -- * Three-valued booleans
   , LBool(LUndef, LTrue, LFalse)
   , liftBool
@@ -29,6 +30,8 @@ module SAT.Base
 -- base
 import Data.Bits
   ( shiftL, shiftR, xor, (.|.), (.&.) )
+import Data.Kind
+  ( Type )
 import Data.Word
   ( Word8 )
 import GHC.Generics
@@ -141,6 +144,18 @@ litPolarity ( Lit l )
 negateLit :: Lit -> Lit
 negateLit ( Lit l ) = Lit ( l `xor` 1 )
 
+-- | A literal with the given value (in a given context).
+type LitOfValue :: Bool -> Type
+newtype LitOfValue v =
+  LitOfValue { underlyingLit :: Lit }
+  -- NB: unsafe, but we can easily audit use-sites.
+    deriving newtype ( Eq, Ord, Show )
+
+pattern FalseLit :: Lit -> LitOfValue False
+pattern FalseLit a = LitOfValue a
+{-# COMPLETE FalseLit #-}
+{-# INLINE FalseLit #-}
+
 -------------------------------------------------------------------------------
 -- Three-valued booleans.
 
@@ -177,6 +192,7 @@ lnot LFalse = LTrue
 
 -- | The value of a literal given the lifted value of its variable.
 litValueFromVar :: Lit -> LBool -> LBool
-litValueFromVar l vb = case litPolarity l of
-  Positive -> vb
-  Negative -> lnot vb
+litValueFromVar l vb =
+  case litPolarity l of
+    Positive -> vb
+    Negative -> lnot vb
