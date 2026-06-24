@@ -22,7 +22,7 @@ import Test.Tasty.Bench
   ( Benchmark, RelStDev(..), bgroup, bench, env, whnf )
 
 -- unary-scheduling
-import SAT
+import SAT.Base
   ( Polarity(..) )
 
 -- unary-scheduling bench suite

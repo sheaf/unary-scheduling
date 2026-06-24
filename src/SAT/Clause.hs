@@ -187,14 +187,10 @@ clauseToList c = go ( clauseSize c - 1 ) []
 -- | Why a literal was added to the trail.
 data Reason
   -- | Literal enforced unconditionally at the ground level (a unit input
-  -- clause, or a unit learnt clause whose backjump level is @0@). No clause
-  -- supports the assignment; level-zero reasons are never resolved against.
+  -- clause, or a unit learnt clause whose backjump level is @0@).
   = RFact
   -- | Literal chosen by the search heuristic (head of a decision level
   -- above the ground level).
-  --
-  -- Also used as the placeholder reason for variables that are currently
-  -- unassigned; the reason is never inspected in that state.
   | RDecision
   -- | Literal that was unit-propagated from a binary clause.
   | RBinary !FalsifiedLit -- ^ the "other" literal

@@ -34,16 +34,18 @@ import qualified Data.Vector as Boxed.Vector
 import qualified Z3.Monad as Z3
 
 -- unary-scheduling
-import SAT
+import SAT.Base
   ( Var(..), Lit, mkLit
   , Polarity(..)
   , LBool(..)
-  , Verdict(..)
-  , SolverState, newSolver, newVar
+  )
+import SAT.Solver
+  ( SolverState, newSolver, newVar
   , addClause, PostResult(..)
   , solveWith, getModel
   , Assignment, assignmentValue
   , SolverOptions(..), defaultOptions
+  , Verdict(..)
   )
 
 --------------------------------------------------------------------------------

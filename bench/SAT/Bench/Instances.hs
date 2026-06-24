@@ -36,11 +36,13 @@ import System.Random
   ( StdGen, mkStdGen, randomR )
 
 -- unary-scheduling
-import SAT
+import SAT.Base
   ( Var(..), Lit, mkLit
   , Polarity(..)
   , LBool(..)
-  , Verdict(..)
+  )
+import SAT.Solver
+  ( Verdict(..)
   , newSolver, newVar
   , addClause, PostResult(..)
   , solveWith, defaultOptions

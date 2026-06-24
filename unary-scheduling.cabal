@@ -121,7 +121,6 @@ library
     , Data.Vector.Generic.Index
     , Data.Vector.PhaseTransition
     , Data.Vector.Ranking
-    , SAT
     , SAT.Base
     , SAT.Clause
     , SAT.Restart
