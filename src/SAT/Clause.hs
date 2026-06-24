@@ -50,7 +50,7 @@ import qualified Data.Vector.Primitive.Mutable as PMV
 
 -- unary-scheduling
 import SAT.Base
-  ( Lit, LitOfValue(FalsifiedLit), FalsifiedLit, litIndex, litFromIndex )
+  ( Lit(..), LitOfValue(..), FalsifiedLit )
 
 -------------------------------------------------------------------------------
 -- Clause references.
@@ -163,7 +163,7 @@ isLearnt :: Clause s -> Bool
 isLearnt = clauseLearnt
 
 clauseLit :: PrimMonad m => Clause ( PrimState m ) -> Int -> m Lit
-clauseLit c i = litFromIndex <$> PMV.unsafeRead ( clauseBody c ) i
+clauseLit c i = Lit <$> PMV.unsafeRead ( clauseBody c ) i
 
 clauseSwap :: PrimMonad m => Clause ( PrimState m ) -> Int -> Int -> m ()
 clauseSwap c = PMV.unsafeSwap ( clauseBody c )
@@ -179,7 +179,7 @@ clauseToList c = go ( clauseSize c - 1 ) []
       | i < 0     = pure acc
       | otherwise = do
           l <- PMV.unsafeRead v i
-          go ( i - 1 ) ( litFromIndex l : acc )
+          go ( i - 1 ) ( Lit l : acc )
 
 -------------------------------------------------------------------------------
 -- Reasons.
@@ -263,7 +263,7 @@ decodeReason w =
   case w .&. 7 of
     0 -> RFact
     1 -> RDecision
-    2 -> RBinary $ FalsifiedLit $ litFromIndex ix
+    2 -> RBinary $ FalsifiedLit $ Lit ix
     3 -> RClause $ ClauseRef ix
     4 -> RLazy   $ LazyRef ix
     _ -> error "SAT.Clause.decodeReason: invalid reason tag"

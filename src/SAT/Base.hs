@@ -5,15 +5,12 @@
 module SAT.Base
   ( -- * Variables
     Var(..)
-  , varIndex
     -- * Polarity
   , Polarity( Positive, Negative )
   , negatePolarity
   , polarityValue
     -- * Literals
-  , Lit
-  , litIndex
-  , litFromIndex
+  , Lit(..)
   , mkLit
   , litVar
   , litPolarity
@@ -69,12 +66,9 @@ import qualified Data.Vector.Unboxed.Mutable as Unboxed
 -- Variables.
 
 -- | A propositional variable, identified by its 0-based index.
-newtype Var = Var Int
+newtype Var = Var { varIndex :: Int }
   deriving stock   ( Eq, Ord, Show, Generic )
   deriving newtype ( NFData, Prim )
-
-varIndex :: Var -> Int
-varIndex ( Var v ) = v
 
 -------------------------------------------------------------------------------
 -- Polarity.
@@ -114,7 +108,12 @@ polarityValue Negative = LFalse
 -- Literals.
 
 -- | A signed propositional variable. Build with 'mkLit'.
-newtype Lit = Lit Int
+newtype Lit =
+  Lit {
+    -- | The literal's nonnegative integer key, in the range
+    -- @[0, 2 * numVars)@.
+    litIndex :: Int
+  }
   deriving stock   ( Eq, Ord, Show, Generic )
   deriving newtype ( NFData, Prim )
 
@@ -123,15 +122,6 @@ newtype instance Unboxed.Vector    Lit = VLit  ( Unboxed.Vector    Int )
 deriving newtype instance Generic.MVector Unboxed.MVector Lit
 deriving newtype instance Generic.Vector Unboxed.Vector Lit
 deriving newtype instance Vector.Unbox Lit
-
--- | The literal's nonnegative integer key, in the range
--- @[0, 2 * numVars)@.
-litIndex :: Lit -> Int
-litIndex ( Lit l ) = l
-
--- | Inverse of 'litIndex'.
-litFromIndex :: Int -> Lit
-litFromIndex = Lit
 
 mkLit :: Var -> Polarity -> Lit
 mkLit ( Var v ) Positive = Lit ( v `shiftL` 1 )
