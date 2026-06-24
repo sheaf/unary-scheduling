@@ -1722,22 +1722,25 @@ channelPass t cts deltas = do
         ( preEst, preLct ) = case IntMap.lookup i ( capBounds cap ) of
           Just ( eV, lV, _ ) -> ( eV, lV )
           Nothing            -> ( est post, lct post )
-        -- The anchor (the directly-imposed bound) and its justification, read
-        -- off the emitted constraint; see Note [Bound-move reason completeness].
+        -- Every bound move is anchored at the task's own prior bound on the moved
+        -- side. See Note [Bound-move reason completeness].
         mkAntecedents =
           case side of
             Earliest -> do
+              selfLit <- estLitAt t i preEst
               ( anchorLits, lowerStart ) <-
                 case notEarlierThan ct of
-                  Just v  -> do { ss <- capSubsetLits t cap subset; pure ( ss ++ precLits, v ) }
-                  Nothing -> do { pl <- estLitAt t i preEst;        pure ( [ pl ], preEst ) }
+                  Just v  -> do { ss <- capSubsetLits t cap subset; pure ( selfLit : ss ++ precLits, v ) }
+                  Nothing -> pure ( [ selfLit ], preEst )
               boundMoveReason t i dur
                 ( Interval lowerStart ( estLowerToStartUpper newEst ) )
                 ( pure . capCompOf cap ) ( capSubsetLits t cap ) anchorLits
             Latest -> do
-              ( anchorLits, upperStart ) <- case notLaterThan ct of
-                Just v  -> do { ss <- capSubsetLits t cap subset; pure ( ss ++ precLits, v ) }
-                Nothing -> do { pl <- lctLitAt t i preLct;        pure ( [ pl ], latestStartFromCompletion dur preLct ) }
+              selfLit <- lctLitAt t i preLct
+              ( anchorLits, upperStart ) <-
+                case notLaterThan ct of
+                  Just v  -> do { ss <- capSubsetLits t cap subset; pure ( selfLit : ss ++ precLits, v ) }
+                  Nothing -> pure ( [ selfLit ], latestStartFromCompletion dur preLct )
               boundMoveReason t i dur
                 ( Interval ( startUpperToEstLower newLst ) upperStart )
                 ( pure . capCompOf cap ) ( capSubsetLits t cap ) anchorLits

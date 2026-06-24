@@ -57,7 +57,7 @@ import qualified Data.IntMap.Strict as IntMap
 import Data.IntSet
   ( IntSet )
 import qualified Data.IntSet as IntSet
-  ( fromList, delete, null, empty )
+  ( fromList, delete, null, empty, singleton )
 import Data.Sequence
   ( Seq )
 import qualified Data.Sequence as Seq
@@ -180,7 +180,7 @@ import Schedule.Tree
   ( newTree, cloneTree, fmapTree
   , Propagatable
     ( overloaded, handedIndex, handedPrecedences, inHandedOrder, propagateLeafChange )
-  , DurationInfo(..), BaseDurationInfo
+  , DurationInfo(..), BaseDurationInfo(..)
   , DurationExtraInfo(..)
   )
 
@@ -764,8 +764,8 @@ overloadCheck = do
     nbTasks = Boxed.Vector.length taskNames
   tree <- newTree @Earliest @(BaseDurationInfo Earliest t) nbTasks
   let
-    go :: Int -> [Int] -> m ()
-    go j seenTaskNbs
+    go :: Int -> m ()
+    go j
       | j >= nbTasks = pure ()
       | otherwise = do
         -- For the overload check, we add tasks by non-decreasing latest completion time.
@@ -774,30 +774,29 @@ overloadCheck = do
         let
           nodeInfo :: BaseDurationInfo Earliest t
           nodeInfo =
-            DurationInfo
-              { subsetInnerTime = ect task
-              , totalDuration   = taskDuration task
+            BaseDurationInfo
+              { baseInnerTime     = ect task
+              , baseWitness       = IntSet.singleton taskNb
+              , baseTotalDuration = taskDuration task
+              , baseLeaves        = IntSet.singleton taskNb
               }
-        estimatedECT <-
-          subsetInnerTime <$> propagateLeafChange tree nodeInfo allTasks taskNb
+        treeInfo <- propagateLeafChange tree nodeInfo allTasks taskNb
         let
+          estimatedECT :: Endpoint (EarliestTime t)
+          estimatedECT = baseInnerTime treeInfo
           currentLCT :: Endpoint (LatestTime t)
           currentLCT = lct task
-        -- When the unary resource is overloaded, throw to end propagation.
         when ( overloaded estimatedECT currentLCT ) do
-          let
-            culprit :: IntSet
-            culprit = IntSet.fromList ( taskNb : seenTaskNbs )
           throwError $ Overloaded
             { bindingTask = taskNb
             , bindingLCT  = currentLCT
             , subsetECT   = estimatedECT
-            , culprit     = culprit
+            , culprit     = baseWitness treeInfo
             }
 
-        go (j+1) (taskNb:seenTaskNbs)
+        go (j+1)
 
-  go 0 []
+  go 0
 
 -- | Computes constraints deduced from detectable precedences.
 --
@@ -865,9 +864,11 @@ detectablePrecedences = do
         let
           nodeInfo :: BaseDurationInfo h t
           nodeInfo =
-            DurationInfo
-              { subsetInnerTime = pickEndpoint @h @Inner otherTask
-              , totalDuration   = taskDuration otherTask
+            BaseDurationInfo
+              { baseInnerTime     = pickEndpoint @h @Inner otherTask
+              , baseWitness       = IntSet.singleton otherTaskNb
+              , baseTotalDuration = taskDuration otherTask
+              , baseLeaves        = IntSet.singleton otherTaskNb
               }
         void $ propagateLeafChange tree nodeInfo allTasks otherTaskNb
       let
@@ -894,7 +895,7 @@ detectablePrecedences = do
         -- Compute the estimated earliest completion time / latest start time
         -- from the subset excluding the current task.
         excludeCurrentTaskSubsetInnerTime
-          <- subsetInnerTime <$> propagateLeafChange clone mempty allTasks taskNb
+          <- baseInnerTime <$> propagateLeafChange clone mempty allTasks taskNb
         let
           currentOuterTime :: Endpoint ( HandedTime h t )
           currentOuterTime = pickEndpoint @h @Outer currentTask
@@ -985,7 +986,7 @@ notExtremal = do
         -- TODO: implement the optimisation from the paper that computes
         -- a constraint relative to the secondary task before inserting it in the Theta-tree.
         excludeCurrentTaskSubsetInnerTime
-          <- subsetInnerTime <$> propagateLeafChange clone mempty allTasks currentTaskNb
+          <- baseInnerTime <$> propagateLeafChange clone mempty allTasks currentTaskNb
         relevantTask <- taskAvails `unsafeIndex` relevantTaskNb
         let
           associatedOtherInnerTime :: Endpoint ( HandedTime oh t )
@@ -1035,9 +1036,11 @@ notExtremal = do
           let
             nodeInfo :: BaseDurationInfo h t
             nodeInfo =
-              DurationInfo
-                { subsetInnerTime = pickEndpoint @h @Inner otherTask'
-                , totalDuration   = taskDuration otherTask'
+              BaseDurationInfo
+                { baseInnerTime     = pickEndpoint @h @Inner otherTask'
+                , baseWitness       = IntSet.singleton otherTaskNb'
+                , baseTotalDuration = taskDuration otherTask'
+                , baseLeaves        = IntSet.singleton otherTaskNb'
                 }
           void $ propagateLeafChange tree nodeInfo allTasks otherTaskNb'
           innerLoop currentOtherOuterTime j' ( otherTaskNb' : currentSubset )
@@ -1050,9 +1053,11 @@ notExtremal = do
   let
     nodeInfo :: BaseDurationInfo h t
     nodeInfo =
-      DurationInfo
-        { subsetInnerTime = pickEndpoint @h @Inner firstTask
-        , totalDuration   = taskDuration firstTask
+      BaseDurationInfo
+        { baseInnerTime     = pickEndpoint @h @Inner firstTask
+        , baseWitness       = IntSet.singleton firstTaskNb
+        , baseTotalDuration = taskDuration firstTask
+        , baseLeaves        = IntSet.singleton firstTaskNb
         }
   void $ propagateLeafChange tree nodeInfo allTasks firstTaskNb
 
@@ -1099,9 +1104,11 @@ edgeFinding = do
     let
       nodeInfo :: BaseDurationInfo h t
       nodeInfo =
-        DurationInfo
-          { subsetInnerTime = pickEndpoint @h @Inner task
-          , totalDuration   = taskDuration task
+        BaseDurationInfo
+          { baseInnerTime     = pickEndpoint @h @Inner task
+          , baseWitness       = IntSet.singleton taskNb
+          , baseTotalDuration = taskDuration task
+          , baseLeaves        = IntSet.singleton taskNb
           }
     void $ propagateLeafChange startingTree nodeInfo allTasks taskNb
   -- Convert the task tree to a coloured task tree, starting off with no coloured nodes.
@@ -1136,7 +1143,7 @@ edgeFinding = do
         j' = j - 1
 
       DurationExtraInfo
-        { baseDurationInfo  = DurationInfo { subsetInnerTime = currentSubsetInnerTime      }
+        { baseDurationInfo  = BaseDurationInfo { baseInnerTime = currentSubsetInnerTime }
         , extraDurationInfo = DurationInfo { subsetInnerTime = currentSubsetExtraInnerTime }
         } <- propagateLeafChange tree colouredNodeInfo allTasks taskNb
 
@@ -1229,18 +1236,22 @@ makespan label taskNbs mkspans = do
       let
         infoECT :: BaseDurationInfo Earliest t
         infoECT =
-          DurationInfo
-            { subsetInnerTime = pickEndpoint @Earliest @Inner task
-            , totalDuration   = taskDuration task
+          BaseDurationInfo
+            { baseInnerTime     = pickEndpoint @Earliest @Inner task
+            , baseWitness       = IntSet.singleton taskNb
+            , baseTotalDuration = taskDuration task
+            , baseLeaves        = IntSet.singleton taskNb
             }
         infoLST :: BaseDurationInfo Latest t
         infoLST =
-          DurationInfo
-            { subsetInnerTime = pickEndpoint @Latest   @Inner task
-            , totalDuration   = taskDuration task
+          BaseDurationInfo
+            { baseInnerTime     = pickEndpoint @Latest   @Inner task
+            , baseWitness       = IntSet.singleton taskNb
+            , baseTotalDuration = taskDuration task
+            , baseLeaves        = IntSet.singleton taskNb
             }
-      subsetECT <- lift $ subsetInnerTime <$> propagateLeafChange @_ @m treeECT infoECT allTasks taskNb
-      subsetLST <- lift $ subsetInnerTime <$> propagateLeafChange @_ @m treeLST infoLST allTasks taskNb
+      subsetECT <- lift $ baseInnerTime <$> propagateLeafChange @_ @m treeECT infoECT allTasks taskNb
+      subsetLST <- lift $ baseInnerTime <$> propagateLeafChange @_ @m treeLST infoLST allTasks taskNb
       put ( subsetECT, subsetLST )
 
   -- For each makespan constraint, use the computed estimates of the subset ECT and LST

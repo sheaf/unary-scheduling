@@ -10,7 +10,7 @@ module Schedule.Tree
   , visualiseTree
 #endif
   , Propagatable(..)
-  , DurationInfo(..), BaseDurationInfo
+  , DurationInfo(..), BaseDurationInfo(..)
   , DurationExtraInfo(..)
   )
   where
@@ -42,6 +42,8 @@ import Data.Act
 -- containers
 import Data.IntSet
   ( IntSet )
+import qualified Data.IntSet as IntSet
+  ( empty )
 import qualified Data.Tree as Rose
   ( Tree(..) )
 
@@ -68,7 +70,7 @@ import qualified Data.Tree.View as TreeView
 
 -- unary-scheduling
 import Data.Lattice
-  ( Lattice((/\)), BoundedLattice(top)
+  ( BoundedLattice(top)
   , TotallyOrderedLattice((/.\))
   )
 import Data.Vector.Generic.Index
@@ -317,18 +319,32 @@ type family Apply ( p :: Parameter ) ( a :: Type ) :: Type where
 ---------------------------------------------
 -- Simple task tree.
 
--- | Estimation of earliest completion time / latest start time.
+-- | Estimation of earliest completion time / latest start time, together
+-- with a witness (subset of leaves responsible for the estimate).
+data BaseDurationInfo h t = BaseDurationInfo
+  { baseInnerTime     :: !(Endpoint (HandedTime h t))
+    -- ^ estimated ECT/LST
+  , baseWitness       :: !IntSet
+    -- ^ the leaves responsible for 'baseInnerTime' (its critical prefix Ω)
+  , baseTotalDuration :: !(Delta t)
+    -- ^ total duration of every leaf in the subtree
+  , baseLeaves        :: !IntSet
+    -- ^ every leaf in the subtree
+  }
+
+deriving stock instance   Eq t                              => Eq   ( BaseDurationInfo h t )
+deriving stock instance ( Show t, Show ( HandedTime h t ) ) => Show ( BaseDurationInfo h t )
+
+-- | Estimation of earliest completion time / latest start time, with an optional
+-- extra (coloured) task; used only as the @extraDurationInfo@ of the coloured
+-- edge-finding tree (see 'DurationExtraInfo').
 data DurationInfo p h t
   = DurationInfo
   { subsetInnerTime :: !(Apply p (Endpoint (HandedTime h t))) -- Estimated earliest completion time / latest start time.
   , totalDuration   :: !(Apply p (Delta t))
   }
 
-type BaseDurationInfo = DurationInfo Normal
-
-deriving stock instance   Eq t         => Eq ( DurationInfo Normal            h t )
 deriving stock instance ( Eq t, Eq l ) => Eq ( DurationInfo (MaybeLabelled l) h t )
-deriving stock instance ( Show t, Show ( HandedTime h t )         ) => Show ( DurationInfo Normal              h t )
 deriving stock instance ( Show t, Show ( HandedTime h t ), Show l ) => Show ( DurationInfo ( MaybeLabelled l ) h t )
 
 ---------------------------------------------
@@ -337,7 +353,7 @@ deriving stock instance ( Show t, Show ( HandedTime h t ), Show l ) => Show ( Du
 -- | Estimate of earliest completion time / latest start time, with extra tasks (coloured tasks).
 data DurationExtraInfo h t r
   = DurationExtraInfo
-  {  baseDurationInfo :: !(DurationInfo Normal            h t)
+  {  baseDurationInfo :: !(BaseDurationInfo               h t)
   , extraDurationInfo :: !(DurationInfo (MaybeLabelled r) h t)
   }
   deriving stock Eq
@@ -352,25 +368,35 @@ deriving stock instance ( Show t, Show (HandedTime h t ), Show r ) => Show ( Dur
 ---------------------------------------------
 -- Simple task tree.
 
-instance ( Lattice ( Endpoint ( HandedTime h t ) )
+instance ( Ord t
+         , TotallyOrderedLattice ( Endpoint ( HandedTime h t ) )
          , Act ( Delta t ) ( HandedTime h t )
          )
-      => Semigroup ( DurationInfo Normal h t )
+      => Semigroup ( BaseDurationInfo h t )
       where
-  (<>)
-    ( DurationInfo { subsetInnerTime = timeL, totalDuration = durL } )
-    ( DurationInfo { subsetInnerTime = timeR, totalDuration = durR } )
-    = DurationInfo
-      { subsetInnerTime = ( durR • timeL ) /\ timeR
-      -- ect = max ( ectL + durR ) ectR
-      -- lst = min ( lstL - durR ) lstR
-      , totalDuration   = durL <> durR
-      }
+  BaseDurationInfo timeL rL durL leavesL <> BaseDurationInfo timeR rR durR leavesR =
+    case Arg ( durR • timeL ) ( rL <> leavesR ) /.\ Arg timeR rR of
+      Arg time witness ->
+        BaseDurationInfo
+          { baseInnerTime     = time
+          , baseWitness       = witness
+          , baseTotalDuration = durL <> durR
+          , baseLeaves        = leavesL <> leavesR
+          }
 
-instance ( Num t, BoundedLattice ( Endpoint ( HandedTime h t ) ), Act ( Delta t ) ( HandedTime h t ) )
-      => Monoid ( DurationInfo Normal h t )
+instance ( Num t, Ord t
+         , BoundedLattice ( Endpoint ( HandedTime h t ) )
+         , TotallyOrderedLattice ( Endpoint ( HandedTime h t ) )
+         , Act ( Delta t ) ( HandedTime h t )
+         )
+      => Monoid ( BaseDurationInfo h t )
       where
-  mempty = DurationInfo { subsetInnerTime = top, totalDuration = mempty }
+  mempty = BaseDurationInfo
+    { baseInnerTime     = top
+    , baseWitness       = IntSet.empty
+    , baseTotalDuration = mempty
+    , baseLeaves        = IntSet.empty
+    }
 
 ---------------------------------------------
 -- Coloured task tree.
@@ -393,12 +419,12 @@ instance ( Num t, Ord t
       where
   (<>)
     ( DurationExtraInfo
-      { baseDurationInfo  = baseInfoL@DurationInfo { totalDuration =  baseDurationL, subsetInnerTime =  baseTimeL }
+      { baseDurationInfo  = baseInfoL@BaseDurationInfo { baseTotalDuration =  baseDurationL, baseInnerTime =  baseTimeL }
       , extraDurationInfo = mbExtraInfoL
       }
     )
     ( DurationExtraInfo
-      { baseDurationInfo  = baseInfoR@DurationInfo { totalDuration =  baseDurationR }
+      { baseDurationInfo  = baseInfoR@BaseDurationInfo { baseTotalDuration =  baseDurationR }
       , extraDurationInfo = mbExtraInfoR
       }
     )

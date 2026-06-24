@@ -18,12 +18,14 @@ import qualified Data.Text as Text
 -- base
 import Control.Monad
   ( when )
+import Data.Coerce
+  ( Coercible )
 import Data.Foldable
   ( toList )
 
 -- hedgehog
 import Hedgehog
-  ( Gen, Property
+  ( Gen, Property, PropertyT
   , (===)
   , annotate, annotateShow, evalIO, failure, forAll, property, success, withTests
   )
@@ -41,6 +43,8 @@ import Schedule.Interval
   ( Clusivity(..), Endpoint(..), Interval(..), Intervals(..), Measurable(..), mkIntervals )
 import Schedule.LCG.Search
   ( SearchResult(..), defaultSearchOptions, lcgSearch )
+import Schedule.Monad
+  ( SchedulableData )
 import Schedule.Monitor
   ( Monitoring(..) )
 import Schedule.Propagators
@@ -49,6 +53,7 @@ import Schedule.Propagators
   , detectablePrecedencesPropagator, detectableSuccedencesPropagator
   , notLastPropagator, notFirstPropagator
   , edgeLastPropagator, edgeFirstPropagator
+  , predecessorPropagator, successorPropagator
   )
 import Schedule.Task
   ( Task(..), TaskInfos(..), ImmutableTaskInfos )
@@ -170,22 +175,60 @@ rehearsalRegressionInstance =
 --------------------------------------------------------------------------------
 -- Properties.
 
-prop_rehearsal_regression :: Property
-prop_rehearsal_regression = withTests 1 $ property do
-  let named = rehearsalRegressionInstance
+-- | Check that the LCG search verdict (using the given propagators) agrees with
+-- Z3's feasibility verdict on the given instance.
+--
+-- A disagreement is a soundness failure: an /unsound learnt clause/ (minted from
+-- a bad explanation) can make the search report UNSAT on a feasible instance, and
+-- the verdict must stay invariant under the choice of (verdict-complete)
+-- propagator subset (see 'baseOnlyProps').
+lcgVerdictMatchesZ3
+  :: forall task t
+  .  ( Real t, Num t, Measurable t, Bounded t, Show t, Show task
+     , Coercible t Int
+     , SchedulableData [ ( Task task t, Text ) ] task t
+     )
+  => [ Propagator task t ]
+  -> [ ( Task task t, Text ) ]
+  -> PropertyT IO ()
+lcgVerdictMatchesZ3 props named = do
   mbStarts <- evalIO ( z3Feasible ( map fst named ) )
-  let res = lcgSearch @MonitoringOff defaultSearchOptions basicPropagators named
+  let res = lcgSearch @MonitoringOff defaultSearchOptions props named
   case ( solution res, mbStarts ) of
-    ( Right _, Just _  ) -> success
-    ( Left _,  Nothing ) -> success
+    ( Right _, Just _ )    -> success
+    ( Left _,  Nothing )   -> success
+    ( Right _, Nothing )   -> do
+      annotate "LCG returned a solution but Z3 reports infeasibility."
+      failure
     ( Left err, Just sts ) -> do
-      annotate "LCG reported infeasible but Z3 found a schedule."
+      annotate "LCG returned infeasible but Z3 found a schedule:"
       annotateShow sts
       annotate ( Text.unpack err )
       failure
-    ( Right _, Nothing ) -> do
-      annotate "LCG found a schedule but Z3 reports infeasibility."
-      failure
+
+prop_rehearsal_regression :: Property
+prop_rehearsal_regression = withTests 1 $ property $
+  lcgVerdictMatchesZ3 basicPropagators rehearsalRegressionInstance
+
+-- | The verdict-complete base configuration: pruning, timetabling, the overload
+-- check and the precedence-matrix propagators. A fully-decided acyclic
+-- tournament over these is enough to settle feasibility, so this subset's
+-- verdict must already match Z3 — a place where an unsound explanation (the open
+-- @base-only@ bug) surfaces as a wrong UNSAT.
+baseOnlyProps :: ( Num t, Measurable t, Bounded t, Show t ) => [ Propagator task t ]
+baseOnlyProps =
+  [ prunePropagator, timetablePropagator, overloadPropagator
+  , predecessorPropagator, successorPropagator
+  ]
+
+prop_lcg_base_only_matches_z3 :: Property
+prop_lcg_base_only_matches_z3 = withTests 2000 $ property do
+  namedTasks <- forAll genInstance
+  lcgVerdictMatchesZ3 baseOnlyProps namedTasks
+
+prop_rehearsal_base_only :: Property
+prop_rehearsal_base_only = withTests 1 $ property $
+  lcgVerdictMatchesZ3 baseOnlyProps rehearsalRegressionInstance
 
 prop_propagation_sound_vs_z3 :: Property
 prop_propagation_sound_vs_z3 = withTests 1000 $ property do
@@ -241,19 +284,7 @@ confluentOn props = withTests 1000 $ property do
 prop_lcg_matches_z3 :: Property
 prop_lcg_matches_z3 = withTests 1000 $ property do
   namedTasks <- forAll genInstance
-  mbStarts   <- evalIO ( z3Feasible ( map fst namedTasks ) )
-  let res = lcgSearch @MonitoringOff defaultSearchOptions basicPropagators namedTasks
-  case ( solution res, mbStarts ) of
-    ( Right _, Just _ )    -> success
-    ( Left _,  Nothing )   -> success
-    ( Right _, Nothing )   -> do
-      annotate "LCG returned a solution but Z3 reports infeasibility."
-      failure
-    ( Left err, Just sts ) -> do
-      annotate "LCG returned infeasible but Z3 found a schedule:"
-      annotateShow sts
-      annotate ( Text.unpack err )
-      failure
+  lcgVerdictMatchesZ3 basicPropagators namedTasks
 
 -- Various subsets of propagators tested separately.
 coreProps, withDetectableProps, withEdgeProps, withoutMatrixProps
@@ -302,4 +333,14 @@ tests = testGroup "Differential tests"
       "LCG vs Z3: tight rehearsal instance"
       "prop_rehearsal_regression"
       prop_rehearsal_regression
+  , testGroup "verdict invariant under propagator subset"
+      [ testPropertyNamed
+          "base-only (prune+timetable+overload+matrix) verdict matches Z3"
+          "prop_lcg_base_only_matches_z3"
+          prop_lcg_base_only_matches_z3
+      , testPropertyNamed
+          "base-only vs Z3: tight rehearsal instance"
+          "prop_rehearsal_base_only"
+          prop_rehearsal_base_only
+      ]
   ]
