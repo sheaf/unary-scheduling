@@ -23,6 +23,7 @@ module SAT.Clause
   , clauseAt
     -- * Clause references
   , ClauseRef(..)
+  , FalsifiedClauseRef(..)
     -- * Reasons
   , Reason(..)
   , LazyRef(..)
@@ -49,7 +50,7 @@ import qualified Data.Vector.Primitive.Mutable as PMV
 
 -- unary-scheduling
 import SAT.Base
-  ( Lit, LitOfValue(..), litIndex, litFromIndex )
+  ( Lit, LitOfValue(FalsifiedLit), FalsifiedLit, litIndex, litFromIndex )
 
 -------------------------------------------------------------------------------
 -- Clause references.
@@ -59,6 +60,11 @@ import SAT.Base
 newtype ClauseRef = ClauseRef { unCRef :: Int }
   deriving stock   Show
   deriving newtype ( Eq, Ord, Prim )
+
+-- | A 'ClauseRef' whose clause is currently /falsified/: every literal is
+-- false under the current assignment.
+newtype FalsifiedClauseRef = FalsifiedClauseRef { falsifiedClause :: ClauseRef }
+  deriving newtype ( Show, Eq, Ord )
 
 -------------------------------------------------------------------------------
 -- Clause storage.
@@ -190,10 +196,8 @@ data Reason
   -- Also used as the placeholder reason for variables that are currently
   -- unassigned; the reason is never inspected in that state.
   | RDecision
-  -- | Literal that was unit-propagated from a binary clause whose other
-  -- literal is given. No clause body is allocated for binary clauses; the
-  -- pair @(propagated lit, other)@ /is/ the clause.
-  | RBinary !( LitOfValue False )
+  -- | Literal that was unit-propagated from a binary clause.
+  | RBinary !FalsifiedLit -- ^ the "other" literal
   -- | Literal that was unit-propagated from the clause at the given
   -- reference. At the moment of propagation, this clause had all other
   -- literals false.
@@ -246,18 +250,22 @@ instance Prim Reason where
 -- Five constructors need three tag bits; the remaining 61 bits hold the
 -- payload ('Lit' index, 'ClauseRef', or 'LazyRef').
 encodeReason :: Reason -> Int
-encodeReason RFact                          = 0
-encodeReason RDecision                      = 1
-encodeReason ( RBinary ( LitOfValue lit ) ) = 2 .|. ( litIndex lit `shiftL` 3 )
-encodeReason ( RClause ( ClauseRef ref ) )  = 3 .|. ( ref `shiftL` 3 )
-encodeReason ( RLazy   ( LazyRef   ref ) )  = 4 .|. ( ref `shiftL` 3 )
+encodeReason = \case
+  RFact -> 0
+  RDecision -> 1
+  RBinary ( FalsifiedLit lit ) -> 2 .|. ( litIndex lit `shiftL` 3 )
+  RClause ( ClauseRef ref ) -> 3 .|. ( ref `shiftL` 3 )
+  RLazy   ( LazyRef  ref ) -> 4 .|. ( ref `shiftL` 3 )
 
 -- | Inverse of 'encodeReason'.
 decodeReason :: Int -> Reason
-decodeReason w = case w .&. 7 of
-  0 -> RFact
-  1 -> RDecision
-  2 -> RBinary ( LitOfValue $ litFromIndex ( w `shiftR` 3 ) )
-  3 -> RClause ( ClauseRef ( w `shiftR` 3 ) )
-  4 -> RLazy   ( LazyRef   ( w `shiftR` 3 ) )
-  _ -> error "SAT.Clause.decodeReason: invalid reason tag"
+decodeReason w =
+  case w .&. 7 of
+    0 -> RFact
+    1 -> RDecision
+    2 -> RBinary $ FalsifiedLit $ litFromIndex ix
+    3 -> RClause $ ClauseRef ix
+    4 -> RLazy   $ LazyRef ix
+    _ -> error "SAT.Clause.decodeReason: invalid reason tag"
+  where
+    ix = w `shiftR` 3

@@ -18,7 +18,9 @@ module SAT.Base
   , litVar
   , litPolarity
   , negateLit
-  , LitOfValue(FalseLit, ..)
+  , LitOfValue(SatisfiedLit, FalsifiedLit, ..)
+  , SatisfiedLit, FalsifiedLit
+  , negateLitOfValue
     -- * Three-valued booleans
   , LBool(LUndef, LTrue, LFalse)
   , liftBool
@@ -32,6 +34,8 @@ import Data.Bits
   ( shiftL, shiftR, xor, (.|.), (.&.) )
 import Data.Kind
   ( Type )
+import Data.Type.Bool
+  ( Not )
 import Data.Word
   ( Word8 )
 import GHC.Generics
@@ -144,17 +148,28 @@ litPolarity ( Lit l )
 negateLit :: Lit -> Lit
 negateLit ( Lit l ) = Lit ( l `xor` 1 )
 
--- | A literal with the given value (in a given context).
+-- | A literal of the given value under the current assignment.
 type LitOfValue :: Bool -> Type
 newtype LitOfValue v =
   LitOfValue { underlyingLit :: Lit }
-  -- NB: unsafe, but we can easily audit use-sites.
     deriving newtype ( Eq, Ord, Show )
 
-pattern FalseLit :: Lit -> LitOfValue False
-pattern FalseLit a = LitOfValue a
-{-# COMPLETE FalseLit #-}
-{-# INLINE FalseLit #-}
+-- | A satisfied literal, e.g. the antecedent of an inference.
+type SatisfiedLit = LitOfValue True
+
+-- | A falsified literal, e.g. a member of a conflicting or reason clause.
+type FalsifiedLit = LitOfValue False
+
+pattern SatisfiedLit :: Lit -> SatisfiedLit
+pattern SatisfiedLit a = LitOfValue a
+{-# COMPLETE SatisfiedLit #-}
+
+pattern FalsifiedLit :: Lit -> FalsifiedLit
+pattern FalsifiedLit a = LitOfValue a
+{-# COMPLETE FalsifiedLit #-}
+
+negateLitOfValue :: LitOfValue v -> LitOfValue ( Not v )
+negateLitOfValue ( LitOfValue l ) = LitOfValue $ negateLit l
 
 -------------------------------------------------------------------------------
 -- Three-valued booleans.

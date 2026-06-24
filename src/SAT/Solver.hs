@@ -76,7 +76,9 @@ module SAT.Solver
   , resolveConflict
   , recordLazyReason
   , recordTheoryClause
+  , recordFalsifiedClause
   , ClauseRef(..)
+  , FalsifiedClauseRef(..)
   , isOk
   , markFalse
   , bumpVarActivity
@@ -145,12 +147,13 @@ import SAT.Base
   , Lit, litIndex, mkLit, litVar, litPolarity, negateLit
   , LBool(..)
   , litValueFromVar
-  , LitOfValue(..)
+  , LitOfValue(..), FalsifiedLit
   )
 import SAT.Clause
   ( Clause, clauseSize, clauseSwap
   , clauseLit
   , ClauseRef(..)
+  , FalsifiedClauseRef(..)
   , ClauseStore, newClauseStore
   )
 import qualified SAT.Clause as Clause
@@ -316,8 +319,8 @@ decodeWatcher cref lit
 
 -- | The source of a Binary Constrait Propagation (BCP) conflict.
 data Conflict
-  = ConflictClause !ClauseRef
-  | ConflictBinary !Lit !Lit
+  = ConflictClause !FalsifiedClauseRef
+  | ConflictBinary !FalsifiedLit !FalsifiedLit
 
 -------------------------------------------------------------------------------
 -- Solver state.
@@ -419,9 +422,10 @@ data ClauseDB s = ClauseDB
     -- clauses so the two sets can be managed independently.
     learnts   :: !( Growable Primitive.MVector s ClauseRef )
   , -- | Per-literal watch lists, indexed by 'litIndex' and sized to
-    -- @2 * numVars@. @watches[p]@ holds every watcher whose clause has
-    -- @negateLit p@ as a watched literal, so that enqueueing @p@ wakes
-    -- those clauses.
+    -- @2 * numVars@.
+    --
+    -- @watches[p]@ holds every watcher whose clause has @negateLit p@ as a
+    -- watched literal, so that enqueueing @p@ wakes those clauses.
     watches   :: !( Growable Boxed.MVector s ( Growable Primitive.MVector s Watcher ) )
   }
 
@@ -695,7 +699,7 @@ describeConflict
   => SolverState ( PrimState m ) -> Conflict -> m String
 describeConflict s = \case
     ConflictClause cref -> do
-      c <- clauseAt ( clauseDB s ) cref
+      c <- clauseAt ( clauseDB s ) ( falsifiedClause cref )
       let n = clauseSize c
           go :: Int -> m [ String ]
           go k
@@ -709,8 +713,8 @@ describeConflict s = \case
       pure $ "ConflictClause " ++ show cref ++ " (size=" ++ show n ++ "):\n"
           ++ unlines ls
     ConflictBinary l1 l2 -> do
-      d1 <- describeLit l1
-      d2 <- describeLit l2
+      d1 <- describeLit ( underlyingLit l1 )
+      d2 <- describeLit ( underlyingLit l2 )
       pure $ "ConflictBinary:\n" ++ unlines [ d1, d2 ]
   where
     describeLit :: Lit -> m String
@@ -946,8 +950,8 @@ addBinaryLemma s l m = do
     case (val_l, val_m) of
       -- 'RBinary' carries the clause's /other/ literal (false here), as in
       -- 'installLearnt' and as consumed by 'walkUIP'.
-      (LFalse, LUndef) -> enqueueUndef s m $ Clause.RBinary ( FalseLit l )
-      (LUndef, LFalse) -> enqueueUndef s l $ Clause.RBinary ( FalseLit m )
+      (LFalse, LUndef) -> enqueueUndef s m $ Clause.RBinary ( FalsifiedLit l )
+      (LUndef, LFalse) -> enqueueUndef s l $ Clause.RBinary ( FalsifiedLit m )
       _                -> pure ()
 
 markFalse :: PrimMonad m => SolverState ( PrimState m ) -> m ()
@@ -1054,8 +1058,8 @@ propagateLit s p = do
   total <- Growable.length ws
   loop ws total 0 0
   where
-    falseLit :: LitOfValue False
-    falseLit = FalseLit $ negateLit p
+    falseLit :: FalsifiedLit
+    falseLit = FalsifiedLit $ negateLit p
 
     loop
       :: Growable Primitive.MVector ( PrimState m ) Watcher
@@ -1083,7 +1087,7 @@ propagateLit s p = do
                   -- Restore unprocessed remainder so the watch invariant
                   -- holds when the search later backjumps and re-runs BCP.
                   compactRest ws total ( ri + 1 ) ( wi + 1 )
-                  pure ( Just ( ConflictBinary ( underlyingLit falseLit ) other ) )
+                  pure $ Just $ ConflictBinary falseLit ( FalsifiedLit other )
             WLong cref blocker -> do
               -- Try the blocker shortcut before fetching the clause.
               bv <- litValue s blocker
@@ -1102,7 +1106,7 @@ propagateLit s p = do
                   WatchConflict newBlocker -> do
                     Growable.write ws wi ( WLong cref newBlocker )
                     compactRest ws total ( ri + 1 ) ( wi + 1 )
-                    pure ( Just ( ConflictClause cref ) )
+                    pure $ Just $ ConflictClause ( FalsifiedClauseRef cref )
 
     -- Slide the unprocessed tail of the watch list down to writeIdx and
     -- truncate; called after surfacing a conflict.
@@ -1121,10 +1125,10 @@ handleWatched
   .  PrimMonad m
   => SolverState ( PrimState m )
   -> ClauseRef        -- ^ reference to the same clause; used for the new watch and the reason
-  -> LitOfValue False -- ^ the watched literal that just became false
+  -> FalsifiedLit     -- ^ the watched literal that just became false
   -> Clause ( PrimState m )
   -> m WatchOutcome
-handleWatched s cref ( LitOfValue @False falseLit ) c = do
+handleWatched s cref ( FalsifiedLit falseLit ) c = do
   -- Normalise so 'falseLit' sits at position 1 and the other watched
   -- literal at position 0.
   c0 <- clauseLit c 0
@@ -1219,8 +1223,8 @@ analyse s conflict0 = do
     -- previously-unseen literal at a non-zero level is either tallied on
     -- the path counter (if at the current level) or pushed onto the
     -- learnt-clause scratch buffers (if at a strictly lower level).
-    visitLit :: Int -> LitOfValue False -> m ()
-    visitLit skip ( FalseLit l ) = do
+    visitLit :: Int -> FalsifiedLit -> m ()
+    visitLit skip ( FalsifiedLit l ) = do
       let i = varIndex ( litVar l )
       Bit marker <- Growable.read seen i
       if marker || i == skip
@@ -1256,18 +1260,18 @@ analyse s conflict0 = do
             | k >= n = pure ()
             | otherwise = do
                 l <- clauseLit c k
-                visitLit skipVi ( FalseLit l )
+                visitLit skipVi ( FalsifiedLit l )
                 loopK ( k + 1 )
       loopK 0
 
   -- Seed analysis from the conflict source.
   case conflict0 of
     ConflictClause cref -> do
-      c <- clauseAt ( clauseDB s ) cref
+      c <- clauseAt ( clauseDB s ) ( falsifiedClause cref )
       visit -1 c
     ConflictBinary l1 l2 -> do
-      visitLit -1 $ FalseLit l1
-      visitLit -1 $ FalseLit l2
+      visitLit -1 l1
+      visitLit -1 l2
 
   -- BCP only fires this analysis when the conflict was produced at the
   -- current level, so the conflict source must mention at least one
@@ -1399,7 +1403,7 @@ minimiseLearnt assig clauseDB
         Clause.RClause cref  -> clauseOthersCovered abstraction cref i
         Clause.RLazy lref    ->
           do { others <- forceLazy ( trail assig ) lref
-             ; othersCovered abstraction i $ map FalseLit others
+             ; othersCovered abstraction i $ map FalsifiedLit others
              }
 
     -- Whether reason-literal @q@ is covered: at the ground level, already a
@@ -1407,8 +1411,8 @@ minimiseLearnt assig clauseDB
     -- Memoises both outcomes (success via 'seen', failure via 'minFailed'). A
     -- literal whose level is absent from the clause's @abstraction@ mask cannot
     -- be covered, so it fails fast without forcing its reason.
-    covered :: Word64 -> LitOfValue False -> m Bool
-    covered abstraction ( FalseLit q ) = do
+    covered :: Word64 -> FalsifiedLit -> m Bool
+    covered abstraction ( FalsifiedLit q ) = do
       let vq = varIndex ( litVar q )
       lvl <- assignmentLevelOfAssignedVar assig ( litVar q )
       if lvl <= GroundLevel
@@ -1421,16 +1425,18 @@ minimiseLearnt assig clauseDB
           Bit isFailed <- Growable.read minFailed vq
           if isFailed
           then pure False
-          else if abstractLevel lvl .&. abstraction == 0
-          then markFailed vq
-          else do
-            ok <- reasonRedundant abstraction vq
-            if ok
-            then do
-              Growable.write seen vq ( Bit True )
-              Growable.push  analyseTouched vq
-              pure True
-            else markFailed vq
+          else
+            if abstractLevel lvl .&. abstraction == 0
+            then markFailed vq
+            else do
+              ok <- reasonRedundant abstraction vq
+              if ok
+              then do
+                Growable.write seen vq ( Bit True )
+                Growable.push  analyseTouched vq
+                pure True
+              else
+                markFailed vq
 
     markFailed :: Int -> m Bool
     markFailed vq = do
@@ -1452,7 +1458,7 @@ minimiseLearnt assig clauseDB
               if varIndex ( litVar l ) == resolved_var_idx
               then go ( k + 1 )
               else do
-                cov <- covered abstraction ( FalseLit l )
+                cov <- covered abstraction ( FalsifiedLit l )
                 if cov then go ( k + 1 ) else pure False
       go 0
 
@@ -1512,7 +1518,7 @@ walkUIP
   .  PrimMonad m
   => SolverState ( PrimState m )
   -> ( Int -> Clause ( PrimState m ) -> m () )
-  -> ( Int -> LitOfValue False -> m () )
+  -> ( Int -> FalsifiedLit -> m () )
   -> TrailPos
   -> m Lit
 walkUIP
@@ -1566,7 +1572,7 @@ walkUIP
                   go ( idx - 1 )
 
     visitLits :: Int -> [ Lit ] -> m ()
-    visitLits skipVi = mapM_ ( visitLit skipVi . FalseLit )
+    visitLits skipVi = mapM_ ( visitLit skipVi . FalsifiedLit )
 
 -- | Pick the highest-level literal from the analyse-side scratch buffers;
 -- it becomes the learnt clause's second watch and its level the backjump
@@ -1851,7 +1857,7 @@ installLearnt s = \case
   [ l ] -> enqueueUndef s l Clause.RFact
   [ l, m ] -> do
     attachBinary ( clauseDB s ) l m
-    enqueueUndef s l ( Clause.RBinary $ FalseLit m )
+    enqueueUndef s l ( Clause.RBinary $ FalsifiedLit m )
   ls@( l : _ ) -> do
     ( cref, c ) <- recordClause ( clauseDB s ) True ls
     Growable.push ( learnts ( clauseDB s ) ) cref
@@ -1940,6 +1946,13 @@ recordTheoryClause
   => SolverState ( PrimState m ) -> [ Lit ] -> m ClauseRef
 recordTheoryClause s ls = fst <$> recordClause ( clauseDB s ) False ls
   -- TODO: these clauses are stored permanently, never reclaimed.
+
+-- | Record a long (size @≥ 3@) conflicting clause from its falsified literals.
+recordFalsifiedClause
+  :: PrimMonad m
+  => SolverState ( PrimState m ) -> [ FalsifiedLit ] -> m FalsifiedClauseRef
+recordFalsifiedClause s ls =
+  FalsifiedClauseRef <$> recordTheoryClause s ( map underlyingLit ls )
 
 -------------------------------------------------------------------------------
 -- Assignments.
