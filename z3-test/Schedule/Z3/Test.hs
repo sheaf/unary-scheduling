@@ -177,11 +177,6 @@ rehearsalRegressionInstance =
 
 -- | Check that the LCG search verdict (using the given propagators) agrees with
 -- Z3's feasibility verdict on the given instance.
---
--- A disagreement is a soundness failure: an /unsound learnt clause/ (minted from
--- a bad explanation) can make the search report UNSAT on a feasible instance, and
--- the verdict must stay invariant under the choice of (verdict-complete)
--- propagator subset (see 'baseOnlyProps').
 lcgVerdictMatchesZ3
   :: forall task t
   .  ( Real t, Num t, Measurable t, Bounded t, Show t, Show task
@@ -210,11 +205,6 @@ prop_rehearsal_regression :: Property
 prop_rehearsal_regression = withTests 1 $ property $
   lcgVerdictMatchesZ3 basicPropagators rehearsalRegressionInstance
 
--- | The verdict-complete base configuration: pruning, timetabling, the overload
--- check and the precedence-matrix propagators. A fully-decided acyclic
--- tournament over these is enough to settle feasibility, so this subset's
--- verdict must already match Z3 — a place where an unsound explanation (the open
--- @base-only@ bug) surfaces as a wrong UNSAT.
 baseOnlyProps :: ( Num t, Measurable t, Bounded t, Show t ) => [ Propagator task t ]
 baseOnlyProps =
   [ prunePropagator, timetablePropagator, overloadPropagator

@@ -1634,7 +1634,11 @@ boundMoveReason
   -> ST s [ Lit ]
 boundMoveReason t i dur ( Interval lowerStart upperStart ) compOf carverLitsOf anchorLits = do
   let ground   = groundAvail t Boxed.Vector.! i
-      window   = cutAfter upperStart ( cutBefore lowerStart ground )
+      -- @[lowerStart, upperStart]@ is a /start/ span; a task starting at @upperStart@
+      -- occupies through @upperStart + dur@, so the top cut is the occupancy bound,
+      -- not the start bound.
+      window   = cutAfter ( completionFromLatestStart dur upperStart )
+                          ( cutBefore lowerStart ground )
       holdsDur ivals = any ( \ iv -> measure iv >= dur ) ( toList ( intervals ivals ) )
   if not ( holdsDur window )
   then
@@ -1739,7 +1743,9 @@ channelPass t cts deltas = do
               selfLit <- lctLitAt t i preLct
               ( anchorLits, upperStart ) <-
                 case notLaterThan ct of
-                  Just v  -> do { ss <- capSubsetLits t cap subset; pure ( selfLit : ss ++ precLits, v ) }
+                  -- @v@ is a latest-/completion/ bound; the span is in start
+                  -- coordinates, so convert it.
+                  Just v  -> do { ss <- capSubsetLits t cap subset; pure ( selfLit : ss ++ precLits, latestStartFromCompletion dur v ) }
                   Nothing -> pure ( [ selfLit ], latestStartFromCompletion dur preLct )
               boundMoveReason t i dur
                 ( Interval ( startUpperToEstLower newLst ) upperStart )
@@ -1815,6 +1821,16 @@ debugCheckReasonAntecedents
   .  TheoryState mode s task t -> Lit -> LazyReason s -> ST s ()
 debugCheckReasonAntecedents t propLit reason = do
   body <- forceLazyReason reason
+  -- A non-ground clause of just @[propLit]@ has no antecedents: it asserts the
+  -- propagation as an unconditional fact (which would belong at the ground level
+  -- as 'RFact'). A dropped-antecedent bug.
+  when ( all ( \ l -> litVar l == litVar propLit ) body ) $ do
+    dump <- SAT.dumpSolverState ( theorySolverState t )
+    error $ unlines
+      [ "Schedule.LCG.Theory.enqueuePropagated: reason for "<> show propLit <> " has no antecedents."
+      , "clause = " <> show body
+      , dump
+      ]
   let check []         = pure ()
       check ( l : ls )
         | litVar l == litVar propLit = check ls
@@ -2115,8 +2131,7 @@ checkCitabilityInvariant t ctx = go 0
 
 -- | Verify a conflict mentions at least one literal at the current decision level.
 --
--- An empty body is a genuine ground-level inconsistency (handled by 'markFalse',
--- never passed to 'analyse') and is exempt.
+-- An empty body is a genuine ground-level inconsistency and is exempt.
 debugAssertCurrentLevelLit
   :: forall s. Text -> SAT.SolverState s -> [ Lit ] -> ST s ()
 debugAssertCurrentLevelLit _     _ []   = pure ()
@@ -2124,9 +2139,10 @@ debugAssertCurrentLevelLit label s body = do
   cur   <- SAT.currentLevel s
   descs <- traverse ( describe cur ) body
   when ( not ( any fst descs ) ) $
-    error $ "Schedule.LCG.Theory.literalsAsConflict: conflict " <> show label
-         <> " has no literal at the current level (" <> show cur <> ")\n"
-         <> unlines ( map snd descs )
+    error $ unlines $
+       ( "conflict " <> show label <>
+         " has no literal at the current level (" <> show cur <> ")"
+       ) : map snd descs
   where
     describe :: SAT.DecisionLevel -> Lit -> ST s ( Bool, String )
     describe cur l = do
