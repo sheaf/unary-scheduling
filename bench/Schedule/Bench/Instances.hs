@@ -10,7 +10,6 @@ module Schedule.Bench.Instances
     BenchTime(..), BenchTask, Instance
     -- * Runners
   , LCGOutcome(..), runLCG
-  , PropOutcome(..), runPropOnly
     -- * Instance families
   , fullTask
   , windowedTask
@@ -44,7 +43,7 @@ import Control.DeepSeq
 
 -- random
 import System.Random
-  ( mkStdGen, randomRs, split )
+  ( SplitGen(splitGen), mkStdGen, randomRs )
 
 -- text
 import Data.Text
@@ -53,8 +52,6 @@ import qualified Data.Text as Text
   ( pack )
 
 -- unary-scheduling
-import Schedule.Constraint
-  ( renderInfeasible )
 import Schedule.Interval
   ( Clusivity(..), Endpoint(..), Interval(..)
   , Measurable, mkIntervals
@@ -64,9 +61,9 @@ import Schedule.LCG.Search
 import Schedule.Monitor
   ( Monitoring(..) )
 import Schedule.Propagators
-  ( basicPropagators, propagateConstraints )
+  ( basicPropagators )
 import Schedule.Task
-  ( ImmutableTaskInfos, Task(..), taskNames )
+  ( Task(..) )
 import Schedule.Time
   ( Delta(..), Time(..), HandedTime(..) )
 
@@ -97,21 +94,6 @@ newtype LCGOutcome = LCGOutcome
 
 runLCG :: Instance -> LCGOutcome
 runLCG inst = LCGOutcome ( lcgSearch @MonitoringOff defaultSearchOptions basicPropagators inst )
-
--- | The propagator fixpoint with no SAT search on top.
---
--- We force the final 'ImmutableTaskInfos' and the @Maybe Text@ error
--- channel, so the work is comparable to forcing 'LCGOutcome'.
-data PropOutcome = PropOutcome
-  !( ImmutableTaskInfos () BenchTime )
-  !( Maybe Text )
-  deriving stock    Generic
-  deriving anyclass NFData
-
-runPropOnly :: Instance -> PropOutcome
-runPropOnly inst =
-  case propagateConstraints inst 1000 basicPropagators of
-    ( ti, _, mbErr ) -> PropOutcome ti ( renderInfeasible ( taskNames ti ) <$> mbErr )
 
 -------------------------------------------------------------------------------
 -- Instance generators.
@@ -163,8 +145,8 @@ randomWindowedInstance utilisation windowSlack n maxDur seed =
   | ( t, ( lo, hi ) ) <- zip [ 0 .. n - 1 ] winSlacks
   ]
   where
-    ( gDur, g1 )   = split ( mkStdGen seed )
-    ( gKey, gWin ) = split g1
+    ( gDur, g1 )   = splitGen ( mkStdGen seed )
+    ( gKey, gWin ) = splitGen g1
 
     -- Random duration per task id.
     durs :: IntMap Int
@@ -213,7 +195,7 @@ rehearsalInstance utilisation availProb numDays numSongs maxDur seed =
   | k <- [ 0 .. numSongs - 1 ]
   ]
   where
-    ( gDur, gAvail ) = split ( mkStdGen seed )
+    ( gDur, gAvail ) = splitGen ( mkStdGen seed )
 
     durs :: IntMap Int
     durs  = IntMap.fromList ( zip [ 0 .. ] ( take numSongs ( randomRs ( 1, maxDur ) gDur ) ) )

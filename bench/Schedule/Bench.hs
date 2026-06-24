@@ -32,7 +32,7 @@ import Test.Tasty.Bench
 -- unary-scheduling bench suite
 import Schedule.Bench.Instances
   ( BenchTime(..), Instance
-  , runLCG, runPropOnly
+  , runLCG
   , randomWindowedInstance, rehearsalInstance
   , overloadedInstance
   , tightCliqueInstance
@@ -62,9 +62,8 @@ triple :: String -> Instance -> Benchmark
 triple label inst =
   env ( pure inst ) \ i ->
     bgroup label
-      [ bench "LCG"         ( whnf runLCG i )
-      , bench "propagators" ( whnf runPropOnly i )
-      , bench "Z3"          ( nfIO ( runZ3 i ) )
+      [ bench "LCG" ( whnf runLCG i )
+      , bench "Z3"  ( nfIO ( runZ3 i ) )
       ]
 
 benchmarks :: [ Benchmark ]

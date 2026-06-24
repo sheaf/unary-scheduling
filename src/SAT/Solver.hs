@@ -224,7 +224,7 @@ data LevelStart = LevelStart
     -- ^ 'entries' length when the level opened
     --
     -- This is also where Boolean Constraint Propagation resumes, i.e.
-    -- the 'qhead' to restore on backjump.
+    -- the 'trailHead' to restore on backjump.
   , levelLazyCount :: !Int
     -- ^ 'lazyReasons' length when the level opened
   }
@@ -242,7 +242,7 @@ data AssignmentTrail s = AssignmentTrail
     -- TODO: give 'LevelStart' a proper 'Prim' or 'Unboxed' instance instead
     -- of using boxed vectors.
 
-  , qhead       :: !( MutVar s TrailPos )
+  , trailHead   :: !( MutVar s TrailPos )
     -- ^ Next trail position for Boolean Constraint Propagation.
   , lazyReasons :: !( Growable Boxed.MVector s ( Clause.LazyReason s ) )
     -- ^ Lazy-reason closures attached to theory-propagated literals via
@@ -252,12 +252,11 @@ data AssignmentTrail s = AssignmentTrail
 -- | Allocate an empty assignment trail.
 newAssignmentTrail :: PrimMonad m => m ( AssignmentTrail ( PrimState m ) )
 newAssignmentTrail = do
-  ent <- Growable.new 16
-  lvl <- Growable.new 4
-  qh  <- newMutVar 0
-  lzs <- Growable.new 4
-  pure AssignmentTrail
-    { entries = ent, levelStarts = lvl, qhead = qh, lazyReasons = lzs }
+  entries     <- Growable.new 16
+  levelStarts <- Growable.new 4
+  trailHead   <- newMutVar 0
+  lazyReasons <- Growable.new 4
+  pure $ AssignmentTrail { .. }
 
 -------------------------------------------------------------------------------
 -- Watchers and conflicts.
@@ -1022,13 +1021,13 @@ propagate s@( SolverState { solverAssignments = Assignments { trail } } ) = loop
   where
     loop :: m ( Maybe Conflict )
     loop = do
-      q  <- readMutVar ( qhead trail )
+      q  <- readMutVar ( trailHead trail )
       sz <- trailSize trail
       if q >= sz
       then pure Nothing
       else do
         p <- Growable.read ( entries trail ) ( unTrailPos q )
-        writeMutVar ( qhead trail ) ( q + 1 )
+        writeMutVar ( trailHead trail ) ( q + 1 )
         mbConf <- propagateLit s p
         case mbConf of
           Just c  -> pure ( Just c )
@@ -1692,7 +1691,7 @@ truncateToLevel
   Growable.truncate ( entries trl )     p
   Growable.truncate ( lazyReasons trl ) nLazy
   Growable.truncate ( levelStarts trl ) tgt
-  writeMutVar ( qhead trl ) pos
+  writeMutVar ( trailHead trl ) pos
 
 -------------------------------------------------------------------------------
 -- Decisions.

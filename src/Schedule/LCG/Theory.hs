@@ -177,7 +177,6 @@ import Schedule.Task
   , est, ect, lst, lct )
 import Schedule.Time
   ( EarliestTime, LatestTime, Delta(getDelta), HandedTime(handedTime)
-  , Time(getTime)
   , Handedness(Earliest, Latest)
   )
 import Schedule.Trail
