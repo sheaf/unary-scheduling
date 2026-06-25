@@ -147,6 +147,10 @@ main = withCP65001 do
     -- on the real (uninstrumented) default-config path, so a cost-centre profile
     -- is attributable to that one workload. Usage: lcg-inspect prof <name>.
     ( "prof" : rest ) -> mapM_ profRun ( if null rest then [ "d6s24", "copies2" ] else rest )
+    -- Instrumented (MonitoringOn) solve of a single named instance, printing the
+    -- full monitor report (phases, per-propagator, conflict sources). Usage:
+    -- lcg-inspect report <name>.
+    ( "report" : rest ) -> mapM_ reportRun ( if null rest then [ "copies2" ] else rest )
     ( "exp" : _ )     -> propagatorSubsetExperiment
     ( "opts" : _ )    -> optionToggleExperiment
     ( "lazy" : _ )    -> lazyReasonReport
@@ -161,7 +165,10 @@ main = withCP65001 do
 -- | Select among some representative instances for a profiling run.
 profInstance :: String -> Instance
 profInstance "d6s24"   = Instances.rehearsalInstance 1.0 0.4 6 24 8 9
+profInstance "tight520" = Instances.rehearsalInstance 1.0 0.4 5 20 8 3
+profInstance "copies1" = Instances.infeasibleRehearsalInstance 1
 profInstance "copies2" = Instances.infeasibleRehearsalInstance 2
+profInstance "copies3" = Instances.infeasibleRehearsalInstance 3
 profInstance other     = error ( "lcg-inspect prof: unknown instance " ++ show other )
 
 -- | Solve one anchor instance once, on the uninstrumented default path, forcing
@@ -177,6 +184,27 @@ profRun name = do
   printf "%-8s %-11s %-11s dec=%d conf=%d learnt=%d tprop=%d\n"
     name ( fmtNs ( t1 - t0 ) ) ( verdict res )
     ( numDecisions st ) ( numConflicts st ) ( numLearnts st ) ( numTheoryPropagations st )
+
+-- | Solve one named instance with full instrumentation and print the report
+-- plus the propagator-compute share.
+reportRun :: String -> IO ()
+reportRun name = do
+  let inst = profInstance name
+  _   <- evaluate ( force inst )
+  printf "=== instrumented report: %s (tasks: %d) ===\n" name ( length inst )
+  t0  <- getMonotonicTimeNSec
+  rep <- evaluate ( force ( lcgSearch @MonitoringOn defaultSearchOptions basicPropagators inst ) )
+  t1  <- getMonotonicTimeNSec
+  let st = stats rep
+  printf "verdict=%s dec=%d conf=%d learnt=%d tprop=%d\n"
+    ( verdict rep ) ( numDecisions st ) ( numConflicts st )
+    ( numLearnts st ) ( numTheoryPropagations st )
+  putStr ( renderReport ( monitorReport rep ) )
+  let propSum = sum ( perPropagatorTime ( monitorReport rep ) )
+  printf "instrumented total %s  (propagator compute %.2f ms = %.0f%%)\n\n"
+    ( fmtNs ( t1 - t0 ) )
+    ( fromIntegral propSum / 1e6 :: Double )
+    ( 100 * fromIntegral propSum / fromIntegral ( t1 - t0 ) :: Double )
 
 -- | Two views of the lazy-reason machinery across representative instances, from
 -- one 'MonitoringOn' solve each:
