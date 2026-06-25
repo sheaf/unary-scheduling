@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TemplateHaskell #-}
 
@@ -20,6 +21,10 @@ import Data.Bifunctor
   ( bimap, second )
 import Data.Coerce
   ( coerce )
+#ifdef DEBUG
+import Data.Foldable
+  ( toList )
+#endif
 import Data.Function
   ( (&) )
 import Data.Functor.Identity
@@ -107,7 +112,11 @@ import Data.Vector.Ranking
 import Schedule.Constraint
   ( Constraints, Infeasible, BoundMove )
 import Schedule.Interval
-  ( Measurable )
+  ( Measurable
+#ifdef DEBUG
+  , Endpoint(..), Intervals(..)
+#endif
+  )
 import Schedule.Ordering
   ( Order(Unknown), newOrderingMatrix )
 import Schedule.Task
@@ -115,9 +124,12 @@ import Schedule.Task
   , MutableTaskInfos, ImmutableTaskInfos
   , est, lct, ect, lst
   )
+#ifdef DEBUG
+import Schedule.Time
+  ( Time(..), HandedTime(..), Delta(..) )
+#endif
 import Schedule.Trail
   ( Trail, newTrail )
-
 
 -------------------------------------------------------------------------------
 -- Schedule monad.
@@ -206,7 +218,7 @@ instance ( Num t, Ord t, Bounded t )
       where
   initialTaskData = thaw
 
-instance ( Num t, Measurable t, Bounded t )
+instance ( Num t, Measurable t, Bounded t, Show t )
       => SchedulableData [ ( Task task t, Text ) ] task t
       where
   initialTaskData taskList = do
@@ -219,6 +231,9 @@ instance ( Num t, Measurable t, Bounded t )
       ( immutableTasks, taskNames ) = Boxed.Vector.unzip $ Boxed.Vector.fromList taskList
       n :: Int
       n = Boxed.Vector.length taskNames
+#ifdef DEBUG
+    assertHeadroom immutableTasks
+#endif
     taskAvails <- Boxed.Vector.unsafeThaw immutableTasks
     rankingEST <- rankOn est numberedTasks
     rankingLCT <- rankOn lct numberedTasks
@@ -228,6 +243,34 @@ instance ( Num t, Measurable t, Bounded t )
     -- rediscovered on the first propagation, which keeps the matrix in sync.
     orderings  <- newOrderingMatrix n ( \ _ _ -> Unknown )
     pure ( TaskInfos { .. } )
+
+#ifdef DEBUG
+-- | Ensure that we aren't going past minBound/maxBound when canonicalising
+-- the availabilities of any tasks.
+assertHeadroom
+  :: forall m task t
+  .  ( Monad m, Num t, Measurable t, Bounded t, Show t )
+  => Boxed.Vector ( Task task t ) -> m ()
+assertHeadroom tasks =
+  case filter ( not . Prelude.null . intervals . taskAvailability ) ( toList tasks ) of
+    []        -> pure ()
+    realTasks
+      | maxLct >= maxBound - totalDur || minEst <= minBound + totalDur
+      -> error $ unlines
+          [ "Task availabilities outside of bounds."
+          , "  minBound = " <> show ( minBound :: t )
+          , "  maxBound = " <> show ( maxBound :: t )
+          , "  min est  = " <> show minEst
+          , "  max lct  = " <> show maxLct
+          , "  total duration (largest Θ shift) = " <> show totalDur
+          ]
+      | otherwise
+      -> pure ()
+      where
+        minEst   = minimum ( map ( getTime . handedTime . endpoint . est ) realTasks )
+        maxLct   = maximum ( map ( getTime . handedTime . endpoint . lct ) realTasks )
+        totalDur = sum     ( map ( getDelta . taskDuration )               realTasks )
+#endif
 
 -------------------------------------------------------------------------------
 -- Keeping track of stale tasks,

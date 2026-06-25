@@ -123,9 +123,13 @@ instance Ord t => Lattice ( Endpoint ( LatestTime t ) ) where
     LT -> Endpoint t1 clu1
     GT -> Endpoint t2 clu2
 
+-- | NB: canonicalisation can turn [a,b] into [a,b+1) (e.g. for discrete time domains),
+-- so we always need to stay strictly below 'maxBound'.
 instance ( Ord t, Bounded t ) => BoundedLattice ( Endpoint ( EarliestTime t ) ) where
   bottom = Endpoint maxBound Exclusive
   top    = Endpoint minBound Inclusive
+-- | NB: canonicalisation can turn [a,b] into [a,b+1) (e.g. for discrete time domains),
+-- so we always need to stay strictly below 'maxBound'.
 instance ( Ord t, Bounded t ) => BoundedLattice ( Endpoint ( LatestTime t ) ) where
   bottom = Endpoint minBound Exclusive
   top    = Endpoint maxBound Inclusive

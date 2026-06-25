@@ -68,11 +68,7 @@ import Schedule.Z3
 -- A small, bounded time type so generated instances stay cheap for Z3.
 
 newtype TestTime = TestTime Int
-  deriving newtype ( Eq, Ord, Num, Real, Measurable )
-
-instance Bounded TestTime where
-  minBound = TestTime 0
-  maxBound = TestTime horizon
+  deriving newtype ( Eq, Ord, Bounded, Num, Real, Measurable )
 
 instance Show TestTime where
   show ( TestTime t ) = show t
@@ -80,6 +76,8 @@ instance Show TestTime where
 -- | The scheduling horizon: all generated times lie in @[0, horizon]@.
 horizon :: Int
 horizon = 32
+  -- Must be strictly less than maxBound, because [0, horizon] canonicalises
+  -- to [0, horizon + 1).
 
 type TestTask = Task () TestTime
 
@@ -120,20 +118,10 @@ genInstance = do
 --------------------------------------------------------------------------------
 -- A structured regression fixture (needs a longer horizon than 'TestTime').
 
-newtype RehTime = RehTime Int
-  deriving newtype ( Eq, Ord, Num, Real, Measurable )
-
-instance Bounded RehTime where
-  minBound = RehTime 0
-  maxBound = RehTime 128
-
-instance Show RehTime where
-  show ( RehTime t ) = show t
-
 -- | A concrete tight multi-day rehearsal.
 --
 -- Serves as a regression test for an ordering matrix double-write bug.
-rehearsalRegressionInstance :: [ ( Task () RehTime, Text ) ]
+rehearsalRegressionInstance :: [ ( Task () TestTime, Text ) ]
 rehearsalRegressionInstance =
   zipWith ( \ i ( dur, wins ) -> ( mkTask dur wins, "song" <> Text.pack ( show i ) ) )
     [ 0 :: Int .. ]
@@ -159,18 +147,18 @@ rehearsalRegressionInstance =
     , ( 5, [ (36,52) ] )
     ]
   where
-    mkTask :: Int -> [ ( Int, Int ) ] -> Task () RehTime
+    mkTask :: Int -> [ ( Int, Int ) ] -> Task () TestTime
     mkTask dur wins =
       Task
         { taskAvailability = mkIntervals ( Seq.fromList ( map window wins ) )
-        , taskDuration     = Delta ( RehTime dur )
+        , taskDuration     = Delta ( TestTime dur )
         , taskInfo         = ()
         }
-    window :: ( Int, Int ) -> Interval RehTime
+    window :: ( Int, Int ) -> Interval TestTime
     window ( lo, hi ) =
       Interval
-        ( Endpoint ( EarliestTime ( Time ( RehTime lo ) ) ) Inclusive )
-        ( Endpoint ( LatestTime   ( Time ( RehTime hi ) ) ) Inclusive )
+        ( Endpoint ( EarliestTime ( Time ( TestTime lo ) ) ) Inclusive )
+        ( Endpoint ( LatestTime   ( Time ( TestTime hi ) ) ) Inclusive )
 
 --------------------------------------------------------------------------------
 -- Properties.
@@ -272,7 +260,7 @@ confluentOn props = withTests 1000 $ property do
 -- | The LCG search's verdict (feasible / infeasible) must agree with Z3's
 -- on every instance.
 prop_lcg_matches_z3 :: Property
-prop_lcg_matches_z3 = withTests 1000 $ property do
+prop_lcg_matches_z3 = withTests 2000 $ property do
   namedTasks <- forAll genInstance
   lcgVerdictMatchesZ3 basicPropagators namedTasks
 
