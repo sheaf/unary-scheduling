@@ -347,10 +347,14 @@ type family Apply ( p :: Parameter ) ( a :: Type ) :: Type where
 data BaseDurationInfo h t = BaseDurationInfo
   { baseInnerTime     :: !(Endpoint (HandedTime h t))
     -- ^ estimated ECT/LST
-  , baseWitness       :: !IntSet
-    -- ^ the leaves responsible for 'baseInnerTime' (its critical prefix Ω)
   , baseTotalDuration :: !(Delta t)
     -- ^ total duration of every leaf in the subtree
+
+  -- TODO: the following two IntSets are always contiguous in rank order,
+  -- so we should instead only store the endpoints to avoid building up
+  -- allocations with <>.
+  , baseWitness       :: !IntSet
+    -- ^ the leaves responsible for 'baseInnerTime' (its critical prefix Ω)
   , baseLeaves        :: !IntSet
     -- ^ every leaf in the subtree
   }
@@ -397,13 +401,13 @@ instance ( Ord t
          )
       => Semigroup ( BaseDurationInfo h t )
       where
-  BaseDurationInfo timeL rL durL leavesL <> BaseDurationInfo timeR rR durR leavesR =
+  BaseDurationInfo timeL durL rL leavesL <> BaseDurationInfo timeR durR rR leavesR =
     case Arg ( durR • timeL ) ( rL <> leavesR ) /.\ Arg timeR rR of
       Arg time witness ->
         BaseDurationInfo
           { baseInnerTime     = time
-          , baseWitness       = witness
           , baseTotalDuration = durL <> durR
+          , baseWitness       = witness
           , baseLeaves        = leavesL <> leavesR
           }
 
