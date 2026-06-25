@@ -7,6 +7,8 @@ module Schedule.Z3
   , buildUnaryModel
     -- * Feasibility oracle
   , z3Feasible
+    -- ** Shared-environment feasibility (amortised setup)
+  , newZ3Env, z3FeasibleIn
     -- * Differential validation
   , Z3Verdict(..)
   , verifyAgainstZ3
@@ -135,11 +137,39 @@ z3Feasible
   .  Coercible t Int
   => [ Task task t ]
   -> IO ( Maybe [ Integer ] )
-z3Feasible tasks = Z3.evalZ3 do
+z3Feasible = Z3.evalZ3 . z3FeasibleQuery
+
+-- | The feasibility query as a reusable 'Z3' action: build the model, check it,
+-- and read back the start times. Factored out of 'z3Feasible' so a single
+-- environment can drive many checks (see 'z3FeasibleIn').
+z3FeasibleQuery
+  :: forall task t
+  .  Coercible t Int
+  => [ Task task t ]
+  -> Z3 ( Maybe [ Integer ] )
+z3FeasibleQuery tasks = do
   ts <- buildUnaryModel tasks
   ( _res, mbStarts ) <- Z3.withModel \ model ->
     mapM ( Z3.evalInt model . ( \ ( _, t, _ ) -> t ) ) ts
   pure ( sequence =<< mbStarts )
+
+-- | Create a fresh Z3 environment that can be re-used across many
+-- feasability checks, in order to amortise the setup cost.
+newZ3Env :: IO Z3.Z3Env
+newZ3Env = Z3.newEnv Nothing Z3.stdOpts
+
+-- | Run a single feasibility given a Z3 environment.
+--
+-- The check runs under 'Z3.local', so its assertions are popped afterwards and
+-- the environment is left clean for the next check.
+z3FeasibleIn
+  :: forall task t
+  .  Coercible t Int
+  => Z3.Z3Env
+  -> [ Task task t ]
+  -> IO ( Maybe [ Integer ] )
+z3FeasibleIn env tasks =
+  Z3.evalZ3WithEnv ( Z3.local ( z3FeasibleQuery tasks ) ) env
 
 --------------------------------------------------------------------------------
 -- Differential validation.
