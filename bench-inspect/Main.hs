@@ -151,6 +151,10 @@ main = withCP65001 do
     -- full monitor report (phases, per-propagator, conflict sources). Usage:
     -- lcg-inspect report <name>.
     ( "report" : rest ) -> mapM_ reportRun ( if null rest then [ "copies2" ] else rest )
+    -- Strong-branching width sweep on the key instances (FDS §6.3): time / dec /
+    -- conf / verdict per width, to tell whether probing+shaving at restart roots
+    -- pays off and at what width. Usage: lcg-inspect sb.
+    ( "sb" : _ )      -> strongBranchSweep
     ( "exp" : _ )     -> propagatorSubsetExperiment
     ( "opts" : _ )    -> optionToggleExperiment
     ( "lazy" : _ )    -> lazyReasonReport
@@ -272,6 +276,52 @@ lazyReasonReport = do
       , ( "bin copies4 (inf)",    Instances.infeasibleRehearsalInstance 4 )
       , ( "pigeonhole m=5 (inf)", Instances.intervalPigeonholeInstance 5 2 )
       , ( "pigeonhole m=6 (inf)", Instances.intervalPigeonholeInstance 6 2 )
+      ]
+
+-- | Sweep the strong-branching width across the key instances, holding
+-- everything else at the default. Each cell is @time/dec/conf@; the trailing tag
+-- is the verdict (which must not change across widths).
+strongBranchSweep :: IO ()
+strongBranchSweep = do
+  printf "Strong-branching width sweep (time / dec / conf ; verdict must not change):\n\n"
+  printf "  %-22s" ( "instance" :: String )
+  forM_ widths \ w -> printf " %-20s" ( "w=" ++ show w )
+  putStrLn "  verdict"
+  forM_ sbInstances \ ( iname, inst ) -> do
+    _ <- evaluate ( force inst )
+    cells <- forM widths \ w -> do
+      mb <- timeout 15_000_000 ( measureOff ( withWidth w ) inst )
+      case mb of
+        Nothing -> pure ( Nothing, "TIMEOUT" :: String )
+        Just ( time, res ) -> do
+          let st = stats res
+          pure ( Just ( verdict res )
+               , printf "%s/%d/%d" ( fmtNs time ) ( numDecisions st ) ( numConflicts st ) )
+    let verdicts = [ v | ( Just v, _ ) <- cells ]
+        tag = case verdicts of
+          ( v0 : _ ) | all ( == v0 ) verdicts -> v0
+          _                                    -> "DISAGREE " ++ show verdicts
+    printf "  %-22s" iname
+    forM_ cells \ ( _, c ) -> printf " %-20s" c
+    printf "  %s\n" tag
+  putStrLn ""
+  where
+    widths :: [ Int ]
+    widths = [ 0, 1, 2, 4, 8, 16 ]
+    withWidth :: Int -> SearchOptions
+    withWidth w = defaultSearchOptions { optStrongBranchWidth = w }
+    sbInstances :: [ ( String, Instance ) ]
+    sbInstances =
+      [ ( "reh tight 5x20/3",  Instances.rehearsalInstance 1.0 0.4 5 20 8 3 )
+      , ( "reh tight 6x24/9",  Instances.rehearsalInstance 1.0 0.4 6 24 8 9 )
+      , ( "reh slack 5x20",    Instances.rehearsalInstance 0.9 0.6 5 20 8 42 )
+      , ( "clique n=12",       Instances.tightCliqueInstance 12 2 )
+      , ( "pigeonhole m=5",    Instances.intervalPigeonholeInstance 5 2 )
+      , ( "pigeonhole m=6",    Instances.intervalPigeonholeInstance 6 2 )
+      , ( "bin copies1",       Instances.infeasibleRehearsalInstance 1 )
+      , ( "bin copies2",       Instances.infeasibleRehearsalInstance 2 )
+      , ( "bin copies3",       Instances.infeasibleRehearsalInstance 3 )
+      , ( "frag [667789]/5",   Instances.fragmentationInstance [ 6, 6, 7, 7, 8, 9 ] 5 )
       ]
 
 -- | Measure how much each (group of) expensive global propagator earns its

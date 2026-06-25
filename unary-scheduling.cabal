@@ -130,6 +130,7 @@ library
     , Schedule.Contention
     , Schedule.Interval
     , Schedule.LCG.Atoms
+    , Schedule.LCG.FDS
     , Schedule.LCG.Search
     , Schedule.LCG.Theory
     , Schedule.Monad

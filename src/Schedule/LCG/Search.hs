@@ -17,9 +17,7 @@ module Schedule.LCG.Search
     -- * Options
   , SearchOptions(..)
   , defaultSearchOptions
-    -- * Building blocks (re-export of the inner pieces)
-  , module Schedule.LCG.Theory
-  , module Schedule.LCG.Atoms
+  , TheoryOptions(..) -- re-export
   )
   where
 
@@ -55,7 +53,7 @@ import qualified SAT.Restart as Restart
 import qualified SAT.Solver as SAT
 import Schedule.Interval
   ( Measurable )
-import Schedule.LCG.Atoms
+import Schedule.LCG.FDS
 import Schedule.LCG.Theory
 import Schedule.Monad
   ( SchedulableData
@@ -86,12 +84,18 @@ data SearchOptions = SearchOptions
     --
     -- @<= 0@ disables restarts.
     optRestartUnit    :: !Int
+  , -- | Strong-branching width: at the root of each restart, pre-evaluate this
+    -- many best-rated precedence choices by probing both branches (FDS §6.3),
+    -- maturing their ratings, shaving any infeasible branch, and pre-selecting
+    -- the best-localRating branch. @<= 0@ disables strong branching.
+    optStrongBranchWidth :: !Int
   }
 
 defaultSearchOptions :: SearchOptions
 defaultSearchOptions = SearchOptions
   { optSolver          = SAT.defaultOptions
   , optRestartUnit     = 100
+  , optStrongBranchWidth = 8
   , optTheoryOpts =
       TheoryOptions
         { maxPropRounds = 1000
@@ -169,6 +173,7 @@ lcgSearch opts props givenTasks = runST do
   finalVerdict <-
     driveLoop
       ( optRestartUnit opts )
+      ( optStrongBranchWidth opts )
       theory
 
   -- Build the result.
@@ -227,10 +232,11 @@ driveLoop
      , Show t, Show task
      , MonitorMode mode
      )
-  => Int                      -- ^ base Luby restart window, in conflicts (@<= 0@: no restarts)
+  => Int -- ^ base Luby restart window, in conflicts (@<= 0@: no restarts)
+  -> Int -- ^ strong-branching width (@<= 0@: no strong branching)
   -> TheoryState mode s task t
   -> ST s SAT.Verdict
-driveLoop restartUnit theoryState = driveRestarts 1
+driveLoop restartUnit strongWidth theoryState = driveRestarts 1
   where
     solverState :: SAT.SolverState s
     solverState = theorySolverState theoryState
@@ -243,6 +249,19 @@ driveLoop restartUnit theoryState = driveRestarts 1
     -- Run window @k@; on a restart, roll back to ground and open window @k + 1@.
     driveRestarts :: Int -> ST s SAT.Verdict
     driveRestarts !k = do
+      -- Strong branching + shaving at the root of each restart.
+      sb <-
+        if fdsEnabled && strongWidth > 0 && k > 1
+        then strongBranch theoryState strongWidth
+        else pure StrongBranchOk
+      case sb of
+        StrongBranchUnsat -> do
+          SAT.markFalse solverState
+          pure SAT.Unsat
+        StrongBranchOk -> driveWindow k
+
+    driveWindow :: Int -> ST s SAT.Verdict
+    driveWindow !k = do
       let limit = restartUnit * Restart.luby k
       res <- searchWindow limit
       case res of
