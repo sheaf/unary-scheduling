@@ -193,6 +193,7 @@ readOrdering ( OrderingMatrix { dim, orderingMatrix } ) i j = case compare i j o
   EQ -> pure Equal
   LT -> unsafeIndex orderingMatrix ( upperTriangular dim i j )
   GT -> unsafeIndex orderingMatrix ( upperTriangular dim j i ) <&> reverseOrder
+{-# INLINE readOrdering #-}
 
 -- | Reusable scratch buffer for 'insertEdgeTransitively'.
 newtype TransitiveClosureScratch s = TransitiveClosureScratch ( Unboxed.MVector s Int )
