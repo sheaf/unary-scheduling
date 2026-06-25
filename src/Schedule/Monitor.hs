@@ -294,15 +294,15 @@ renderReport r = unlines $
       ( reasonCount r )
       ( meanLen :: Double )
       ( reasonMaxLen r )
-  , "lazy reasons (deferred theory propagations):"
+  , "lazy reasons:"
   , line "recorded"          ( lazyRecorded r )
   , line "forced"            ( lazyForced r )
-  , printf "  %-22s %.1f%% recorded ever forced  |  %.1f mean lits/force"
+  , printf "  %-22s %.1f%%  |  %.1f mean lits/force"
       ( "utilisation" :: String )
       ( utilisation :: Double ) ( meanForceLen :: Double )
   , "conflicts by source:"
   ] ++ conflictLines ++
-  [ "search phases (total ms; indented = sub-phase, ALREADY counted in its parent — do not sum):"
+  [ "search phases (total ms & sub-phase breakdown):"
   ] ++ phaseLines ++
   [ "per-propagator (invocations / productive / total ms):"
   ] ++ propLines
@@ -334,7 +334,7 @@ renderReport r = unlines $
           let kids = childrenOf name
           in  phaseRow ( Text.unpack name ) total
               :  [ phaseRow ( "  - " ++ Text.unpack cn ) cv | ( cn, cv ) <- kids ]
-              ++ [ phaseRow "  - (excl. above) " ( total - sum ( map snd kids ) )
+              ++ [ phaseRow "  - (others) " ( total - sum ( map snd kids ) )
                  | not ( null kids ) ]
     conflictLines
       | Map.null ( conflictBreakdown r ) = [ "  (none)" ]
@@ -353,10 +353,12 @@ renderReport r = unlines $
     propLines
       | Map.null ( perPropagator r ) = [ "  (none)" ]
       | otherwise =
-          [ printf "  %-22s %d / %d / %.2f" ( Text.unpack name ) inv prod
+          [ printf "  %-22s %5d / %5d (%5.1f%%) / %5.2f" ( Text.unpack name ) inv prod prodPct
               ( fromIntegral ( Map.findWithDefault 0 name ( perPropagatorTime r ) ) / 1e6 :: Double )
           -- Most-time-consuming first.
           | ( name, ( inv, prod ) ) <-
               sortOn ( negate . flip ( Map.findWithDefault 0 ) ( perPropagatorTime r ) . fst )
                 ( Map.toList ( perPropagator r ) )
+          , let prodPct :: Double
+                prodPct = 100 * fromIntegral prod / fromIntegral inv
           ]

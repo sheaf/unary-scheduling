@@ -286,7 +286,7 @@ test-suite unary-scheduling-z3-test
     , z3
          >= 411  && < 413
 
-benchmark unary-scheduling-sat-bench
+benchmark bench-unary-scheduling
 
   import: common
 
