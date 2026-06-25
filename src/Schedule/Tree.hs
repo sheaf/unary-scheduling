@@ -261,17 +261,42 @@ class Propagatable ( h :: Handedness ) where
   inHandedOrder :: Order -> Bool
   handedPrecedences :: IntSet -> ( IntSet, IntSet )
 
-  -- | Propagate a change from a leaf to the rest of a unary scheduling tree.
-  --
-  -- The given index is the task number, from which the leaf index is computed
-  -- depending on the handedness of the scheduling tree,
-  -- using the relevant task ranking (by earliest start time or latest completion time).
+  -- | The tree-vector index of the leaf holding a given task, computed from the
+  -- task's rank in the handedness-appropriate ranking (by earliest start time for
+  -- 'Earliest', latest completion time for 'Latest').
+  leafIndexFor
+    :: ( PrimMonad m, s ~ PrimState m
+       , ReadableVector m Int (uvec Int)
+       )
+    => Tree h s a
+    -> TaskInfos bvec uvec task t
+    -> Int -- ^ task index
+    -> m Int
+
+  -- | Propagate a change to a task's leaf through the rest of a unary scheduling
+  -- tree, returning the new root value. The 'Int' is the task number (see
+  -- 'leafIndexFor').
   propagateLeafChange
     :: ( PrimMonad m, s ~ PrimState m
        , Monoid a, Show a
        , ReadableVector m Int (uvec Int)
        )
-    => Tree h s a -> a -> TaskInfos bvec uvec task t -> Int -> m a
+    => Tree h s a -> a -> TaskInfos bvec uvec task t
+    -> Int -- ^ task index
+    -> m a
+  propagateLeafChange tree val taskData taskIndex = do
+    leafIndex <- leafIndexFor tree taskData taskIndex
+    propagateChangeFromLeaf tree val leafIndex
+
+  -- | Read a task's current leaf value without modifying the tree.
+  peekLeaf
+    :: ( PrimMonad m, s ~ PrimState m
+       , ReadableVector m Int (uvec Int)
+       )
+    => Tree h s a -> TaskInfos bvec uvec task t -> Int -> m a
+  peekLeaf tree@( Tree { treeVector } ) taskData taskIndex = do
+    leafIndex <- leafIndexFor tree taskData taskIndex
+    treeVector `Boxed.MVector.unsafeRead` leafIndex
 
 instance Propagatable Earliest where
   overloaded start end =
@@ -280,13 +305,12 @@ instance Propagatable Earliest where
   inHandedOrder LessThan = True
   inHandedOrder _        = False
   handedPrecedences m = ( m, mempty )
-  propagateLeafChange tree@(Tree { treeVector }) val ( TaskInfos { rankingEST = Ranking { ranks } } ) taskIndex = do
+  leafIndexFor ( Tree { treeVector } ) ( TaskInfos { rankingEST = Ranking { ranks } } ) taskIndex = do
     rankEST <- ranks `unsafeIndex` taskIndex
     let
-      nbNodes, leafIndex :: Int
+      nbNodes :: Int
       nbNodes = Boxed.MVector.length treeVector
-      leafIndex = rankEST + ( nbNodes `div` 2 )
-    propagateChangeFromLeaf tree val leafIndex
+    pure ( rankEST + ( nbNodes `div` 2 ) )
 
 instance Propagatable Latest where
   overloaded end start =
@@ -295,13 +319,12 @@ instance Propagatable Latest where
   inHandedOrder GreaterThan = True
   inHandedOrder _           = False
   handedPrecedences m = ( mempty, m )
-  propagateLeafChange tree@(Tree { treeVector }) val taskData taskIndex = do
+  leafIndexFor ( Tree { treeVector } ) taskData taskIndex = do
     rankLCT <- ranks ( view ( _ranking @Latest @Outer ) taskData ) `unsafeIndex` taskIndex
     let
-      nbNodes, leafIndex :: Int
+      nbNodes :: Int
       nbNodes = Boxed.MVector.length treeVector
-      leafIndex = nbNodes - 1 - rankLCT
-    propagateChangeFromLeaf tree val leafIndex
+    pure ( nbNodes - 1 - rankLCT )
 
 ---------------------------------------------------------------------------------------------------
 -- Node data that can be propagated through task trees.

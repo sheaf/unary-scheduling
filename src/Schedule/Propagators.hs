@@ -177,9 +177,8 @@ import Schedule.Time
   , HandedTime(..), EarliestTime, LatestTime
   )
 import Schedule.Tree
-  ( newTree, cloneTree, fmapTree
-  , Propagatable
-    ( overloaded, handedIndex, handedPrecedences, inHandedOrder, propagateLeafChange )
+  ( newTree, fmapTree
+  , Propagatable(..)
   , DurationInfo(..), BaseDurationInfo(..)
   , DurationExtraInfo(..)
   )
@@ -891,11 +890,13 @@ detectablePrecedences = do
     finishOuter :: Int -> Task task t -> Int -> Int -> [Int] -> m ()
     finishOuter taskNb currentTask i j otherTaskNbs = do
       when ( j > 0 ) do
-        clone <- cloneTree tree
-        -- Compute the estimated earliest completion time / latest start time
-        -- from the subset excluding the current task.
+        -- Compute the estimated earliest completion time / latest start time from
+        -- the subset excluding the current task, by temporarily removing its leaf,
+        -- reading the root, then restoring it (avoids 'cloneTree').
+        savedLeaf <- peekLeaf tree allTasks taskNb
         excludeCurrentTaskSubsetInnerTime
-          <- baseInnerTime <$> propagateLeafChange clone mempty allTasks taskNb
+          <- baseInnerTime <$> propagateLeafChange tree mempty allTasks taskNb
+        _ <- propagateLeafChange tree savedLeaf allTasks taskNb
         let
           currentOuterTime :: Endpoint ( HandedTime h t )
           currentOuterTime = pickEndpoint @h @Outer currentTask
@@ -980,13 +981,16 @@ notExtremal = do
 
       for_ mbRelevantTaskNb \ relevantTaskNb -> do
 
-        clone <- cloneTree tree
-        -- Compute the estimated earliest completion time / latest start time
-        -- from the subset excluding the current task.
+        -- Compute the estimated earliest completion time / latest start time from
+        -- the subset excluding the current task, by temporarily removing its leaf,
+        -- reading the root, then restoring it (avoids 'cloneTree').
+
         -- TODO: implement the optimisation from the paper that computes
         -- a constraint relative to the secondary task before inserting it in the Theta-tree.
+        savedLeaf <- peekLeaf tree allTasks currentTaskNb
         excludeCurrentTaskSubsetInnerTime
-          <- baseInnerTime <$> propagateLeafChange clone mempty allTasks currentTaskNb
+          <- baseInnerTime <$> propagateLeafChange tree mempty allTasks currentTaskNb
+        _ <- propagateLeafChange tree savedLeaf allTasks currentTaskNb
         relevantTask <- taskAvails `unsafeIndex` relevantTaskNb
         let
           associatedOtherInnerTime :: Endpoint ( HandedTime oh t )
