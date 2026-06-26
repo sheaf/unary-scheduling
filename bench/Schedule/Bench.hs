@@ -41,6 +41,7 @@ import Schedule.Bench.Instances
   , tightCliqueInstance
   , intervalPigeonholeInstance
   , infeasibleRehearsalInstance
+  , phaseTransitionAt
   )
 
 -- z3-oracle
@@ -76,7 +77,7 @@ triple label inst =
 benchmarks :: [ Benchmark ]
 benchmarks =
   -- tolerate higher variance to avoid tests taking too long
-  map ( localOption ( RelStDev 0.1 ) . localOption ( mkTimeout 5_000_000 ) )
+  map ( localOption ( RelStDev 0.2 ) . localOption ( mkTimeout 3_000_000 ) )
 
   -- One benchmark group per distinct workload class.
   [ bgroup "staggered windows ~70% (heterogeneous; propagation + search)"
@@ -102,7 +103,7 @@ benchmarks =
   , bgroup "infeasible: resource overload (demand twice the horizon)"
       [ triple ( "n=" ++ show n ++ " d=" ++ show d )
                ( overloadedInstance n d )
-      | ( n, d ) <- [ ( 4, 3 ), ( 6, 3 ), ( 8, 3 ), ( 12, 3 ), ( 16, 3 ) ]
+      | ( n, d ) <- [ ( 4, 3 ), ( 6, 3 ), ( 8, 3 ), ( 12, 3 ) ]
       ]
   , bgroup "infeasible: interval pigeonhole (search-hard; overload-free)"
       [ triple ( "slots=" ++ show m ++ " (" ++ show ( m + 1 ) ++ " tasks)" )
@@ -113,5 +114,19 @@ benchmarks =
       [ triple ( "copies=" ++ show c ++ " (" ++ show ( 5 * c ) ++ " songs, " ++ show ( 3 * c ) ++ " days)" )
                ( infeasibleRehearsalInstance c )
       | c <- [ 1, 2, 3 ]
+      ]
+  -- Mined hard instances from the single-machine solvability phase-transition
+  -- model (Wang, O'Gorman, Tran, Rieffel, Frank & Do, ICAPS 2017).
+  , bgroup "phase transition (Wang et al. 2017; hard)"
+      [ triple
+          ( "n=" ++ show n ++ " T/np\776=" ++ show ratioT
+            ++ " w/T=" ++ show ratioW ++ " s=" ++ show seed )
+          ( phaseTransitionAt ( 3, 19 ) n ratioT ratioW seed )
+      | ( n, ratioT, ratioW, seed ) <-
+          [ (  50, 1.20, 0.50, 14 )   -- ~0.2 s,  244 decisions
+          , (  70, 1.10, 0.50, 36 )   -- ~0.8 s,  962 decisions
+          , (  90, 1.15, 0.50, 29 )   -- ~1.7 s, 1532 decisions
+          , ( 110, 1.15, 0.60, 29 )   -- stress test
+          ]
       ]
   ]

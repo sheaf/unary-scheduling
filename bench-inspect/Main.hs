@@ -21,6 +21,8 @@ import Control.Monad
   ( forM, forM_, when )
 import Data.Word
   ( Word64 )
+import Data.List
+  ( sortOn )
 import GHC.Clock
   ( getMonotonicTimeNSec )
 import System.Environment
@@ -143,21 +145,23 @@ main :: IO ()
 main = withCP65001 do
   args <- getArgs
   case args of
-    -- Focused profiling entry point: solve a single named anchor instance once,
-    -- on the real (uninstrumented) default-config path, so a cost-centre profile
-    -- is attributable to that one workload. Usage: lcg-inspect prof <name>.
+    -- Run the solver on the given instances, for profiling.
     ( "prof" : rest ) -> mapM_ profRun ( if null rest then [ "d6s24", "copies2" ] else rest )
-    -- Instrumented (MonitoringOn) solve of a single named instance, printing the
-    -- full monitor report (phases, per-propagator, conflict sources). Usage:
-    -- lcg-inspect report <name>.
+    -- Run with instrumentation (MonitoringOn) and produce a report.
     ( "report" : rest ) -> mapM_ reportRun ( if null rest then [ "copies2" ] else rest )
-    -- Strong-branching width sweep on the key instances (FDS §6.3): time / dec /
-    -- conf / verdict per width, to tell whether probing+shaving at restart roots
-    -- pays off and at what width. Usage: lcg-inspect sb.
-    ( "sb" : _ )      -> strongBranchSweep
-    ( "exp" : _ )     -> propagatorSubsetExperiment
-    ( "opts" : _ )    -> optionToggleExperiment
-    ( "lazy" : _ )    -> lazyReasonReport
+    -- Explore the phase-transition of models in Wang et al. (ICAPS 2017).
+    ( "phase" : _ ) -> phaseTransitionSweep
+    -- Compare the outcomes when running different subsets of propagators.
+    ( "subsets" : _ ) -> propagatorSubsetExperiment
+    -- Measure the impact of various options e.g. whether to allow bound atom decisions.
+    ( "opts" : _ ) -> optionToggleExperiment
+    -- Measure the impact of changing the strong-branching width parameter.
+    ( "branching" : _ ) -> strongBranchSweep
+    -- Produce statics about lazy reasons (e.g. fraction of lazy reasons forced).
+    ( "lazy" : _ ) -> lazyReasonReport
+
+    -- Default behaviour: sweep several parameters against the benchmark
+    -- instances and report the results.
     _ -> do
       _ <- evaluate ( force theInstance )
       printf "=== unary-scheduling LCG inspection harness ===\n\n"
@@ -173,6 +177,10 @@ profInstance "tight520" = Instances.rehearsalInstance 1.0 0.4 5 20 8 3
 profInstance "copies1" = Instances.infeasibleRehearsalInstance 1
 profInstance "copies2" = Instances.infeasibleRehearsalInstance 2
 profInstance "copies3" = Instances.infeasibleRehearsalInstance 3
+profInstance "pt50"    = Instances.phaseTransitionAt ( 3, 19 ) 50  1.20 0.50 14
+profInstance "pt70"    = Instances.phaseTransitionAt ( 3, 19 ) 70  1.10 0.50 36
+profInstance "pt90"    = Instances.phaseTransitionAt ( 3, 19 ) 90  1.15 0.50 29
+profInstance "pt110"   = Instances.phaseTransitionAt ( 3, 19 ) 110 1.15 0.60 29
 profInstance other     = error ( "lcg-inspect prof: unknown instance " ++ show other )
 
 -- | Solve one anchor instance once, on the uninstrumented default path, forcing
@@ -322,6 +330,72 @@ strongBranchSweep = do
       , ( "bin copies2",       Instances.infeasibleRehearsalInstance 2 )
       , ( "bin copies3",       Instances.infeasibleRehearsalInstance 3 )
       , ( "frag [667789]/5",   Instances.fragmentationInstance [ 6, 6, 7, 7, 8, 9 ] 5 )
+      ]
+
+-- | Sweep the phase-transition order parameters @(ratioT = T/(n·p̄), ratioW =
+-- wMax/T)@ over many seeds for the "single-machine solvability phase-transition"
+-- test cases (Wang, O'Gorman, Tran, Rieffel, Frank & Do, ICAPS 2017).
+phaseTransitionSweep :: IO ()
+phaseTransitionSweep = do
+  printf "Phase-transition HARD-INSTANCE finder (Wang et al. ICAPS 2017), P=(3,19).\n"
+  printf "Sweeping n × wMax/T × T/(n·p̄) × %d seeds, %.0fs timeout each.\n\n"
+    nSeeds ( fromIntegral timeoutMicros / 1e6 :: Double )
+  -- Collect (verdict, conflicts, decisions, time) keyed by reproducer params.
+  rows <- fmap concat $ forM grid \ ( n, ratioW, ratioT ) ->
+    forM [ 1 .. nSeeds ] \ seed -> do
+      let inst = Instances.phaseTransitionAt ( 3, 19 ) n ratioT ratioW seed
+      _  <- evaluate ( force inst )
+      mb <- timeout timeoutMicros ( measureOff defaultSearchOptions inst )
+      pure $ case mb of
+        Nothing         -> ( n, ratioW, ratioT, seed, Nothing )
+        Just ( t, res ) ->
+          ( n, ratioW, ratioT, seed
+          , Just ( case solution res of { Left _ -> 'U'; Right _ -> 'S' }
+                 , numConflicts ( stats res ), numDecisions ( stats res ), t ) )
+  -- Per (n, wMax/T, T/np̄): feasible fraction and the p50/p90/max conflicts.
+  printf "Grid summary (feas = fraction feasible; conf = p50/p90/max; TO = timeouts):\n"
+  printf "  %-3s %-6s %-7s %-6s %-18s %s\n"
+    ( "n" :: String ) ( "wMx/T" :: String ) ( "T/np̄" :: String )
+    ( "feas" :: String ) ( "conf p50/p90/max" :: String ) ( "TO" :: String )
+  forM_ grid \ ( n, ratioW, ratioT ) -> do
+    let here  = [ r | ( n', w', t', _, r ) <- rows, n' == n, w' == ratioW, t' == ratioT ]
+        done  = [ x | Just x <- here ]
+        nTO   = length [ () | Nothing <- here ]
+        feas  = length [ () | ( 'S', _, _, _ ) <- done ]
+        confs = sortOn id [ c | ( _, c, _, _ ) <- done ]
+        pick p = if null confs then 0 else confs !! min ( length confs - 1 ) ( floor ( p * fromIntegral ( length confs ) :: Double ) )
+    printf "  %-3d %-6.2f %-7.2f %-6.2f %6d /%5d /%5d  %d\n"
+      n ratioW ratioT
+      ( if null done then 0 else fromIntegral feas / fromIntegral ( length done ) :: Double )
+      ( pick 0.5 ) ( pick 0.9 ) ( if null confs then 0 else last confs ) nTO
+  -- Leaderboard: the hardest specific instances (timeouts first, then by
+  -- conflicts), with exact reproducers for curating the benchmark.
+  printf "\nHardest instances (reproduce with phaseTransitionAt (3,19) n ratioT ratioW seed):\n"
+  printf "  %-26s %-4s %-7s %-7s %s\n"
+    ( "n ratioT ratioW seed" :: String ) ( "verd" :: String )
+    ( "conf" :: String ) ( "dec" :: String ) ( "time" :: String )
+  let timeouts = [ ( n, w, t, s ) | ( n, w, t, s, Nothing ) <- rows ]
+      solved   = sortOn ( \ ( _, _, _, _, _, c, _, _ ) -> negate c )
+                   [ ( n, w, t, s, v, c, d, tm ) | ( n, w, t, s, Just ( v, c, d, tm ) ) <- rows ]
+  forM_ timeouts \ ( n, w, t, s ) ->
+    printf "  n=%-2d T/np̄=%.2f wMx/T=%.2f s=%-3d TIMEOUT\n" n t w s
+  forM_ ( take 25 solved ) \ ( n, w, t, s, v, c, d, tm ) ->
+    printf "  n=%-2d T/np̄=%.2f wMx/T=%.2f s=%-3d %-4s %-7d %-7d %s\n"
+      n t w s ( [ v ] :: String ) c d ( fmtNs tm )
+  putStrLn ""
+  where
+    nSeeds :: Int
+    nSeeds = 50
+    timeoutMicros :: Int
+    timeoutMicros = 15_000_000
+    -- Mine the hard region: large n, wide windows and a fine, T/np̄ grid
+    -- near the phase transition.
+    grid :: [ ( Int, Double, Double ) ]
+    grid =
+      [ ( n, ratioW, ratioT )
+      | n      <- [ 70, 90, 110 ]
+      , ratioW <- [ 0.5, 0.6, 0.7 ]
+      , ratioT <- [ 1.05, 1.10, 1.15, 1.20 ]
       ]
 
 -- | Measure how much each (group of) expensive global propagator earns its

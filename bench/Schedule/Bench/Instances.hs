@@ -20,6 +20,8 @@ module Schedule.Bench.Instances
   , intervalPigeonholeInstance
   , infeasibleRehearsalInstance
   , fragmentationInstance
+  , phaseTransitionInstance
+  , phaseTransitionAt
   )
   where
 
@@ -321,4 +323,77 @@ tightCliqueInstance n d =
   [ fullTask ( n * d ) d ( Text.pack ( "c" ++ show k ) )
   | k <- [ 0 .. n - 1 ]
   ]
+
+-- | A random single-machine instance from the /solvability phase-transition/
+-- model of Wang, O'Gorman, Tran, Rieffel, Frank & Do, \"An Investigation of
+-- Phase Transitions in Single-Machine Scheduling Problems\" (ICAPS 2017).
+--
+-- Each of @n@ jobs gets:
+--
+--   * a processing time drawn uniformly from the /two-element coprime set/
+--     @{pₛ, pₗ}@ (the paper uses e.g. @{3,19}@ or @{7,11}@; coprimality and a
+--     moderate ratio are deliberate, to avoid accidentally-easy instances);
+--   * a window length @w ~ U[pₗ + 1, wMax]@ (so every job fits its own window,
+--     but tightly — infeasibility can only come from the no-overlap interaction);
+--   * a release @r ~ U[0, T − w]@, giving the availability window @[r, r + w]@.
+--
+-- @T@ (horizon) and @wMax@ (max window length) are the two order parameters; see
+-- 'phaseTransitionAt' for the paper's normalised @(T/(n·p̄), wMax/T)@ coordinates.
+phaseTransitionInstance
+  :: ( Int, Int )  -- ^ processing-time pair @(pₛ, pₗ)@, @pₛ < pₗ@, coprime
+  -> Int           -- ^ number of jobs @n@
+  -> Int           -- ^ horizon @T@
+  -> Int           -- ^ maximum window length @wMax@ (clamped to @[pₗ+1, T]@)
+  -> Int           -- ^ PRNG seed
+  -> Instance
+phaseTransitionInstance ( pSmall, pLarge ) n horizon wMaxArg seed =
+  [ windowedTask r ( r + w ) p ( Text.pack ( "pt" ++ show k ) )
+  | ( k, p, w, u ) <- zip4 [ 0 :: Int .. ] procs windows releaseDraws
+  , let r = floor ( u * fromIntegral ( max 0 ( horizon - w ) ) )
+  ]
+  where
+    -- Window lengths are bounded below by pₗ+1 (every job fits) and above by the
+    -- horizon (so a release in [0, T-w] always exists).
+    wMax :: Int
+    wMax = max ( pLarge + 1 ) ( min horizon wMaxArg )
+
+    ( gProc, g1 )       = splitGen ( mkStdGen seed )
+    ( gWindow, gRelease ) = splitGen g1
+
+    -- p ~ U{pₛ, pₗ}; w ~ U[pₗ+1, wMax]; release fraction u ~ U[0,1) (scaled per
+    -- job to its own [0, T-w] range, since the range depends on w).
+    procs :: [ Int ]
+    procs = take n ( map ( \ b -> if b == ( 0 :: Int ) then pSmall else pLarge )
+                         ( randomRs ( 0, 1 ) gProc ) )
+    windows :: [ Int ]
+    windows = take n ( randomRs ( pLarge + 1, wMax ) gWindow )
+    releaseDraws :: [ Double ]
+    releaseDraws = take n ( randomRs ( 0, 0.999999 ) gRelease )
+
+    zip4 :: [ a ] -> [ b ] -> [ c ] -> [ d ] -> [ ( a, b, c, d ) ]
+    zip4 ( a : as ) ( b : bs ) ( c : cs ) ( d : ds ) = ( a, b, c, d ) : zip4 as bs cs ds
+    zip4 _ _ _ _ = []
+
+-- | Build a 'phaseTransitionInstance' from the paper's /normalised/ order
+-- parameters, so a benchmark can place an instance directly relative to the
+-- solvability frontier (the hyperbola @T/(n·p̄) = a₀/(wMax/T) + c₀@):
+--
+--   * @ratioT = T / (n · p̄)@ — the horizon as a multiple of the expected total
+--     work (@p̄ = (pₛ + pₗ)/2@). @≈1@ is tight (little room); @>1@ is loose.
+--   * @ratioW = wMax / T@ — window length relative to the horizon. Small means
+--     tight windows (a sharper transition); large means loose windows.
+phaseTransitionAt
+  :: ( Int, Int )  -- ^ @(pₛ, pₗ)@
+  -> Int           -- ^ @n@
+  -> Double        -- ^ @ratioT = T/(n·p̄)@
+  -> Double        -- ^ @ratioW = wMax/T@
+  -> Int           -- ^ seed
+  -> Instance
+phaseTransitionAt p@( pSmall, pLarge ) n ratioT ratioW seed =
+  phaseTransitionInstance p n horizon wMax seed
+  where
+    pBar :: Double
+    pBar    = fromIntegral ( pSmall + pLarge ) / 2
+    horizon = round ( ratioT * fromIntegral n * pBar )
+    wMax    = round ( ratioW * fromIntegral horizon )
 
