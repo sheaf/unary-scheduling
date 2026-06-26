@@ -18,7 +18,7 @@ module Schedule.Bench
 import Control.Monad
   ( replicateM_ )
 import Control.Exception
-  ( evaluate )
+  ( Exception, evaluate, throwIO )
 import Data.Maybe
   ( isJust )
 
@@ -46,23 +46,38 @@ import Schedule.Bench.Instances
 
 -- z3-oracle
 import Schedule.Z3
-  ( newZ3Env, z3FeasibleIn )
+  ( Z3Feasibility(..), newZ3Env, z3FeasibleIn )
 
 -------------------------------------------------------------------------------
 -- The Z3 oracle.
 
+-- | Thrown to abort a Z3 benchmark case as soon as a single solver call hits
+-- the Z3 timeout.
+--
+-- Deals with the fact that Z3 invocations use unsafe FFI calls, which Tasty
+-- cannot properly cancel.
+data Z3Timeout = Z3Timeout
+  deriving stock Show
+  deriving anyclass Exception
+
 -- | Z3 feasibility benchmark.
 benchZ3 :: Instance -> Benchmarkable
 benchZ3 inst = Benchmarkable \ n -> do
-  -- Don't include the Z3 setup cost (~6ms)
-  z3Env <- newZ3Env
+  -- Don't include the Z3 setup cost in the benchmark (~6ms)
+  z3Env <- newZ3Env $ fromIntegral ( timeout_us `div` 1000 )
   let tasks = map fst inst
   replicateM_ ( fromIntegral n ) do
     res <- z3FeasibleIn z3Env tasks
-    evaluate ( isJust res )
+    case res of
+      Z3TimedOut    -> throwIO Z3Timeout
+      Z3Decided mb  -> evaluate ( isJust mb )
 
 -------------------------------------------------------------------------------
 -- Suite.
+
+-- | Wall-clock budget for each benchmark, in microseconds.
+timeout_us :: Integer
+timeout_us = 5_000_000 -- μs
 
 -- | Two benchmarks (LCG, Z3) sharing one cached instance, presented as a
 -- labelled group.
@@ -77,7 +92,7 @@ triple label inst =
 benchmarks :: [ Benchmark ]
 benchmarks =
   -- tolerate higher variance to avoid tests taking too long
-  map ( localOption ( RelStDev 0.2 ) . localOption ( mkTimeout 3_000_000 ) )
+  map ( localOption ( RelStDev 0.2 ) . localOption ( mkTimeout timeout_us ) )
 
   -- One benchmark group per distinct workload class.
   [ bgroup "staggered windows ~70% (heterogeneous; propagation + search)"

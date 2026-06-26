@@ -1,4 +1,5 @@
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TupleSections #-}
 
 -- | A Z3-backed oracle for unary-scheduling.
 module Schedule.Z3
@@ -8,6 +9,7 @@ module Schedule.Z3
     -- * Feasibility oracle
   , z3Feasible
     -- ** Shared-environment feasibility (amortised setup)
+  , Z3Feasibility(..)
   , newZ3Env, z3FeasibleIn
     -- * Differential validation
   , Z3Verdict(..)
@@ -137,26 +139,53 @@ z3Feasible
   .  Coercible t Int
   => [ Task task t ]
   -> IO ( Maybe [ Integer ] )
-z3Feasible = Z3.evalZ3 . z3FeasibleQuery
+z3Feasible tasks = snd <$> Z3.evalZ3 ( z3FeasibleQuery tasks )
 
 -- | The feasibility query as a reusable 'Z3' action: build the model, check it,
 -- and read back the start times. Factored out of 'z3Feasible' so a single
 -- environment can drive many checks (see 'z3FeasibleIn').
+--
+-- The 'Z3.Result' is returned alongside the start times so callers can tell a
+-- timeout apart from infeasibility.
+--
+-- We do /not/ use 'Z3.withModel' here: it fetches the model on any non-'Z3.Unsat'
+-- result, which throws \"there is no current model\" on the 'Z3.Undef' produced
+-- by a timeout. We instead read the model only when the check returns 'Z3.Sat'.
 z3FeasibleQuery
   :: forall task t
   .  Coercible t Int
   => [ Task task t ]
-  -> Z3 ( Maybe [ Integer ] )
+  -> Z3 ( Z3.Result, Maybe [ Integer ] )
 z3FeasibleQuery tasks = do
   ts <- buildUnaryModel tasks
-  ( _res, mbStarts ) <- Z3.withModel \ model ->
-    mapM ( Z3.evalInt model . ( \ ( _, t, _ ) -> t ) ) ts
-  pure ( sequence =<< mbStarts )
+  res <- Z3.check
+  ( res, ) <$>
+    case res of
+      Z3.Sat -> do
+        -- Only use 'getModel' when there is a model.
+        model    <- Z3.solverGetModel
+        mbStarts <- mapM ( Z3.evalInt model . ( \ ( _, t, _ ) -> t ) ) ts
+        pure $ sequence mbStarts
+      Z3.Unsat -> pure Nothing
+      Z3.Undef -> pure Nothing
+
+-- | The outcome of a single shared-environment feasibility check
+-- (see 'z3FeasibleIn').
+data Z3Feasibility
+  = Z3TimedOut
+    -- ^ the solver hit the timeout
+  | Z3Decided !( Maybe [ Integer ] )
+    -- ^ the solver decided: @Just starts@ for a feasible schedule, @Nothing@ if
+    -- infeasible
+  deriving stock ( Eq, Show )
 
 -- | Create a fresh Z3 environment that can be re-used across many
 -- feasability checks, in order to amortise the setup cost.
-newZ3Env :: IO Z3.Z3Env
-newZ3Env = Z3.newEnv Nothing Z3.stdOpts
+newZ3Env
+  :: Int -- ^ timeout (in milliseconds)
+  -> IO Z3.Z3Env
+newZ3Env timeoutMillis =
+  Z3.newEnv Nothing ( Z3.stdOpts <> Z3.opt "timeout" timeoutMillis )
 
 -- | Run a single feasibility given a Z3 environment.
 --
@@ -167,9 +196,13 @@ z3FeasibleIn
   .  Coercible t Int
   => Z3.Z3Env
   -> [ Task task t ]
-  -> IO ( Maybe [ Integer ] )
-z3FeasibleIn env tasks =
-  Z3.evalZ3WithEnv ( Z3.local ( z3FeasibleQuery tasks ) ) env
+  -> IO Z3Feasibility
+z3FeasibleIn env tasks = do
+  ( res, mbModel ) <- Z3.evalZ3WithEnv ( Z3.local ( z3FeasibleQuery tasks ) ) env
+  pure $ case res of
+    Z3.Undef -> Z3TimedOut
+    Z3.Sat   -> Z3Decided mbModel
+    Z3.Unsat -> Z3Decided mbModel
 
 --------------------------------------------------------------------------------
 -- Differential validation.
