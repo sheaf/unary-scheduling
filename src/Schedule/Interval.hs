@@ -8,6 +8,7 @@ module Schedule.Interval
   , latestStartFromCompletion
   , Interval(.., (:<..<), (:<..<=), (:<=..<), (:<=..<=))
   , startTime, endTime
+  , intervalIntBounds
   , intersection
   , inside, insideLax
   , Measurable(..)
@@ -23,7 +24,7 @@ import Control.Category
 import Control.Monad
   ( guard )
 import Data.Coerce
-  ( coerce )
+  ( Coercible, coerce )
 import Data.Semigroup
   ( Arg(..) )
 import GHC.Generics
@@ -209,6 +210,17 @@ startTime = start >>> endpoint
 
 endTime :: Interval t -> LatestTime t
 endTime = end >>> endpoint
+
+-- | Normalise an interval to half-open integer bounds @[s, e)@.
+--
+-- A task starting at slot @t@ with duration @d@ occupies the slots
+-- @[t, t + d)@, so it fits within this interval exactly when
+-- @s <= t@ and @t + d <= e@.
+intervalIntBounds :: Coercible t Int => Interval t -> ( Int, Int )
+intervalIntBounds ( Interval ( Endpoint ( EarliestTime ( Time s ) ) clu_s ) ( Endpoint ( LatestTime ( Time e ) ) clu_e ) ) =
+  ( case clu_s of { Exclusive -> coerce s + 1; _ -> coerce s }
+  , case clu_e of { Inclusive -> coerce e + 1; _ -> coerce e }
+  )
 
 
 intersection :: Measurable t => Interval t -> Interval t -> Maybe ( Interval t )

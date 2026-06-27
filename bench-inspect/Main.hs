@@ -23,10 +23,12 @@ import Data.Word
   ( Word64 )
 import Data.List
   ( sortOn )
+import Data.Maybe
+  ( fromMaybe )
 import GHC.Clock
   ( getMonotonicTimeNSec )
 import System.Environment
-  ( getArgs )
+  ( getArgs, lookupEnv )
 import System.Timeout
   ( timeout )
 import Text.Printf
@@ -60,9 +62,14 @@ import Schedule.Propagators
   , predecessorPropagator, successorPropagator
   )
 
+-- minizinc-oracle
+import Schedule.MiniZinc
+  ( MiniZincOptions(..), MiniZincOutcome(..), MiniZincStatus(..)
+  , MiniZincError, defaultMiniZincOptions, minizincFeasible )
+
 -- bench:unary-scheduling
 import Schedule.Bench.Instances
-  ( BenchTime, Instance )
+  ( BenchTime(..), Instance )
 import qualified Schedule.Bench.Instances as Instances
 
 -------------------------------------------------------------------------------
@@ -153,6 +160,8 @@ main = withCP65001 do
     ( "phase" : _ ) -> phaseTransitionSweep
     -- Explore hard instances of the performer-driven rehearsal model.
     ( "performer" : _ ) -> performerRehearsalSweep
+    -- Explore instances of the performer-driven rehearsal model hard for Chuffed.
+    ( "performer-chuffed" : _ ) -> performerChuffedSweep
     -- Compare the outcomes when running different subsets of propagators.
     ( "subsets" : _ ) -> propagatorSubsetExperiment
     -- Measure the impact of various options e.g. whether to allow bound atom decisions.
@@ -422,6 +431,36 @@ data PerfCell = PerfCell
   }
   deriving stock Eq
 
+-- | Shared configuration for the two performer-driven rehearsal mining sweeps
+-- ('performerRehearsalSweep', which finds LCG-hard instances, and
+-- 'performerChuffedSweep', which finds Chuffed-hard ones).
+perfMaxDur :: Int
+perfMaxDur = 8
+
+perfNSeeds :: Int
+perfNSeeds = 25
+
+perfTimeoutMicros :: Int
+perfTimeoutMicros = 10_000_000
+
+-- | Realistic rehearsal sizes; sweep the tightness knobs near the boundary.
+perfGrid :: [ PerfCell ]
+perfGrid =
+  [ PerfCell d s perf k dens util
+  | ( d, s, perf ) <- [ ( 5, 20, 8 ), ( 6, 28, 10 ), ( 7, 35, 10 ) ]
+  , k    <- [ 2, 3, 4 ]
+  , dens <- [ 0.45, 0.6, 0.75 ]
+  , util <- [ 0.9, 0.95, 1.0 ]
+  ]
+
+perfInstanceOf :: PerfCell -> Int -> Instance
+perfInstanceOf ( PerfCell { pcDays, pcSongs, pcPerf, pcK, pcDens, pcUtil } ) seed =
+  Instances.performerRehearsalInstance pcUtil pcPerf pcDens pcK pcDays pcSongs perfMaxDur seed
+
+perfReproLabel :: PerfCell -> Int -> String
+perfReproLabel ( PerfCell { pcDays, pcSongs, pcPerf, pcK, pcDens, pcUtil } ) seed =
+  printf "%.2f %d %.2f %d %d %d %d" pcUtil pcPerf pcDens pcK pcDays pcSongs seed
+
 -- | Mine hard instances of the performer-driven rehearsal model.
 performerRehearsalSweep :: IO ()
 performerRehearsalSweep = do
@@ -471,27 +510,122 @@ performerRehearsalSweep = do
     printf "  %-34s %-4s %-7d %-7d %s\n" ( reproLabel c s ) ( [ v ] :: String ) cf d ( fmtNs tm )
   putStrLn ""
   where
-    maxDur :: Int
-    maxDur = 8
-    nSeeds :: Int
-    nSeeds = 25
-    timeoutMicros :: Int
-    timeoutMicros = 10_000_000
-    instanceOf :: PerfCell -> Int -> Instance
-    instanceOf ( PerfCell { pcDays, pcSongs, pcPerf, pcK, pcDens, pcUtil } ) seed =
-      Instances.performerRehearsalInstance pcUtil pcPerf pcDens pcK pcDays pcSongs maxDur seed
-    reproLabel :: PerfCell -> Int -> String
-    reproLabel ( PerfCell { pcDays, pcSongs, pcPerf, pcK, pcDens, pcUtil } ) seed =
-      printf "%.2f %d %.2f %d %d %d %d" pcUtil pcPerf pcDens pcK pcDays pcSongs seed
-    -- Realistic rehearsal sizes; sweep the tightness knobs near the boundary.
-    grid :: [ PerfCell ]
-    grid =
-      [ PerfCell d s perf k dens util
-      | ( d, s, perf ) <- [ ( 5, 20, 8 ), ( 6, 28, 10 ), ( 7, 35, 10 ) ]
-      , k    <- [ 2, 3, 4 ]
-      , dens <- [ 0.45, 0.6, 0.75 ]
-      , util <- [ 0.9, 0.95, 1.0 ]
-      ]
+    -- Configuration shared with 'performerChuffedSweep' (top-level @perf*@).
+    maxDur        = perfMaxDur
+    nSeeds        = perfNSeeds
+    timeoutMicros = perfTimeoutMicros
+    grid          = perfGrid
+    instanceOf    = perfInstanceOf
+    reproLabel    = perfReproLabel
+
+-- | Chuffed's verdict on one mined instance.
+data ChuffedResult
+  = ChuffedSolved !Char !Double  -- ^ verdict (@\'S\'@/@\'U\'@) and search time (seconds)
+  | ChuffedTimeout               -- ^ hit the MiniZinc time limit
+  | ChuffedError !String         -- ^ Chuffed reported @=====ERROR=====@ (the captured note)
+
+-- | One row of the Chuffed mining sweep: a grid point, the LCG verdict\/time
+-- (@Nothing@ on LCG timeout), and the Chuffed outcome.
+type ChuffedRow = ( PerfCell, Int, Maybe ( Char, Word64 ), ChuffedResult )
+
+-- | Mine instances of the performer-driven rehearsal model that are hard for
+-- /Chuffed/, complementing the LCG-hard instances from 'performerRehearsalSweep'.
+--
+-- Runs both solvers on the shared @perf*@ grid and ranks by Chuffed difficulty
+-- relative to LCG: Chuffed timeouts first (preferring those LCG dispatches
+-- quickly), then solved instances by descending Chuffed/LCG time ratio. This
+-- surfaces instances that are expensive for Chuffed but cheap for LCG. It also
+-- cross-checks that the two solvers agree on feasibility wherever both decide,
+-- and lists instances Chuffed errors out on (kept out of the timing ranking).
+--
+-- Chuffed is located via the @MINIZINC@ environment variable (default
+-- @minizinc@ on @PATH@). This is a long offline sweep (one external @minizinc@
+-- process per instance).
+performerChuffedSweep :: IO ()
+performerChuffedSweep = do
+  exe <- fromMaybe "minizinc" <$> lookupEnv "MINIZINC"
+  let mzOpts = defaultMiniZincOptions
+        { minizincExe = exe
+        , timeLimitMs = perfTimeoutMicros `div` 1000
+        }
+  printf "Performer-driven rehearsal CHUFFED-HARD finder (maxDur=%d, minizinc=%s).\n" perfMaxDur exe
+  printf "Sweeping the performer grid × %d seeds, %.0fs timeout each (LCG vs Chuffed solveTime).\n\n"
+    perfNSeeds ( fromIntegral perfTimeoutMicros / 1e6 :: Double )
+  rows <- fmap concat $ forM perfGrid \ cell ->
+    forM [ 1 .. perfNSeeds ] \ seed -> do
+      let inst = perfInstanceOf cell seed
+      _     <- evaluate ( force inst )
+      mbLcg <- timeout perfTimeoutMicros ( measureOff defaultSearchOptions inst )
+      let lcg = fmap ( \ ( t, res ) ->
+                  ( case solution res of { Left _ -> 'U'; Right _ -> 'S' }, t ) ) mbLcg
+      chu   <- measureChuffed mzOpts inst
+      pure ( cell, seed, lcg, chu )
+  -- Soundness cross-check: the two solvers must agree wherever both decided.
+  let disagreements =
+        [ perfReproLabel c s
+        | ( c, s, Just ( lv, _ ), ChuffedSolved cv _ ) <- rows, lv /= cv ]
+  case disagreements of
+    [] -> printf "LCG and Chuffed agreed on feasibility wherever both decided.\n\n"
+    ds -> do
+      printf "*** FEASIBILITY DISAGREEMENT (LCG vs Chuffed) on %d instance(s): ***\n" ( length ds )
+      forM_ ds ( printf "  %s\n" )
+      putStrLn ""
+  -- Instances Chuffed errored on (notable, but not a timing result).
+  let errored = [ perfReproLabel c s | ( c, s, _, ChuffedError _ ) <- rows ]
+  case errored of
+    [] -> pure ()
+    es -> do
+      printf "Chuffed reported =====ERROR===== on %d instance(s):\n" ( length es )
+      forM_ es ( printf "  %s\n" )
+      putStrLn ""
+  -- Leaderboard: hardest for Chuffed relative to LCG.
+  printf "Chuffed-hardest instances (performerRehearsalInstance util perf dens k days songs %d seed):\n" perfMaxDur
+  printf "  %-34s %-14s %-14s %s\n"
+    ( "util perf dens k days songs seed" :: String )
+    ( "LCG" :: String ) ( "Chuffed" :: String ) ( "C/L" :: String )
+  forM_ ( take 30 ( sortOn sortKey rows ) ) \ ( c, s, lcg, chu ) ->
+    printf "  %-34s %-14s %-14s %s\n"
+      ( perfReproLabel c s ) ( fmtLcg lcg ) ( fmtChu chu ) ( fmtRatio lcg chu )
+  putStrLn ""
+  where
+    measureChuffed :: MiniZincOptions -> Instance -> IO ChuffedResult
+    measureChuffed opts inst = do
+      r <- try @MiniZincError ( minizincFeasible opts ( map fst inst ) )
+      pure $ case r of
+        Left _        -> ChuffedError "minizinc error"
+        Right outcome -> case status outcome of
+          Unknown    -> ChuffedTimeout
+          Feasible{} -> ChuffedSolved 'S' ( fromMaybe 0 ( solveTime outcome ) )
+          Infeasible -> ChuffedSolved 'U' ( fromMaybe 0 ( solveTime outcome ) )
+
+    -- Seconds, treating a timeout (or error) as the full budget.
+    budgetSecs :: Double
+    budgetSecs = fromIntegral perfTimeoutMicros / 1e6
+    lcgSecs :: Maybe ( Char, Word64 ) -> Double
+    lcgSecs = maybe budgetSecs ( \ ( _, t ) -> fromIntegral t / 1e9 )
+    chuSecs :: ChuffedResult -> Double
+    chuSecs = \ case
+      ChuffedSolved _ cs -> cs
+      ChuffedTimeout     -> budgetSecs
+      ChuffedError _     -> budgetSecs
+
+    -- Chuffed timeouts first (and among those, the LCG-easiest); then solved
+    -- instances by descending Chuffed/LCG ratio; errors sink to the bottom.
+    sortKey :: ChuffedRow -> ( Int, Double )
+    sortKey ( _, _, lcg, chu ) = case chu of
+      ChuffedTimeout     -> ( 0, lcgSecs lcg )
+      ChuffedSolved _ cs -> ( 1, negate ( cs / max 1e-6 ( lcgSecs lcg ) ) )
+      ChuffedError _     -> ( 2, 0 )
+
+    fmtLcg :: Maybe ( Char, Word64 ) -> String
+    fmtLcg = maybe "TIMEOUT" ( \ ( v, t ) -> printf "%c %s" v ( fmtNs t ) )
+    fmtChu :: ChuffedResult -> String
+    fmtChu = \ case
+      ChuffedSolved v cs -> printf "%c %.3f s" v cs
+      ChuffedTimeout     -> "TIMEOUT"
+      ChuffedError _     -> "ERROR"
+    fmtRatio :: Maybe ( Char, Word64 ) -> ChuffedResult -> String
+    fmtRatio lcg chu = printf "%.1f" ( chuSecs chu / max 1e-6 ( lcgSecs lcg ) )
 
 -- | Measure how much each (group of) expensive global propagator earns its
 -- keep.

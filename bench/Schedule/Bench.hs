@@ -3,13 +3,13 @@
 
 -- | Benchmarks for the unary-scheduling solvers.
 --
--- For each instance family we report two timings on the same instance:
+-- For each instance family we report three timings on the same instance:
 --
---  * /LCG/ — the full 'lcgSearch' (BCP + theory propagation + 1-UIP).
---  * /Z3/  — 'z3Feasible' as an external oracle.
+--  * /LCG/     — the full 'lcgSearch' (BCP + theory propagation + 1-UIP).
+--  * /Z3/      — Z3 SMT solver
+--  * /Chuffed/ — the MiniZinc lazy-clause-generation solver
 --
--- The ratio @LCG / Z3@ is the north-star comparison against an industrial
--- solver. See @bench/SAT/Bench.hs@ for the SAT-core-only counterpart.
+-- See @bench/SAT/Bench.hs@ for the SAT-core-only counterpart.
 module Schedule.Bench
   ( benchmarks )
   where
@@ -19,8 +19,18 @@ import Control.Monad
   ( replicateM_ )
 import Control.Exception
   ( Exception, evaluate, throwIO )
+import Data.IORef
+  ( IORef, newIORef, readIORef, modifyIORef' )
 import Data.Maybe
-  ( isJust )
+  ( fromMaybe, isJust )
+import Data.Word
+  ( Word64 )
+import System.Environment
+  ( lookupEnv )
+
+-- deepseq
+import Control.DeepSeq
+  ( NFData(rnf) )
 
 -- tasty
 import Test.Tasty
@@ -28,7 +38,7 @@ import Test.Tasty
 
 -- tasty-bench
 import Test.Tasty.Bench
-  ( Benchmark, Benchmarkable(..), RelStDev(..)
+  ( Benchmark, Benchmarkable(..), RelStDev(..), TimeMode(..)
   , bgroup, bench, env, whnf )
 
 -- unary-scheduling bench suite
@@ -48,6 +58,12 @@ import Schedule.Bench.Instances
 -- z3-oracle
 import Schedule.Z3
   ( Z3Feasibility(..), newZ3Env, z3FeasibleIn )
+
+-- minizinc-oracle
+import Schedule.MiniZinc
+  ( MiniZincOptions(..), MiniZincOutcome(..), MiniZincStatus(..)
+  , defaultMiniZincOptions, minizincFeasible
+  )
 
 -------------------------------------------------------------------------------
 -- The Z3 oracle.
@@ -74,21 +90,69 @@ benchZ3 inst = Benchmarkable \ n -> do
       Z3Decided mb  -> evaluate ( isJust mb )
 
 -------------------------------------------------------------------------------
+-- The MiniZinc/Chuffed oracle.
+
+-- | Thrown to abort a Chuffed benchmark case as soon as a single solve hits the
+-- MiniZinc time limit, mirroring 'Z3Timeout'.
+data MiniZincTimeout = MiniZincTimeout
+  deriving stock Show
+  deriving anyclass Exception
+
+-- | Chuffed feasibility benchmark.
+--
+-- We invoke @minizinc@ as an external process, so to properly report its time
+-- we need to use 'CustomTime' instead of relying on tasty-bench.
+benchMiniZinc :: IORef Word64 -> Instance -> Benchmarkable
+benchMiniZinc timeAccRef inst = Benchmarkable \ n -> do
+  exe <- fromMaybe "minizinc" <$> lookupEnv "MINIZINC"
+  let opts = defaultMiniZincOptions
+        { minizincExe = exe
+        , timeLimitMs = fromIntegral ( timeout_us `div` 1000 )
+        }
+      tasks = map fst inst
+  replicateM_ ( fromIntegral n ) do
+    outcome <- minizincFeasible opts tasks
+    case status outcome of
+      Unknown    -> throwIO MiniZincTimeout
+      Feasible{} -> pure ()
+      Infeasible -> pure ()
+    -- MiniZinc reports solveTime in seconds (millisecond resolution).
+    let solvePicoSecs = max 1_000_000_000 -- Chuffed has 1ms resolution
+                      $ round ( fromMaybe 0 ( solveTime outcome ) * 1e12 ) :: Word64
+    modifyIORef' timeAccRef ( + solvePicoSecs )
+
+-------------------------------------------------------------------------------
 -- Suite.
 
 -- | Wall-clock budget for each benchmark, in microseconds.
 timeout_us :: Integer
 timeout_us = 60_000_000 -- μs
 
--- | Two benchmarks (LCG, Z3) sharing one cached instance, presented as a
--- labelled group.
-triple :: String -> Instance -> Benchmark
-triple label inst =
-  env ( pure inst ) \ i ->
+data BenchEnv =
+  BenchEnv
+    { chuffedTimer  :: IORef Word64
+    , benchInstance :: Instance
+    }
+instance NFData BenchEnv where
+  rnf ( BenchEnv { benchInstance = inst } ) = rnf inst
+
+solverGroup :: String -> Instance -> Benchmark
+solverGroup label inst =
+  -- NB: lazy pattern match required by tasty-bench.
+  env mkEnv \ ~( BenchEnv { chuffedTimer, benchInstance = i } ) ->
     bgroup label
-      [ bench "LCG" ( whnf runLCG i )
-      , bench "Z3"  ( benchZ3 i )
+      [ bench "LCG"     ( whnf runLCG i )
+      , bench "Z3"      ( benchZ3 i )
+      , localOption ( CustomTime ( readIORef chuffedTimer ) )
+          -- Use 'CustomTime' to retrieve the solve time reported by minizinc.
+      $ localOption ( RelStDev ( 1 / 0 ) )
+      $ bench "Chuffed" ( benchMiniZinc chuffedTimer i )
       ]
+  where
+    mkEnv :: IO BenchEnv
+    mkEnv = do
+      chuffedTimer <- newIORef 0
+      pure $ BenchEnv { benchInstance = inst, chuffedTimer }
 
 benchmarks :: [ Benchmark ]
 benchmarks =
@@ -97,44 +161,44 @@ benchmarks =
 
   -- One benchmark group per distinct workload class.
   [ bgroup "staggered windows ~70% (heterogeneous; propagation + search)"
-      [ triple ( "n=" ++ show n ++ " maxDur=" ++ show d )
+      [ solverGroup ( "n=" ++ show n ++ " maxDur=" ++ show d )
                ( randomWindowedInstance 0.7 4 n d 42 )
       | ( n, d ) <- [ ( 4, 3 ), ( 6, 3 ), ( 8, 3 ), ( 12, 3 ), ( 16, 3 ) ]
       ]
   , bgroup "disjunctive clique (shared window; propagators idle, pure search)"
-      [ triple ( "n=" ++ show n ++ " d=" ++ show d )
+      [ solverGroup ( "n=" ++ show n ++ " d=" ++ show d )
                ( tightCliqueInstance n d )
       | ( n, d ) <- [ ( 4, 2 ), ( 6, 2 ), ( 8, 2 ), ( 12, 2 ), ( 16, 2 ) ]
       ]
   , bgroup "multi-day rehearsal (single director; day-assignment bin-packing)"
-      [ triple ( "days=" ++ show days ++ " songs=" ++ show songs )
+      [ solverGroup ( "days=" ++ show days ++ " songs=" ++ show songs )
                ( rehearsalInstance 0.9 0.6 days songs 8 42 )
       | ( days, songs ) <- [ ( 3, 9 ), ( 4, 12 ), ( 5, 15 ), ( 5, 20 ) ]
       ]
   , bgroup "tight feasible rehearsal (near boundary; forces backtracking)"
-      [ triple ( "days=" ++ show days ++ " songs=" ++ show songs )
+      [ solverGroup ( "days=" ++ show days ++ " songs=" ++ show songs )
                ( rehearsalInstance 1.0 0.4 days songs 8 seed )
       | ( days, songs, seed ) <- [ ( 4, 16, 5 ), ( 5, 20, 3 ), ( 6, 24, 3 ) ]
       ]
   , bgroup "infeasible: resource overload (demand twice the horizon)"
-      [ triple ( "n=" ++ show n ++ " d=" ++ show d )
+      [ solverGroup ( "n=" ++ show n ++ " d=" ++ show d )
                ( overloadedInstance n d )
       | ( n, d ) <- [ ( 4, 3 ), ( 6, 3 ), ( 8, 3 ), ( 12, 3 ) ]
       ]
   , bgroup "infeasible: interval pigeonhole (search-hard; overload-free)"
-      [ triple ( "slots=" ++ show m ++ " (" ++ show ( m + 1 ) ++ " tasks)" )
+      [ solverGroup ( "slots=" ++ show m ++ " (" ++ show ( m + 1 ) ++ " tasks)" )
                ( intervalPigeonholeInstance m 2 )
       | m <- [ 3, 4, 5, 6 ]
       ]
   , bgroup "infeasible: bin-packing fragmentation (overload-free; search-hard)"
-      [ triple ( "copies=" ++ show c ++ " (" ++ show ( 5 * c ) ++ " songs, " ++ show ( 3 * c ) ++ " days)" )
+      [ solverGroup ( "copies=" ++ show c ++ " (" ++ show ( 5 * c ) ++ " songs, " ++ show ( 3 * c ) ++ " days)" )
                ( infeasibleRehearsalInstance c )
       | c <- [ 1, 2, 3 ]
       ]
   -- Mined hard instances from the single-machine solvability phase-transition
   -- model (Wang, O'Gorman, Tran, Rieffel, Frank & Do, ICAPS 2017).
   , bgroup "phase transition (Wang et al. 2017; hard)"
-      [ triple
+      [ solverGroup
           ( "n=" ++ show n ++ " T/np\776=" ++ show ratioT
             ++ " w/T=" ++ show ratioW ++ " s=" ++ show seed )
           ( phaseTransitionAt ( 3, 19 ) n ratioT ratioW seed )
@@ -147,7 +211,7 @@ benchmarks =
       ]
   -- Mined hard instances of the performer-driven rehearsal model.
   , bgroup "performer-driven rehearsal (hard)"
-      [ triple
+      [ solverGroup
           ( "d=" ++ show days ++ " s=" ++ show songs ++ " perf=" ++ show perf
             ++ " k=" ++ show k ++ " s=" ++ show seed )
           ( performerRehearsalInstance util perf dens k days songs 8 seed )
@@ -158,6 +222,8 @@ benchmarks =
           , ( 1.00, 10, 0.75, 3,  6, 28,  6 )   -- infeasible, ~4.1s, 4606 conf
           , ( 1.00, 10, 0.75, 3,  7, 35, 20 )   -- feasible,   ~5.1s, 2973 conf
           , ( 0.95, 10, 0.75, 3,  7, 35, 15 )   -- infeasible, ~6.1s, 4072 conf
+          , ( 1.00, 10, 0.75, 2,  6, 28, 17 )   -- feasible,   ~46ms,  Chuffed >60s
+          , ( 1.00, 10, 0.75, 3,  7, 35,  9 )   -- infeasible, ~0.6ms, Chuffed 6.9s
           ]
       ]
   ]
