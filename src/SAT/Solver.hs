@@ -310,12 +310,12 @@ data SolverState s = SolverState
     -- VSIDS activity scores, current bump increment, and decay factor).
   , varOrder  :: !( VarOrder s )
 
-    -- | Transient per-literal marker used by 'preprocessClause' to detect
-    -- duplicate literals and tautologies in O(1) per literal.
+    -- | Transient per-literal marker, indexed by 'litIndex' (so two bits per
+    -- variable, one per polarity). Used by 'preprocessClause' to detect
+    -- duplicate literals and tautologies, and by 'binarySubsume' for O(1)
+    -- learnt-clause membership tests.
     --
-    -- Indexed by 'litIndex' (so two bits per variable: one per polarity).
-    --
-    -- Always @False@ outside of a 'preprocessClause' call.
+    -- Always @False@ outside of those calls.
   , seenLit   :: !( Growable Unboxed.MVector s Bit )
 
     -- | Search statistics and instrumentation counters.
@@ -1270,12 +1270,18 @@ analyse s conflict0 = do
   initTrail <- solverTrailSize s
   uipLit <- walkUIP s visit visitLit ( initTrail - 1 )
 
-  -- Drop self-subsumed body literals while 'seen' still marks the body. This
-  -- runs before the clause is built, so 'pickSecondWatch' sees the shorter body.
+  -- Drop self-subsumed body literals while 'seen' still marks the body.
   minimiseLearnt
     ( solverAssignments s )
     ( clauseDB s )
     ( analysisState s )
+
+  let asserting = negateLit uipLit
+
+  -- Strengthen the body further by subsumption resolution against binary
+  -- clauses (independent of 'seen', so order versus the clearance below is
+  -- immaterial).
+  binarySubsume s asserting
 
   -- Clear the 'seen' bits we set during this analysis (including variables
   -- 'minimiseLearnt' additionally marked while memoising proven-redundant ones).
@@ -1289,7 +1295,6 @@ analyse s conflict0 = do
               clearLoop ( i + 1 )
     clearLoop 0
 
-  let asserting = negateLit uipLit
   ( mbSecond, restLits, bjLevel ) <-
     pickSecondWatch analyseOtherLits analyseOtherLevels
   let learnt = case mbSecond of
@@ -1471,6 +1476,104 @@ minimiseLearnt assig clauseDB
               Growable.write minFailed var_idx ( Bit False )
               loop ( i + 1 )
       loop 0
+
+-- | Subsumption resolution against binary clauses (\"binary self-subsumption\").
+--
+-- A body literal @l@ of the learnt clause is dropped whenever the clause
+-- database holds a binary clause @¬l ∨ q@ with @q@ also in the learnt clause:
+-- resolving the two on @l@ yields the learnt clause minus @l@, which subsumes
+-- the original.
+--
+-- Precondition: every learnt-clause literal is currently assigned false (the
+-- post-analysis state), though only literal /identity/, not value, is used.
+binarySubsume
+  :: forall m
+  .  PrimMonad m
+  => SolverState ( PrimState m )
+  -> Lit -- ^ asserting literal: kept, but eligible as a surviving witness
+  -> m ()
+binarySubsume s asserting = do
+  let
+    AnalysisState { analyseOtherLits, analyseOtherLevels } = analysisState s
+    seenL = seenLit s
+    ws    = watches ( clauseDB s )
+  n <- Growable.length analyseOtherLits
+  -- Mark every literal of the learnt clause (asserting literal + body).
+  Growable.write seenL ( litIndex asserting ) ( Bit True )
+  let
+    markBody :: Int -> m ()
+    markBody !i
+      | i >= n    = pure ()
+      | otherwise = do
+          l <- Growable.read analyseOtherLits i
+          Growable.write seenL ( litIndex l ) ( Bit True )
+          markBody ( i + 1 )
+  markBody 0
+
+  let
+    -- Whether some binary clause @¬l ∨ q@ has @q@ a current clause member
+    -- (other than @l@ itself, which would be the tautology @¬l ∨ l@). The
+    -- watch list @watches[litIndex l]@ holds a 'WBinary' @q@ for exactly the
+    -- binary clauses @¬l ∨ q@ (see 'attachBinary' / 'pushWatcher').
+    subsumed :: Lit -> m Bool
+    subsumed l = do
+      wl <- Growable.read ws ( litIndex l )
+      m  <- Growable.length wl
+      let
+        scan :: Int -> m Bool
+        scan !k
+          | k >= m    = pure False
+          | otherwise = do
+              w <- Growable.read wl k
+              case w of
+                WLong {} -> scan ( k + 1 )
+                WBinary q
+                  | litIndex q == litIndex l -> scan ( k + 1 )
+                  | otherwise -> do
+                      Bit member <- Growable.read seenL ( litIndex q )
+                      if member
+                      then pure True
+                      else scan ( k + 1 )
+      scan 0
+
+    -- Walk the body, dropping subsumed literals and compacting both buffers in
+    -- lockstep (read index @ri@, write index @wi@), mirroring 'minimiseLearnt'.
+    compact :: Int -> Int -> m ()
+    compact !ri !wi
+      | ri >= n = do
+          Growable.truncate analyseOtherLits   wi
+          Growable.truncate analyseOtherLevels wi
+      | otherwise = do
+          l       <- Growable.read analyseOtherLits ri
+          dropLit <- subsumed l
+          if dropLit
+          then do
+            -- Unmark @l@ so it cannot in turn justify dropping another literal:
+            -- guards against an @l ≡ q@ pair (both @¬l ∨ q@ and @¬q ∨ l@ present)
+            -- eliminating both literals, which would be unsound.
+            Growable.write seenL ( litIndex l ) ( Bit False )
+            compact ( ri + 1 ) wi
+          else do
+            when ( wi /= ri ) do
+              lvl <- Growable.read analyseOtherLevels ri
+              Growable.write analyseOtherLits   wi l
+              Growable.write analyseOtherLevels wi lvl
+            compact ( ri + 1 ) ( wi + 1 )
+  compact 0 0
+
+  -- Clear the membership marks: the asserting literal plus every surviving body
+  -- literal (dropped ones were unmarked above), restoring 'seenLit' to all-False.
+  Growable.write seenL ( litIndex asserting ) ( Bit False )
+  finalN <- Growable.length analyseOtherLits
+  let
+    clearMarks :: Int -> m ()
+    clearMarks !i
+      | i >= finalN = pure ()
+      | otherwise = do
+          l <- Growable.read analyseOtherLits i
+          Growable.write seenL ( litIndex l ) ( Bit False )
+          clearMarks ( i + 1 )
+  clearMarks 0
 
 {- Note [Citability invariant]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
