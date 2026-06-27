@@ -34,30 +34,37 @@ module SAT.Clause
 -- base
 import Data.Bits
   ( shiftL, shiftR, (.|.), (.&.) )
+import Data.Int
+  ( Int32 )
 
 -- memory-arena
 import Memory.Arena
   ( Arena, newArena, arenaStorage, allocArray )
+import Memory.Prim
+  ( IsoPrim(..), As(..) )
 
 -- primitive
 import Control.Monad.Primitive
   ( PrimMonad(PrimState) )
 import Data.Primitive
-  ( Prim(..), sizeOf )
+  ( Prim, sizeOf )
 
 -- vector
 import qualified Data.Vector.Primitive.Mutable as PMV
 
 -- unary-scheduling
 import SAT.Base
-  ( Lit(..), LitOfValue(..), FalsifiedLit )
+  ( Lit(..), litIndex
+  , LitOfValue(..)
+  , FalsifiedLit
+  )
 
 -------------------------------------------------------------------------------
 -- Clause references.
 
 -- | A reference into a 'ClauseStore' (offset of a clause's header in the
 -- store's arena).
-newtype ClauseRef = ClauseRef { unCRef :: Int }
+newtype ClauseRef = ClauseRef { unCRef :: Int32 }
   deriving stock   Show
   deriving newtype ( Eq, Ord, Prim )
 
@@ -74,23 +81,23 @@ newtype FalsifiedClauseRef = FalsifiedClauseRef { falsifiedClause :: ClauseRef }
 data ClauseStore s = ClauseStore
   { csArena :: !( Arena s )
       -- ^ Bump allocator over the backing 'MutableByteArray'.
-  , csView  :: !( PMV.MVector s Int )
-      -- ^ Element-indexed view of the entire arena as raw 'Int' data.
+  , csView  :: !( PMV.MVector s Int32 )
+      -- ^ Element-indexed view of the entire arena as raw 'Int32' data.
       --
       -- Shares the same 'MutableByteArray' as 'csArena'.
   }
 
 -- | Allocate an empty store with the given capacity in bytes.
 --
--- Each clause consumes @sizeOf Int * (size + 1)@ bytes.
+-- Each clause consumes @sizeOf Int32 * (size + 1)@ bytes.
 newClauseStore
   :: PrimMonad m
   => Int -> m ( ClauseStore ( PrimState m ) )
 newClauseStore capBytes = do
-  let !ali     = sizeOf @Int undefined
-      !capInts = capBytes `div` ali
+  let !ali      = sizeOf @Int32 undefined
+      !capElems = capBytes `div` ali
   arena <- newArena capBytes ali
-  let view = PMV.MVector 0 capInts ( arenaStorage arena )
+  let view = PMV.MVector 0 capElems ( arenaStorage arena )
   pure ( ClauseStore arena view )
 
 -- | Append a fresh original (non-learnt) clause and return its reference.
@@ -112,17 +119,17 @@ recordRaw
   => ClauseStore ( PrimState m ) -> Bool -> [ Lit ] -> m ClauseRef
 recordRaw store learnt lits = do
   let !n = length lits
-  slice <- allocArray @Int ( csArena store ) ( n + 1 )
+  slice <- allocArray @Int32 ( csArena store ) ( n + 1 )
   -- The slice's offset (in elements) is exactly the 'ClauseRef'.
   let PMV.MVector startElem _ _ = slice
   PMV.unsafeWrite slice 0 ( encodeHeader n learnt )
-  let writeBody :: Int -> [ Lit ] -> m ()
+  let writeBody :: Int32 -> [ Lit ] -> m ()
       writeBody !_ [] = pure ()
       writeBody !i ( l : rest ) = do
-        PMV.unsafeWrite slice ( 1 + i ) ( litIndex l )
+        PMV.unsafeWrite slice ( fromIntegral $ 1 + i ) ( fromIntegral $ litIndex l )
         writeBody ( i + 1 ) rest
   writeBody 0 lits
-  pure ( ClauseRef startElem )
+  pure ( ClauseRef $ fromIntegral startElem )
 
 -- | Retrieve the 'Clause' from a reference into the clause store.
 --
@@ -131,28 +138,28 @@ clauseAt
   :: PrimMonad m
   => ClauseStore ( PrimState m ) -> ClauseRef -> m ( Clause ( PrimState m ) )
 clauseAt store ( ClauseRef ref ) = do
-  hdr <- PMV.unsafeRead ( csView store ) ref
+  hdr <- PMV.unsafeRead ( csView store ) ( fromIntegral ref )
   let ( !sz, !learnt ) = decodeHeader hdr
-      body = PMV.unsafeSlice ( ref + 1 ) sz ( csView store )
+      body = PMV.unsafeSlice ( fromIntegral $ ref + 1 ) sz ( csView store )
   pure ( Clause body learnt )
   -- NB: this is the only function that knows about the layout
   -- of the clause store header.
 
--- | Pack a clause's size and learnt-flag into a single header 'Int':
+-- | Pack a clause's size and learnt-flag into a single header 'Int32':
 -- the low bit is the learnt flag, the remaining bits are the size.
-encodeHeader :: Int -> Bool -> Int
-encodeHeader sz learnt = ( sz `shiftL` 1 ) .|. ( if learnt then 1 else 0 )
+encodeHeader :: Int -> Bool -> Int32
+encodeHeader sz learnt = ( fromIntegral sz `shiftL` 1 ) .|. ( if learnt then 1 else 0 )
 
 -- | Inverse of 'encodeHeader'.
-decodeHeader :: Int -> ( Int, Bool )
-decodeHeader h = ( h `shiftR` 1, ( h .&. 1 ) /= 0 )
+decodeHeader :: Int32 -> ( Int, Bool )
+decodeHeader h = ( fromIntegral ( h `shiftR` 1 ), ( h .&. 1 ) /= 0 )
 
 -------------------------------------------------------------------------------
 -- Clauses (transient views).
 
 -- | A view of a clause's literal body together with its learnt flag.
 data Clause s = Clause
-  { clauseBody   :: {-# UNPACK #-} !( PMV.MVector s Int )
+  { clauseBody   :: {-# UNPACK #-} !( PMV.MVector s Int32 )
   , clauseLearnt :: !Bool
   }
 
@@ -163,7 +170,7 @@ isLearnt :: Clause s -> Bool
 isLearnt = clauseLearnt
 
 clauseLit :: PrimMonad m => Clause ( PrimState m ) -> Int -> m Lit
-clauseLit c i = Lit <$> PMV.unsafeRead ( clauseBody c ) i
+clauseLit c i = Lit . fromIntegral <$> PMV.unsafeRead ( clauseBody c ) i
 
 clauseSwap :: PrimMonad m => Clause ( PrimState m ) -> Int -> Int -> m ()
 clauseSwap c = PMV.unsafeSwap ( clauseBody c )
@@ -179,7 +186,7 @@ clauseToList c = go ( clauseSize c - 1 ) []
       | i < 0     = pure acc
       | otherwise = do
           l <- PMV.unsafeRead v i
-          go ( i - 1 ) ( Lit l : acc )
+          go ( i - 1 ) ( Lit ( fromIntegral l ) : acc )
 
 -------------------------------------------------------------------------------
 -- Reasons.
@@ -206,7 +213,7 @@ data Reason
   | RLazy !LazyRef
 
 -- | A reference into the solver's lazy-reason table.
-newtype LazyRef = LazyRef { unLazyRef :: Int }
+newtype LazyRef = LazyRef { unLazyRef :: Int32 }
   deriving stock   Show
   deriving newtype ( Eq, Ord, Prim )
 
@@ -221,25 +228,18 @@ newtype LazyRef = LazyRef { unLazyRef :: Int }
 -- The returned list contains the literals of the supporting clause; the
 -- propagated literal may be included since 1-UIP analysis filters out
 -- the resolution variable.
-newtype LazyReason s = LazyReason
-  { forceLazyReason :: forall m. ( PrimMonad m, PrimState m ~ s ) => m [ Lit ] }
+data LazyReason s =
+  -- | A (still unevaluated) lazy reason.
+    LazyReason
+      ( forall m. ( PrimMonad m, PrimState m ~ s ) => m [ Lit ] )
+  -- | The value of an already-forced lazy reason.
+  | AlreadyForcedReason [ Lit ]
 
 -- | Fit a 'Reason' into an 'Int'.
-instance Prim Reason where
-  sizeOf# _    = sizeOf#    ( undefined :: Int )
-  alignment# _ = alignment# ( undefined :: Int )
-
-  indexByteArray# arr# i# = decodeReason ( indexByteArray# arr# i# )
-  readByteArray#  arr# i# s0 =
-    case readByteArray# arr# i# s0 of
-      (# s1, w #) -> (# s1, decodeReason ( w :: Int ) #)
-  writeByteArray# arr# i# r s0 = writeByteArray# arr# i# ( encodeReason r ) s0
-
-  indexOffAddr# addr# i# = decodeReason ( indexOffAddr# addr# i# )
-  readOffAddr#  addr# i# s0 =
-    case readOffAddr# addr# i# s0 of
-      (# s1, w #) -> (# s1, decodeReason ( w :: Int ) #)
-  writeOffAddr# addr# i# r s0 = writeOffAddr# addr# i# ( encodeReason r ) s0
+deriving via ( As Reason Int ) instance Prim Reason
+instance IsoPrim Reason Int where
+  toPrim   = encodeReason
+  fromPrim = decodeReason
 
 -- | Internal packing for the 'Prim' 'Reason' instance.
 --
@@ -249,9 +249,9 @@ encodeReason :: Reason -> Int
 encodeReason = \case
   RFact -> 0
   RDecision -> 1
-  RBinary ( FalsifiedLit lit ) -> 2 .|. ( litIndex lit `shiftL` 3 )
-  RClause ( ClauseRef ref ) -> 3 .|. ( ref `shiftL` 3 )
-  RLazy   ( LazyRef  ref ) -> 4 .|. ( ref `shiftL` 3 )
+  RBinary ( FalsifiedLit lit ) -> 2 .|. ( fromIntegral ( litIndex lit ) `shiftL` 3 )
+  RClause ( ClauseRef ref )    -> 3 .|. ( fromIntegral ref `shiftL` 3 )
+  RLazy   ( LazyRef  ref )     -> 4 .|. ( fromIntegral ref `shiftL` 3 )
 
 -- | Inverse of 'encodeReason'.
 decodeReason :: Int -> Reason
@@ -264,4 +264,4 @@ decodeReason w =
     4 -> RLazy   $ LazyRef ix
     _ -> error "SAT.Clause.decodeReason: invalid reason tag"
   where
-    ix = w `shiftR` 3
+    ix = fromIntegral w `shiftR` 3

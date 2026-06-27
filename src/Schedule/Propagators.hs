@@ -87,6 +87,10 @@ import Control.Lens.Fold
 import qualified Data.IntSet.Lens as IntSet
   ( members )
 
+-- memory-arena
+import Memory.Vector
+  ( ReadableVector(unsafeIndex) )
+
 -- mtl
 import Control.Monad.Except
   ( MonadError ( throwError ) )
@@ -120,10 +124,6 @@ import Data.Lattice
   , BoundedLattice
     ( top )
   , TotallyOrderedLattice
-  )
-import Data.Vector.Generic.Index
-  ( ReadableVector
-    ( unsafeIndex )
   )
 import Data.Vector.Ranking
   ( Ranking(..) )

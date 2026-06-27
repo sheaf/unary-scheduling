@@ -124,7 +124,7 @@ import SAT.Base
   , LitOfValue(..), SatisfiedLit, FalsifiedLit, negateLitOfValue
   )
 import SAT.Clause
-  ( Reason(..), LazyReason(..), forceLazyReason )
+  ( Reason(..), LazyReason(..) )
 import qualified SAT.Solver as SAT
 import Data.Lattice
   ( BoundedLattice(top, bottom) )
@@ -302,6 +302,8 @@ newTheory tis props opts = do
   let
     !numTasks = Boxed.Vector.length ( taskNames tis )
     !numAtoms = ( numTasks * ( numTasks - 1 ) ) `shiftR` 1
+  -- TODO (symmetry breaking): if some tasks are identical,
+  -- arbitrarily assign precedences to them to break symmetry.
   atoms <-
     if numAtoms == 0
     then pure ( mkPrecedenceAtoms numTasks 0 )
@@ -1083,7 +1085,8 @@ information (e.g. ground availabilities, task durations).
 boundReasonLits
   :: Lit -> ST s [ SatisfiedLit ] -> LazyReason s
 boundReasonLits propLit mkAntecedents =
-  LazyReason ( stToPrim ( ( propLit : ) . map ( underlyingLit . negateLitOfValue ) <$> mkAntecedents ) )
+  LazyReason
+    ( stToPrim ( ( propLit : ) . map ( underlyingLit . negateLitOfValue ) <$> mkAntecedents ) )
 
 -- | The precedence literal between @i@ and @p@ that the matrix currently holds
 -- (true on the trail), or 'Nothing' if they are unordered.
@@ -1480,11 +1483,14 @@ enqueuePropagated t lit reason = do
 instrumentedLazyReason
   :: MonitorMode mode
   => Monitor mode s -> LazyReason s -> LazyReason s
-instrumentedLazyReason mon reason =
-  LazyReason do
-    ls <- forceLazyReason reason
-    tickLazyForce mon ( length ls )
-    pure ls
+instrumentedLazyReason mon = \case
+  LazyReason forceReason ->
+    LazyReason do
+      ls <- forceReason
+      tickLazyForce mon ( length ls )
+      pure ls
+  AlreadyForcedReason r ->
+    AlreadyForcedReason r
 {-# SPECIALISE instrumentedLazyReason @MonitoringOff #-}
 
 #ifdef DEBUG
@@ -1557,7 +1563,10 @@ assert t label lit reason = do
     LTrue  -> pure Nothing
     LUndef -> enqueuePropagated t lit reason *> pure Nothing
     LFalse -> do
-      body <- forceLazyReason reason
+      -- Eagerly force the reason: we need it now. Don't generate a 'LazyRef'.
+      body <- case reason of
+        LazyReason forceIt -> forceIt
+        AlreadyForcedReason lits -> pure lits
       conflictClause t label ( map FalsifiedLit body )
 
 -------------------------------------------------------------------------------

@@ -4,13 +4,13 @@
 -- | Propositional variables, literals, and three-valued booleans.
 module SAT.Base
   ( -- * Variables
-    Var(..)
+    Var(..), varIndex
     -- * Polarity
   , Polarity( Positive, Negative )
   , negatePolarity
   , polarityValue
     -- * Literals
-  , Lit(..)
+  , Lit(..), litIndex
   , mkLit
   , litVar
   , litPolarity
@@ -29,6 +29,8 @@ module SAT.Base
 -- base
 import Data.Bits
   ( shiftL, shiftR, xor, (.|.), (.&.) )
+import Data.Int
+  ( Int32 )
 import Data.Kind
   ( Type )
 import Data.Type.Bool
@@ -66,9 +68,13 @@ import qualified Data.Vector.Unboxed.Mutable as Unboxed
 -- Variables.
 
 -- | A propositional variable, identified by its 0-based index.
-newtype Var = Var { varIndex :: Int }
+newtype Var = Var Int32
   deriving stock   ( Eq, Ord, Show, Generic )
   deriving newtype ( NFData, Prim )
+
+varIndex :: Var -> Int
+varIndex ( Var v ) = fromIntegral v
+{-# INLINE varIndex #-}
 
 -------------------------------------------------------------------------------
 -- Polarity.
@@ -108,19 +114,18 @@ polarityValue Negative = LFalse
 -- Literals.
 
 -- | A signed propositional variable. Build with 'mkLit'.
-newtype Lit =
-  Lit {
-    -- | The literal's nonnegative integer key, in the range
-    -- @[0, 2 * numVars)@.
-    litIndex :: Int
-  }
+newtype Lit = Lit Int32
   deriving stock   ( Eq, Ord, Show, Generic )
   deriving newtype ( NFData, Prim )
 
-newtype instance Unboxed.MVector s Lit = MVLit ( Unboxed.MVector s Int )
-newtype instance Unboxed.Vector    Lit = VLit  ( Unboxed.Vector    Int )
+-- | The literal's nonnegative integer key, in the range  @[0, 2 * numVars)@.
+litIndex :: Lit -> Int
+litIndex ( Lit i ) = fromIntegral i
+
+newtype instance Unboxed.MVector s Lit = MVLit ( Unboxed.MVector s Int32 )
+newtype instance Unboxed.Vector    Lit = VLit  ( Unboxed.Vector    Int32 )
 deriving newtype instance Generic.MVector Unboxed.MVector Lit
-deriving newtype instance Generic.Vector Unboxed.Vector Lit
+deriving newtype instance Generic.Vector  Unboxed.Vector  Lit
 deriving newtype instance Vector.Unbox Lit
 
 mkLit :: Var -> Polarity -> Lit

@@ -64,6 +64,14 @@ import Control.Lens
 import Data.Generics.Product.Fields
   ( field' )
 
+-- memory-arena
+import Memory.Vector
+  ( Freeze
+      ( unsafeFreeze )
+  , Thaw
+      ( thaw )
+  )
+
 -- mtl
 import Control.Monad.Except
   ( MonadError )
@@ -101,12 +109,6 @@ import qualified Data.Vector as Boxed.Vector
   ( length, fromList, unzip, unsafeThaw )
 
 -- unary-scheduling
-import Data.Vector.PhaseTransition
-  ( Freeze
-      ( unsafeFreeze )
-  , Thaw
-      ( thaw )
-  )
 import Data.Vector.Ranking
   ( rankOn )
 import Schedule.Constraint
@@ -262,7 +264,7 @@ assertHeadroom tasks =
           , "  maxBound = " <> show ( maxBound :: t )
           , "  min est  = " <> show minEst
           , "  max lct  = " <> show maxLct
-          , "  total duration (largest Θ shift) = " <> show totalDur
+          , "  total duration = " <> show totalDur
           ]
       | otherwise
       -> pure ()

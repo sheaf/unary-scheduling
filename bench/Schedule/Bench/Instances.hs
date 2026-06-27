@@ -73,14 +73,9 @@ import Schedule.Time
 -- A small, bounded time type matching the test suite.
 
 newtype BenchTime = BenchTime Int
-  deriving newtype ( Eq, Ord, Num, Real, Measurable, NFData )
-
+  deriving newtype ( Eq, Ord, Bounded, Num, Real, Measurable, NFData )
 instance Show BenchTime where
   show ( BenchTime t ) = show t
-
-instance Bounded BenchTime where
-  minBound = BenchTime 0
-  maxBound = BenchTime 100000
 
 type BenchTask = Task () BenchTime
 type Instance  = [ ( BenchTask, Text ) ]

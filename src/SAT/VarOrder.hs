@@ -25,12 +25,14 @@ import Control.Monad
   ( when )
 import Data.Bits
   ( shiftL, shiftR )
+import Data.Int
+  ( Int32 )
 
 -- primitive
 import Control.Monad.Primitive
   ( PrimMonad(PrimState) )
 import Data.Primitive
-  ( Prim(..) )
+  ( Prim )
 import Data.Primitive.MutVar
   ( MutVar, newMutVar, readMutVar, modifyMutVar' )
 
@@ -38,6 +40,8 @@ import Data.Primitive.MutVar
 import Memory.Growable
   ( Growable )
 import qualified Memory.Growable as Growable
+import Memory.Prim
+  ( IsoPrim(..), As(..) )
 
 -- vector
 import qualified Data.Vector.Primitive.Mutable as Primitive
@@ -63,23 +67,10 @@ data HeapPos
     InHeap !Int
 
 -- | Packed into a single 'Int'.
-instance Prim HeapPos where
-  sizeOf# _    = sizeOf#    ( undefined :: Int )
-  alignment# _ = alignment# ( undefined :: Int )
-
-  indexByteArray# arr# i# = decodeHeapPos ( indexByteArray# arr# i# )
-  readByteArray#  arr# i# s0 =
-    case readByteArray# arr# i# s0 of
-      (# s1, w #) -> (# s1, decodeHeapPos ( w :: Int ) #)
-  writeByteArray# arr# i# hp s0 =
-    writeByteArray# arr# i# ( encodeHeapPos hp ) s0
-
-  indexOffAddr# addr# i# = decodeHeapPos ( indexOffAddr# addr# i# )
-  readOffAddr#  addr# i# s0 =
-    case readOffAddr# addr# i# s0 of
-      (# s1, w #) -> (# s1, decodeHeapPos ( w :: Int ) #)
-  writeOffAddr# addr# i# hp s0 =
-    writeOffAddr# addr# i# ( encodeHeapPos hp ) s0
+deriving via ( As HeapPos Int ) instance Prim HeapPos
+instance IsoPrim HeapPos Int where
+  toPrim   = encodeHeapPos
+  fromPrim = decodeHeapPos
 
 -- | Internal packing for the 'Prim' 'HeapPos' instance.
 encodeHeapPos :: HeapPos -> Int
@@ -134,8 +125,8 @@ newVarOrder decay = do
     }
 
 -- | Number of variables registered with this 'VarOrder'.
-numVars :: PrimMonad m => VarOrder ( PrimState m ) -> m Int
-numVars vo = Growable.length ( activity vo )
+numVars :: PrimMonad m => VarOrder ( PrimState m ) -> m Int32
+numVars vo = fromIntegral <$> Growable.length ( activity vo )
 
 -- | Allocate a fresh variable with zero activity and append it at the
 -- bottom of the heap.
@@ -180,7 +171,7 @@ bumpActivity :: PrimMonad m => VarOrder ( PrimState m ) -> Var -> m ()
 bumpActivity vo v = do
   inc <- readMutVar ( varInc vo )
   let vi = varIndex v
-  Growable.modify ( activity vo ) ( + inc ) vi
+  Growable.modify ( activity vo ) vi ( + inc )
   a <- Growable.read ( activity vo ) vi
   -- Rescale before any single activity threatens to overflow.
   when ( a > 1e100 ) ( rescaleActivities vo )
@@ -264,7 +255,7 @@ rescaleActivities vo = do
   n <- Growable.length ( activity vo )
   let go !i
         | i >= n    = pure ()
-        | otherwise = Growable.modify ( activity vo ) ( * 1e-100 ) i *> go ( i + 1 )
+        | otherwise = Growable.modify ( activity vo ) i ( * 1e-100 ) *> go ( i + 1 )
   go 0
   modifyMutVar' ( varInc vo ) ( * 1e-100 )
 

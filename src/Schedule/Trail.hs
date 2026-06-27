@@ -26,6 +26,8 @@ import Control.Monad.Primitive
   ( PrimMonad(PrimState) )
 import Data.Primitive.MutVar
   ( MutVar, newMutVar, readMutVar, writeMutVar, modifyMutVar' )
+import Data.Primitive.PrimVar
+  ( PrimVar, newPrimVar, readPrimVar, writePrimVar, modifyPrimVar )
 
 -- vector
 import qualified Data.Vector.Mutable as Boxed.MVector
@@ -115,17 +117,17 @@ data Trail s task t
   = Trail
   { trailUndos :: !( MutVar s [ Action task t ] )
      -- ^ Inverse actions (most recent first).
-  , trailDepth :: !( MutVar s Int )
+  , trailDepth :: !( PrimVar s Int )
      -- ^ Number of recorded mutations.
   }
 
 -- | Create a fresh, empty trail.
 newTrail :: PrimMonad m => m ( Trail ( PrimState m ) task t )
-newTrail = Trail <$> newMutVar [] <*> newMutVar 0
+newTrail = Trail <$> newMutVar [] <*> newPrimVar 0
 
 -- | The current trail depth.
 currentMark :: PrimMonad m => Trail ( PrimState m ) task t -> m Int
-currentMark = readMutVar . trailDepth
+currentMark = readPrimVar . trailDepth
 
 -- | Apply an action to the shared state and record its inverse for later undo.
 record
@@ -137,7 +139,7 @@ record
 record trail tis act = do
   inv <- runAction tis act
   modifyMutVar' ( trailUndos trail ) ( inv : )
-  modifyMutVar' ( trailDepth trail ) ( + 1 )
+  modifyPrimVar ( trailDepth trail ) ( + 1 )
 
 -- | Undo recorded mutations until the trail is back at the given mark.
 undoTo
@@ -149,7 +151,7 @@ undoTo
 undoTo trail tis target = go
   where
     go = do
-      d <- readMutVar ( trailDepth trail )
+      d <- readPrimVar ( trailDepth trail )
       when ( d > target ) do
         us <- readMutVar ( trailUndos trail )
         case us of
@@ -158,7 +160,7 @@ undoTo trail tis target = go
           ( u : rest ) -> do
             _ <- runAction tis u
             writeMutVar ( trailUndos trail ) rest
-            writeMutVar ( trailDepth trail ) ( d - 1 )
+            writePrimVar ( trailDepth trail ) ( d - 1 )
             go
 
 -------------------------------------------------------------------------------

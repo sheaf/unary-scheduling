@@ -105,7 +105,7 @@ nativeSolve ( CNF nVars cls ) = runST \ @s -> do
     options = defaultOptions { optConflictBudget = 50000 }
 
 rawToLit :: RawLit -> Lit
-rawToLit ( RawLit i pol ) = mkLit ( Var i ) pol
+rawToLit ( RawLit i pol ) = mkLit ( Var ( fromIntegral i ) ) pol
 
 -- | Post every clause. Returns 'False' once any clause makes the problem
 -- instantly UNSAT; subsequent clauses are skipped.
@@ -146,7 +146,7 @@ modelSatisfies :: Assignment -> CNF -> Bool
 modelSatisfies a ( CNF _ cls ) = all clauseHolds cls
   where
     clauseHolds = any litHolds
-    litHolds ( RawLit i pol ) = case assignmentValue ( Var i ) a of
+    litHolds ( RawLit i pol ) = case assignmentValue ( Var ( fromIntegral i ) ) a of
       LTrue  -> case pol of { Positive -> True;  Negative -> False }
       LFalse -> case pol of { Positive -> False; Negative -> True  }
       LUndef -> True   -- free variable: the model is consistent under either value

@@ -36,6 +36,10 @@ import Data.Bit
 import Control.DeepSeq
   ( NFData )
 
+-- memory-arena
+import Memory.Vector
+  ( ReadableVector(unsafeIndex), Freeze(..), Thaw(..) )
+
 -- mtl
 import Control.Monad.Except
   ( MonadError ( throwError ) )
@@ -74,10 +78,6 @@ import qualified Algebra.Graph.Export.Dot as Alga
 -- unary-scheduling
 import Data.Lattice
   ( Lattice(..), BoundedLattice(..), Heyting(..) )
-import Data.Vector.PhaseTransition
-  ( Freeze(..), Thaw(..) )
-import Data.Vector.Generic.Index
-  ( ReadableVector(unsafeIndex) )
 
 -------------------------------------------------------------------------------
 

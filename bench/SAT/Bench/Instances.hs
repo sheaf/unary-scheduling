@@ -71,16 +71,19 @@ solveCNF :: CNF -> Verdict
 solveCNF ( CNF nVars cls ) = runST \ @s -> do
   solver <- newSolver @( ST s )
   replicateM_ nVars ( newVar solver )
-  let toLit ( i, pol ) = mkLit ( Var i ) pol
-      addStep :: Bool -> Clause -> ST s Bool
-      addStep False _  = pure False
-      addStep True  cl = do
-        r <- addClause solver ( map toLit cl )
-        pure ( r /= InstantUnsat )
+  let
+    addStep :: Bool -> Clause -> ST s Bool
+    addStep False _  = pure False
+    addStep True  cl = do
+      r <- addClause solver ( map toLit cl )
+      pure ( r /= InstantUnsat )
   ok <- foldM addStep True cls
   if not ok
   then pure Unsat
   else solveWith defaultOptions solver
+
+toLit :: ( Int, Polarity ) -> Lit
+toLit ( i, pol ) = mkLit ( Var ( fromIntegral i ) ) pol
 
 -------------------------------------------------------------------------------
 -- Pigeonhole (UNSAT).
@@ -266,12 +269,12 @@ solveTwice :: CNF -> Verdict
 solveTwice ( CNF nVars cls ) = runST \ @s -> do
   solver <- newSolver @( ST s )
   replicateM_ nVars ( newVar solver )
-  let toLit ( i, pol ) = mkLit ( Var i ) pol
-      addStep :: Bool -> Clause -> ST s Bool
-      addStep False _  = pure False
-      addStep True  cl = do
-        r <- addClause solver ( map toLit cl )
-        pure ( r /= InstantUnsat )
+  let
+    addStep :: Bool -> Clause -> ST s Bool
+    addStep False _  = pure False
+    addStep True  cl = do
+      r <- addClause solver ( map toLit cl )
+      pure ( r /= InstantUnsat )
   ok <- foldM addStep True cls
   if not ok
   then pure Unsat
@@ -281,10 +284,12 @@ solveTwice ( CNF nVars cls ) = runST \ @s -> do
       Sat -> do
         m <- getModel solver
         let blockingLit :: Int -> Maybe Lit
-            blockingLit i = case assignmentValue ( Var i ) m of
-              LTrue  -> Just ( mkLit ( Var i ) Negative )
-              LFalse -> Just ( mkLit ( Var i ) Positive )
-              LUndef -> Nothing
+            blockingLit i =
+              let v = Var ( fromIntegral i )
+              in case assignmentValue v m of
+                LTrue  -> Just ( mkLit v Negative )
+                LFalse -> Just ( mkLit v Positive )
+                LUndef -> Nothing
             blocking = mapMaybe blockingLit [ 0 .. nVars - 1 ]
         r <- addClause solver blocking
         case r of

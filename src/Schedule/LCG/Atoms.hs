@@ -124,12 +124,14 @@ mkPrecedenceAtoms d firstIx =
 precLit :: PrecedenceAtoms -> Int -> Int -> Lit
 precLit ps predTask succTask = case compare predTask succTask of
   EQ -> error "Schedule.LCG.Atoms.precLit: predecessor equals successor"
-  LT -> mkLit
-          ( Var ( firstVarIx ps + upperTriangular ( dim ps ) predTask succTask ) )
-          Positive
-  GT -> mkLit
-          ( Var ( firstVarIx ps + upperTriangular ( dim ps ) succTask predTask ) )
-          Negative
+  LT ->
+    mkLit
+      ( Var $ fromIntegral $ firstVarIx ps + upperTriangular ( dim ps ) predTask succTask )
+      Positive
+  GT ->
+    mkLit
+      ( Var $ fromIntegral $ firstVarIx ps + upperTriangular ( dim ps ) succTask predTask )
+      Negative
 
 -- | Decode a literal into its directed precedence @(predecessor, successor)@
 -- pair: @Just (p, s)@ when the literal asserts @T_p ≺ T_s@, 'Nothing' if
@@ -176,14 +178,10 @@ data BoundAtoms s t = BoundAtoms
 -- index one past the last precedence atom (i.e. 'numAtoms' of the precedence
 -- block).
 newBoundAtoms :: Int -> ST s ( BoundAtoms s t )
-newBoundAtoms firstIx = do
-  fwd <- newMutVar IntMap.empty
-  rev <- newMutVar IntMap.empty
-  pure BoundAtoms
-    { firstBoundVar = firstIx
-    , boundFwd      = fwd
-    , boundRev      = rev
-    }
+newBoundAtoms firstBoundVar = do
+  boundFwd <- newMutVar IntMap.empty
+  boundRev <- newMutVar IntMap.empty
+  pure $ BoundAtoms { .. }
 
 -- | Get-or-create the latest-start atom @start ≤ l@ for a task, returning its
 -- positive literal and whether the atom was freshly created.

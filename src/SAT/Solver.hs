@@ -75,6 +75,8 @@ module SAT.Solver
   , installLearnt
   , resolveConflict
   , recordLazyReason
+  , getLazyReason
+  , forceLazyReason
   , recordTheoryClause
   , recordFalsifiedClause
   , ClauseRef(..)
@@ -92,6 +94,8 @@ import Data.Bits
   ( (.&.), (.|.), unsafeShiftL )
 import Data.Foldable
   ( for_ )
+import Data.Int
+  ( Int32 )
 import Data.List
   ( intercalate )
 import Data.Word
@@ -111,18 +115,16 @@ import qualified Data.IntMap.Strict as IntMap
 import Control.Monad.Primitive
   ( PrimMonad(PrimState) )
 import Data.Primitive
-  ( Prim(..) )
+  ( Prim )
 import Data.Primitive.MutVar
   ( MutVar, newMutVar, readMutVar, writeMutVar, modifyMutVar' )
-
--- ghc-prim
-import GHC.Exts
-  ( (+#), (*#) )
 
 -- memory-arena
 import Memory.Growable
   ( Growable )
 import qualified Memory.Growable as Growable
+import Memory.Prim
+  ( IsoPrim(..), As(..), P2(..) )
 
 -- vector
 import qualified Data.Vector.Generic as Generic
@@ -144,7 +146,7 @@ import qualified Data.Vector.Unboxed.Mutable as Unboxed
 import SAT.Base
   ( Var(..), varIndex
   , Polarity(..), polarityValue
-  , Lit, litIndex, mkLit, litVar, litPolarity, negateLit
+  , Lit(..), litIndex, mkLit, litVar, litPolarity, negateLit
   , LBool(..)
   , litValueFromVar
   , LitOfValue(..), FalsifiedLit
@@ -159,7 +161,6 @@ import SAT.Clause
 import qualified SAT.Clause as Clause
   ( Reason(..), LazyReason(..), LazyRef(..)
   , clauseAt, recordClause, recordLearntClause
-  , forceLazyReason
   )
 import qualified SAT.Restart as Restart
   ( luby )
@@ -208,12 +209,12 @@ abstractLevel ( DecisionLevel l ) = 1 `unsafeShiftL` ( l .&. 63 )
 --
 -- Also used to express the trail's length / the "one past the last assignment"
 -- anchor of a decision level.
-newtype TrailPos = TrailPos { unTrailPos :: Int }
+newtype TrailPos = TrailPos { unTrailPos :: Int32 }
   deriving stock   Show
   deriving newtype ( Eq, Ord, Num )
 
-newtype instance Unboxed.MVector s TrailPos = MVTrailPos ( Unboxed.MVector s Int )
-newtype instance Unboxed.Vector    TrailPos = VTrailPos  ( Unboxed.Vector    Int )
+newtype instance Unboxed.MVector s TrailPos = MVTrailPos ( Unboxed.MVector s Int32 )
+newtype instance Unboxed.Vector    TrailPos = VTrailPos  ( Unboxed.Vector    Int32 )
 deriving newtype instance Generic.MVector Unboxed.MVector TrailPos
 deriving newtype instance Generic.Vector  Unboxed.Vector  TrailPos
 deriving newtype instance Vector.Unbox TrailPos
@@ -269,46 +270,15 @@ data Watcher
     -- whose current truth lets BCP skip fetching the clause altogether.
     WLong !ClauseRef !Lit
 
--- | A 'Watcher' is encoded in two adjacent 'Int's: a 'ClauseRef' followed by a 'Lit'.
-instance Prim Watcher where
-  sizeOf# _ = sizeOf# ( undefined :: ClauseRef ) +# sizeOf# ( undefined :: Lit )
-  alignment# _ = alignment# ( undefined :: ClauseRef )
-
-  indexByteArray# arr# i# =
-    let !cr  = indexByteArray# arr# ( i# *# 2# )      :: ClauseRef
-        !lit = indexByteArray# arr# ( i# *# 2# +# 1# ) :: Lit
-    in decodeWatcher cr lit
-  readByteArray# arr# i# s0 =
-    case readByteArray# arr# ( i# *# 2# ) s0 of
-      (# s1, cr #) ->
-        case readByteArray# arr# ( i# *# 2# +# 1# ) s1 of
-          (# s2, lit #) -> (# s2, decodeWatcher ( cr :: ClauseRef ) ( lit :: Lit ) #)
-  writeByteArray# arr# i# w s0 =
-    case w of
-      WBinary lit ->
-        case writeByteArray# arr# ( i# *# 2# ) ( ClauseRef -1 ) s0 of
-          s1 -> writeByteArray# arr# ( i# *# 2# +# 1# ) lit s1
-      WLong cref lit ->
-        case writeByteArray# arr# ( i# *# 2# ) cref s0 of
-          s1 -> writeByteArray# arr# ( i# *# 2# +# 1# ) lit s1
-
-  indexOffAddr# addr# i# =
-    let !cr  = indexOffAddr# addr# ( i# *# 2# )      :: ClauseRef
-        !lit = indexOffAddr# addr# ( i# *# 2# +# 1# ) :: Lit
-    in decodeWatcher cr lit
-  readOffAddr# addr# i# s0 =
-    case readOffAddr# addr# ( i# *# 2# ) s0 of
-      (# s1, cr #) ->
-        case readOffAddr# addr# ( i# *# 2# +# 1# ) s1 of
-          (# s2, lit #) -> (# s2, decodeWatcher ( cr :: ClauseRef ) ( lit :: Lit ) #)
-  writeOffAddr# addr# i# w s0 =
-    case w of
-      WBinary lit ->
-        case writeOffAddr# addr# ( i# *# 2# ) ( ClauseRef -1 ) s0 of
-          s1 -> writeOffAddr# addr# ( i# *# 2# +# 1# ) lit s1
-      WLong cref lit ->
-        case writeOffAddr# addr# ( i# *# 2# ) cref s0 of
-          s1 -> writeOffAddr# addr# ( i# *# 2# +# 1# ) lit s1
+-- | A 'Watcher' is encoded in two adjacent 'Int32's: a 'ClauseRef' followed by
+-- a 'Lit'. Both a clause-arena offset and a literal index fit comfortably in
+-- 32 bits, so the watch entry is 8 bytes rather than 16.
+deriving via ( As Watcher ( P2 Int32 ) ) instance Prim Watcher
+instance IsoPrim Watcher ( P2 Int32 ) where
+  toPrim = \case
+    WBinary ( Lit lit )                -> P2 -1 lit
+    WLong ( ClauseRef cr ) ( Lit lit ) -> P2 cr lit
+  fromPrim ( P2 cr lit ) = decodeWatcher ( ClauseRef cr ) ( Lit lit )
 
 -- | Internal round-trip helper for the 'Prim' 'Watcher' instance.
 decodeWatcher :: ClauseRef -> Lit -> Watcher
@@ -653,16 +623,16 @@ dumpSolverState s@( SolverState { solverAssignments = assigs@( Assignments { tra
   DecisionLevel cur <- currentLevel s
   nLim              <- Growable.length ( levelStarts trail )
   let
-    readLim :: Int -> m Int
+    readLim :: Int32 -> m Int32
     readLim k = do
       LevelStart { levelTrailPos = TrailPos p }
-        <- Growable.read ( levelStarts trail ) k
+        <- Growable.read ( levelStarts trail ) ( fromIntegral k )
       pure p
-    showLits :: Int -> m [ String ]
+    showLits :: Int32 -> m [ String ]
     showLits k
       | k >= sz   = pure []
       | otherwise = do
-          l   <- Growable.read ( entries trail ) k
+          l   <- Growable.read ( entries trail ) ( fromIntegral k )
           lvl <- Growable.read ( level  $ varData assigs ) ( varIndex ( litVar l ) )
           rsn <- Growable.read ( reason $ varData assigs ) ( varIndex ( litVar l ) )
           val <- Growable.read ( assignments assigs ) ( varIndex ( litVar l ) )
@@ -671,9 +641,9 @@ dumpSolverState s@( SolverState { solverAssignments = assigs@( Assignments { tra
                  ++ "  lvl=" ++ ( case lvl of UnassignedLevel -> "UNASSIGNED"; DecisionLevel d -> show d )
                  ++ "  assign=" ++ show val
                  ++ "  reason=" ++ showReason rsn ) : rest )
-    limLine :: Int -> m [ String ]
+    limLine :: Int32 -> m [ String ]
     limLine k
-      | k >= nLim = pure []
+      | fromIntegral k >= nLim = pure []
       | otherwise = do
           p <- readLim k
           rest <- limLine ( k + 1 )
@@ -728,10 +698,12 @@ describeConflict s = \case
           ++ "  reason=" ++ showReason rsn
 
 solverTrailSize :: PrimMonad m => SolverState ( PrimState m ) -> m TrailPos
-solverTrailSize s = TrailPos <$> Growable.length ( entries ( trail $ solverAssignments s ) )
+solverTrailSize s = TrailPos . fromIntegral
+                 <$> Growable.length ( entries ( trail $ solverAssignments s ) )
 
 trailSize :: PrimMonad m => AssignmentTrail ( PrimState m ) -> m TrailPos
-trailSize trail = TrailPos <$> Growable.length ( entries trail )
+trailSize trail = TrailPos . fromIntegral
+               <$> Growable.length ( entries trail )
 
 
 numConflicts, numDecisions :: PrimMonad m => SolverState ( PrimState m ) -> m Int
@@ -845,7 +817,7 @@ pushWatcher cdb watched w = do
   -- We want to watch the literal being falsified, so the trigger to wake-up
   -- is when the negated literal is assigned true.
   let trigger = negateLit watched
-  inner <- Growable.read ( watches cdb ) ( litIndex trigger )
+  inner <- Growable.read ( watches cdb ) ( fromIntegral $ litIndex trigger )
   Growable.push inner w
 
 -- | Register a binary clause @[l, m]@ inline on both watch lists. No
@@ -1026,7 +998,7 @@ propagate s@( SolverState { solverAssignments = Assignments { trail } } ) = loop
       if q >= sz
       then pure Nothing
       else do
-        p <- Growable.read ( entries trail ) ( unTrailPos q )
+        p <- Growable.read ( entries trail ) ( fromIntegral $ unTrailPos q )
         writeMutVar ( trailHead trail ) ( q + 1 )
         mbConf <- propagateLit s p
         case mbConf of
@@ -1250,7 +1222,7 @@ analyse s conflict0 = do
         if lvl <= GroundLevel
         then pure ()
         else do
-          VarOrder.bumpActivity ( varOrder s ) ( Var i )
+          VarOrder.bumpActivity ( varOrder s ) ( Var $ fromIntegral i )
           markSeen i
           if lvl >= curLevel
           then modifyMutVar' analysePathC ( + 1 )
@@ -1408,8 +1380,12 @@ minimiseLearnt assig clauseDB
         Clause.RBinary other -> covered abstraction other
         Clause.RClause cref  -> clauseOthersCovered abstraction cref i
         Clause.RLazy lref    ->
-          do { others <- forceLazy ( trail assig ) lref
-             ; othersCovered abstraction i $ map FalsifiedLit others
+          -- NB: we don't force lazy reasons just for the purpose of minimisation.
+          do { lazyReason <- getLazyReason ( trail assig ) lref
+             ; case lazyReason of
+                Clause.LazyReason {} -> pure False
+                Clause.AlreadyForcedReason others ->
+                  othersCovered abstraction i $ map FalsifiedLit others
              }
 
     -- Whether reason-literal @q@ is covered: at the ground level, already a
@@ -1537,11 +1513,11 @@ walkUIP
   visit visitLit
   ( TrailPos start ) = go start
   where
-    go :: Int -> m Lit
+    go :: Int32 -> m Lit
     go !idx
       | idx < 0 = error "SAT.Solver.analyse: trail underflow during UIP scan"
       | otherwise = do
-          lit <- Growable.read ( entries trail ) idx
+          lit <- Growable.read ( entries trail ) ( fromIntegral idx )
           let lit_idx = varIndex ( litVar lit )
           Bit marker <- Growable.read seen lit_idx
           if not marker
@@ -1571,7 +1547,7 @@ walkUIP
                 Clause.RLazy lref -> do
                   -- Theory-propagated literal: force the deferred reason
                   -- closure to recover the supporting clause's literals.
-                  ls <- forceLazy trail lref
+                  ls <- forceLazyReason trail lref
                   -- Each forced literal must be currently assigned, so 'visitLit'
                   -- can read its decision level. See Note [Citability invariant].
                   visitLits lit_idx ls
@@ -1638,11 +1614,11 @@ cancelUntil
     start@( LevelStart { levelTrailPos = TrailPos limI } ) <-
       Growable.read ( levelStarts ( trail assig ) ) tgt
     let
-      undo :: Int -> m ()
+      undo :: Int32 -> m ()
       undo !i
         | i < limI  = pure ()
         | otherwise = do
-            lit <- Growable.read ( entries ( trail assig ) ) i
+            lit <- Growable.read ( entries ( trail assig ) ) ( fromIntegral i )
             let v     = litVar lit
                 v_idx = varIndex v
             -- The lit on the trail was the asserted-true literal, so its
@@ -1668,7 +1644,7 @@ cancelUntil
 -- | Snapshot the current lengths of every backjump-coupled array.
 captureLevelStart :: PrimMonad m => AssignmentTrail ( PrimState m ) -> m LevelStart
 captureLevelStart trl = do
-  pos   <- TrailPos <$> Growable.length ( entries trl )
+  pos   <- TrailPos . fromIntegral <$> Growable.length ( entries trl )
   nLazy <- Growable.length ( lazyReasons trl )
   pure ( LevelStart { levelTrailPos = pos, levelLazyCount = nLazy } )
 
@@ -1688,7 +1664,7 @@ truncateToLevel
     { levelTrailPos = pos@( TrailPos p )
     , levelLazyCount = nLazy
     } = do
-  Growable.truncate ( entries trl )     p
+  Growable.truncate ( entries trl )     ( fromIntegral p )
   Growable.truncate ( lazyReasons trl ) nLazy
   Growable.truncate ( levelStarts trl ) tgt
   writeMutVar ( trailHead trl ) pos
@@ -1906,7 +1882,7 @@ trailAt
 trailAt
   ( SolverState { solverAssignments = Assignments { trail } } )
   ( TrailPos i )
-    = Growable.read ( entries trail ) i
+    = Growable.read ( entries trail ) ( fromIntegral i )
 
 -- | Stash a lazy-reason closure in the solver and return its handle.
 --
@@ -1919,25 +1895,38 @@ recordLazyReason
 recordLazyReason ( SolverState { solverAssignments = Assignments { trail } } ) lazy = do
   i <- Growable.length ( lazyReasons trail )
   Growable.push ( lazyReasons trail ) lazy
-  pure ( Clause.LazyRef i )
+  pure ( Clause.LazyRef $ fromIntegral i )
 
--- | Force a 'Clause.LazyReason' to obtain its supporting clause's literals.
-forceLazy
+-- | Retrieve a 'LazyReason' from its reference.
+--
+-- Does not force the 'LazyReason'.
+getLazyReason
   :: PrimMonad m
-  => AssignmentTrail ( PrimState m ) -> Clause.LazyRef -> m [ Lit ]
-forceLazy trail ( Clause.LazyRef i ) = do
+  => AssignmentTrail ( PrimState m ) -> Clause.LazyRef -> m ( Clause.LazyReason ( PrimState m ) )
+getLazyReason trail ( Clause.LazyRef i ) = do
 #ifdef DEBUG
   n <- Growable.length ( lazyReasons trail )
-  when ( i < 0 || i >= n ) $
+  when ( i < 0 || i >= fromIntegral n ) $
     error $ "SAT.Solver.forceLazy: out-of-range LazyRef=" ++ show i
          ++ " lazyReasons.length=" ++ show n
 #endif
-  lazy <- Growable.read ( lazyReasons trail ) i
-  ls   <- Clause.forceLazyReason lazy
+  Growable.read ( lazyReasons trail ) ( fromIntegral i )
 
-  -- Overwrite the thunk with what it evaluated to.
-  Growable.write ( lazyReasons trail ) i ( Clause.LazyReason ( pure ls ) )
-  pure ls
+-- | Force a 'Clause.LazyReason' to obtain its supporting clause's literals.
+forceLazyReason
+  :: PrimMonad m
+  => AssignmentTrail ( PrimState m ) -> Clause.LazyRef -> m [ Lit ]
+forceLazyReason trail ref@( Clause.LazyRef i ) = do
+  rea <- getLazyReason trail ref
+  case rea of
+    Clause.LazyReason forceIt ->
+      do { lits <- forceIt
+           -- Overwrite the thunk with what it evaluated to.
+         ; Growable.write ( lazyReasons trail ) ( fromIntegral i ) $
+             Clause.AlreadyForcedReason lits
+         ; return lits
+         }
+    Clause.AlreadyForcedReason lits -> pure lits
 
 -- | Record a long (size @≥ 3@) theory-supplied clause in the clause store
 -- (without attaching watchers).
@@ -1973,7 +1962,7 @@ newtype Assignment = Assignment ( IntMap Bool )
 -- | The lifted-boolean value of a variable under the assignment.
 assignmentValue :: Var -> Assignment -> LBool
 assignmentValue ( Var v ) ( Assignment m ) =
-  case IntMap.lookup v m of
+  case IntMap.lookup ( fromIntegral v ) m of
     Just True  -> LTrue
     Just False -> LFalse
     Nothing    -> LUndef
@@ -1998,7 +1987,7 @@ getModel s = do
     collect !i !acc
       | i < 0     = pure acc
       | otherwise = do
-          val <- valueOf s ( Var i )
+          val <- valueOf s ( Var $ fromIntegral i )
           let !acc' = case val of
                 LTrue  -> IntMap.insert i True  acc
                 LFalse -> IntMap.insert i False acc

@@ -118,8 +118,6 @@ library
   exposed-modules:
       Data.Lattice
     , Data.Sequence.Insert
-    , Data.Vector.Generic.Index
-    , Data.Vector.PhaseTransition
     , Data.Vector.Ranking
     , SAT.Base
     , SAT.Clause

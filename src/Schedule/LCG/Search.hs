@@ -35,6 +35,10 @@ import Control.DeepSeq
 import GHC.Generics
   ( Generic )
 
+-- memory-arena
+import Memory.Vector
+  ( Freeze(freeze) )
+
 -- primitive
 import Data.Primitive.MutVar
   ( readMutVar )
@@ -44,8 +48,6 @@ import Data.Text
   ( Text )
 
 -- unary-scheduling
-import Data.Vector.PhaseTransition
-  ( Freeze(freeze) )
 import SAT.Clause
   ( Reason(..) )
 import qualified SAT.Restart as Restart

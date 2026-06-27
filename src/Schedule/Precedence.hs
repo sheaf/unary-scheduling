@@ -18,6 +18,10 @@ import Control.Lens
 import Data.Generics.Product.Fields
   ( field' )
 
+-- memory-arena
+import Memory.Vector
+  ( unsafeIndex )
+
 -- mtl
 import Control.Monad.Reader
   ( ask )
@@ -27,8 +31,6 @@ import qualified Data.Vector.Mutable as Boxed
   ( MVector )
 
 -- unary-scheduling
-import Data.Vector.Generic.Index
-  ( unsafeIndex )
 import Schedule.Constraint
   ( Constraint(..), Infeasible(..), Justification(..), tightenMany )
 import Schedule.Interval

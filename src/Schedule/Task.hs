@@ -42,6 +42,14 @@ import Data.Generics.Product.Fields
       ( field' )
   )
 
+-- memory-arena
+import Memory.Vector
+  ( Freeze
+     ( freeze, unsafeFreeze )
+  , Thaw
+     ( thaw, unsafeThaw )
+  )
+
 -- primitive
 import Control.Monad.Primitive
   ( PrimMonad
@@ -73,12 +81,6 @@ import qualified Data.Vector.Unboxed.Mutable as Unboxed
 -- unary-scheduling
 import Data.Lattice
   ( BoundedLattice(bottom) )
-import Data.Vector.PhaseTransition
-  ( Freeze
-     ( freeze, unsafeFreeze )
-  , Thaw
-     ( thaw, unsafeThaw )
-  )
 import Data.Vector.Ranking
   ( Ranking(..) )
 import Schedule.Interval

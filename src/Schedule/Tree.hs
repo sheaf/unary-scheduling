@@ -51,6 +51,10 @@ import qualified Data.Tree as Rose
 import Data.GenericLens.Internal
   ( view )
 
+-- memory-arena
+import Memory.Vector
+  ( ReadableVector(unsafeIndex) )
+
 -- primitive
 import Control.Monad.Primitive
   ( PrimMonad(PrimState) )
@@ -72,10 +76,6 @@ import qualified Data.Tree.View as TreeView
 import Data.Lattice
   ( BoundedLattice(top)
   , TotallyOrderedLattice((/.\))
-  )
-import Data.Vector.Generic.Index
-  ( ReadableVector
-    ( unsafeIndex )
   )
 import Schedule.Ordering
   ( Order(..) )

@@ -27,6 +27,10 @@ import Data.Generics.Product.Constraints
     ( constraints )
   )
 
+-- memory-arena
+import Memory.Vector
+  ( Freeze(..), Thaw(..) )
+
 -- primitive
 import Control.Monad.Primitive
   ( PrimMonad(PrimState) )
@@ -42,10 +46,6 @@ import qualified Data.Vector.Unboxed.Mutable as Unboxed
   ( MVector )
 import qualified Data.Vector.Unboxed.Mutable as Unboxed.Vector
   ( unsafeRead )
-
--- unary-scheduling
-import Data.Vector.PhaseTransition
-  ( Freeze(..), Thaw(..) )
 
 -------------------------------------------------------------------------------
 
