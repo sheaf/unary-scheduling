@@ -256,7 +256,7 @@ data StrongBranchResult
 -- of the main search loop ('Schedule.LCG.Search.searchWindow'), without deciding.
 propagateFixpoint
   :: forall mode s task t
-  .  ( Num t, Measurable t, Bounded t, Show t, Show task, MonitorMode mode )
+  .  ( Real t, Num t, Measurable t, Bounded t, Show t, Show task, MonitorMode mode )
   => TheoryState mode s task t -> ST s ( Maybe SAT.Conflict )
 propagateFixpoint t = loop
   where

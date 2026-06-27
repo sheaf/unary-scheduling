@@ -77,7 +77,7 @@ benchZ3 inst = Benchmarkable \ n -> do
 
 -- | Wall-clock budget for each benchmark, in microseconds.
 timeout_us :: Integer
-timeout_us = 5_000_000 -- μs
+timeout_us = 60_000_000 -- μs
 
 -- | Two benchmarks (LCG, Z3) sharing one cached instance, presented as a
 -- labelled group.

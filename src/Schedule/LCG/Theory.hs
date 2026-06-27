@@ -127,7 +127,7 @@ import SAT.Clause
   ( Reason(..), LazyReason(..) )
 import qualified SAT.Solver as SAT
 import Data.Lattice
-  ( BoundedLattice(top, bottom) )
+  ( Lattice( (\/) ), BoundedLattice(top, bottom) )
 import Schedule.Constraint
   ( Constraint(notEarlierThan, notLaterThan)
   , Constraints(..), Infeasible(..)
@@ -197,6 +197,11 @@ data TheoryState mode s task t = TheoryState
     --
     -- Never mutated.
     groundAvail    :: !( Boxed.Vector.Vector ( Intervals t ) )
+  , -- | The unary resource's /bins/ for 'resourcePackingCheck': the connected
+    -- components of the union of the tasks' ground availabilities, in ascending
+    -- time order, each as @(slotStart, slotEnd, capacity)@ where the capacity is
+    -- the bin's free length (its 'measure', the total task duration it can hold).
+    resourceSlots :: ![ ( Endpoint ( EarliestTime t ), Endpoint ( LatestTime t ), t ) ]
   , -- | The schedule trail for in-place undo.
     schedTrail     :: !( Trail s task t )
   , -- | Reusable scratch space for transitive closure computations.
@@ -333,6 +338,7 @@ newTheory tis props opts = do
       taskAvailability <$> Boxed.MVector.unsafeRead ( taskAvails tis ) i
   monitor <- newMonitor @mode
   let
+    resourceSlots = computeResourceSlots numTasks groundAvail
     t =
       TheoryState
         { tasks         = tis
@@ -455,7 +461,7 @@ numPrecedenceDecisions t = do
 -- visible to the next 'SAT.propagate' call) and 'Just c' on conflict.
 theoryPropagate
   :: forall mode s task t
-  .  ( Num t, Measurable t, Bounded t
+  .  ( Real t, Num t, Measurable t, Bounded t
      , Show t, Show task
      , MonitorMode mode
      )
@@ -465,7 +471,13 @@ theoryPropagate t = do
   channelOutcome <- withPhaseTiming ( monitor t ) "channel-in" ( channelPending t )
   case channelOutcome of
     Just c  -> pure ( Just c )
-    Nothing -> runPropagators t
+    Nothing -> do
+      mbConf <- runPropagators t
+      case mbConf of
+        Just c  -> pure ( Just c )
+        -- The propagators reached a consistent fixpoint; the citability invariant
+        -- now holds, so the holey Hall check can cite current bound atoms.
+        Nothing -> withPhaseTiming ( monitor t ) "resource-packing" ( resourcePackingCheck t )
 
 -------------------------------------------------------------------------------
 -- (1) Channel SAT trail literals into the scheduler.
@@ -1829,3 +1841,131 @@ debugAssertCurrentLevelLit label s body = do
           pure ( lvl == cur
                , "    " <> show l <> "  assign=" <> show v <> "  lvl=" <> show lvl )
 #endif
+
+--------------------------------------------------------------------------------
+-- Bin-packing feasibility (Shaw, CP 2004), via the Martello-Toth L2 lower bound.
+
+-- The resource's disjoint bins with their free lengths (capacities), for the
+-- bin-packing check.
+computeResourceSlots
+  :: ( Measurable t, Bounded t )
+  => Int
+  -> Boxed.Vector.Vector ( Intervals t )
+  -> [ ( Endpoint ( EarliestTime t ), Endpoint ( LatestTime t ), t ) ]
+computeResourceSlots numTasks groundAvail
+  | numTasks == 0 = []
+  | otherwise =
+      -- NB: must canonicalise the slot endpoints here.
+      [ ( canonicalEarliest ( start iv ), canonicalLatest ( end iv ), getDelta ( measure iv ) )
+      | iv <- toList ( intervals slotUnion )
+      ]
+  where
+    slotUnion = foldr (\/) bottom ( toList groundAvail )
+
+-- | The Martello-Toth $L^2$ lower bound on the number of capacity-@cap@
+-- bins needed to pack @sizes@.
+martelloTothBound :: forall t. ( Real t, Num t, Ord t ) => [ t ] -> t -> Int
+martelloTothBound sizes cap
+  | cap <= 0  = 0
+  | otherwise = maximum ( 0 : map l2For ( 0 : sizes ) )
+  where
+    l2For :: t -> Int
+    l2For k
+      | k + k > cap = 0   -- only thresholds k ≤ cap/2 are valid
+      | otherwise =
+          let j2       = [ s | s <- sizes, s + s > cap, s <= cap - k ]  -- (cap/2, cap−k]
+              j3       = [ s | s <- sizes, s + s <= cap, s >= k ]        -- [k, cap/2]
+              nJ1      = length [ () | s <- sizes, s > cap - k ]         -- (cap−k, cap]
+              slackJ2  = fromIntegral ( length j2 ) * cap - sum j2       -- room left beside J2 items
+              overflow = sum j3 - slackJ2
+              extra    = if overflow <= 0 then 0 else ceilDiv overflow cap
+          in nJ1 + length j2 + extra
+    ceilDiv :: t -> t -> Int
+    ceilDiv a b = ceiling ( toRational a / toRational b )
+
+{-# SPECIALISE resourcePackingCheck @MonitoringOff #-}
+
+-- | Shaw's bin-packing feasibility check: detect a contiguous range of resource
+-- bins into which the items (tasks) the current bounds confine cannot be packed,
+-- because the Martello-Toth L2 lower bound needs more bins than the range provides.
+--
+-- @O(bins² · items · distinctSizes)@; no-op when the resource has fewer than two
+-- bins.
+resourcePackingCheck
+  :: forall mode s task t
+  .  ( Real t, Num t, Measurable t, Bounded t, Show t, MonitorMode mode )
+  => TheoryState mode s task t
+  -> ST s ( Maybe SAT.Conflict )
+resourcePackingCheck t = case resourceSlots t of
+  bins
+    | length bins < 2 -> pure Nothing
+    | otherwise       -> do
+        let n = precedenceAtomsNumTasks ( atoms t )
+        items <- for [ 0 .. n - 1 ] \ i -> do
+          task <- readTask t i
+          pure ( i, est task, lct task, getDelta ( taskDuration task ) )
+        starts items bins
+  where
+    -- Try every contiguous bin range, anchored at each start bin in turn.
+    starts
+      :: [ ( Int, Endpoint ( EarliestTime t ), Endpoint ( LatestTime t ), t ) ]
+      -> [ ( Endpoint ( EarliestTime t ), Endpoint ( LatestTime t ), t ) ]
+      -> ST s ( Maybe SAT.Conflict )
+    starts _ [] = pure Nothing
+    starts items ( ( sStart, sEnd, sCap ) : rest ) = do
+      mb <- extend items sStart sEnd 1 sCap rest
+      case mb of
+        Just c  -> pure ( Just c )
+        Nothing -> starts items rest
+
+    -- Extend the range's last bin, accumulating its end endpoint, bin count and
+    -- (maximum) bin capacity, and test the packing bound at each step.
+    extend
+      :: [ ( Int, Endpoint ( EarliestTime t ), Endpoint ( LatestTime t ), t ) ]
+      -> Endpoint ( EarliestTime t )  -- ^ start endpoint of the range's first bin
+      -> Endpoint ( LatestTime t )    -- ^ end endpoint of the range's current last bin
+      -> Int                          -- ^ number of bins in the range
+      -> t                            -- ^ largest bin capacity in the range
+      -> [ ( Endpoint ( EarliestTime t ), Endpoint ( LatestTime t ), t ) ]
+      -> ST s ( Maybe SAT.Conflict )
+    extend items rStart rEnd nBins capMax rest = do
+      let confined  = [ ( i, sz ) | ( i, e, l, sz ) <- items, e >= rStart, l <= rEnd ]
+      if martelloTothBound ( map snd confined ) capMax > nBins
+      then do
+#ifdef DEBUG
+        assertValidPacking t ( map fst confined )
+#endif
+        lits <- boundLits t ( map fst confined )
+        conflictFromAntecedents t "resource-packing" lits
+      else case rest of
+        []                              -> pure Nothing
+        ( ( _, sEnd', sCap' ) : rest' ) -> extend items rStart sEnd' ( nBins + 1 ) ( max capMax sCap' ) rest'
+
+#ifdef DEBUG
+-- | Verify a reported packing conflict is genuine: the culprit items, confined to
+-- the bins within their window @[min est, max lct]@, need more bins than that
+-- window provides.
+assertValidPacking
+  :: forall mode s task t
+  .  ( Real t, Num t, Measurable t, Bounded t, Show t )
+  => TheoryState mode s task t -> [ Int ] -> ST s ()
+assertValidPacking t confined = do
+  items <- for confined \ c -> do
+    tc <- readTask t c
+    pure ( est tc, lct tc, getDelta ( taskDuration tc ) )
+  let aMin    = minimum [ e | ( e, _, _ ) <- items ]
+      bMax    = maximum [ l | ( _, l, _ ) <- items ]
+      sizes   = [ sz | ( _, _, sz ) <- items ]
+      rangeBins = [ c | ( sStart, sEnd, c ) <- resourceSlots t, sStart >= aMin, sEnd <= bMax ]
+      nBins   = length rangeBins
+      capMax  = if null rangeBins then 0 else maximum rangeBins
+  unless ( martelloTothBound sizes capMax > nBins ) do
+    dump <- SAT.dumpSolverState ( theorySolverState t )
+    error $ unlines
+      [ "Schedule.LCG.Theory.resourcePackingCheck: invalid packing conflict "
+        <> "(L2 ≤ " <> show nBins <> " bins for " <> show ( length sizes ) <> " items)."
+      , dump
+      ]
+#endif
+
+--------------------------------------------------------------------------------

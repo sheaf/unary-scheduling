@@ -174,6 +174,10 @@ main = withCP65001 do
 profInstance :: String -> Instance
 profInstance "d6s24"   = Instances.rehearsalInstance 1.0 0.4 6 24 8 9
 profInstance "tight520" = Instances.rehearsalInstance 1.0 0.4 5 20 8 3
+profInstance "ph3"     = Instances.intervalPigeonholeInstance 3 2
+profInstance "ph4"     = Instances.intervalPigeonholeInstance 4 2
+profInstance "ph5"     = Instances.intervalPigeonholeInstance 5 2
+profInstance "ph6"     = Instances.intervalPigeonholeInstance 6 2
 profInstance "copies1" = Instances.infeasibleRehearsalInstance 1
 profInstance "copies2" = Instances.infeasibleRehearsalInstance 2
 profInstance "copies3" = Instances.infeasibleRehearsalInstance 3
