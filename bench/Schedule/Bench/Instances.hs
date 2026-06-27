@@ -15,6 +15,7 @@ module Schedule.Bench.Instances
   , windowedTask
   , randomWindowedInstance
   , rehearsalInstance
+  , performerRehearsalInstance
   , overloadedInstance
   , tightCliqueInstance
   , intervalPigeonholeInstance
@@ -36,6 +37,10 @@ import Data.IntMap.Strict
   ( IntMap )
 import qualified Data.IntMap.Strict as IntMap
   ( fromList, elems, (!) )
+import Data.IntSet
+  ( IntSet )
+import qualified Data.IntSet as IntSet
+  ( fromList, intersection, member, null, toAscList )
 import qualified Data.Sequence as Seq
   ( fromList )
 
@@ -215,6 +220,100 @@ rehearsalInstance utilisation availProb numDays numSongs maxDur seed =
       let mask = take numDays ( drop ( k * numDays ) availDraws )
           ds   = [ d | ( d, p ) <- zip [ 0 .. ] mask, p < availProb ]
       in if null ds then [ k `mod` numDays ] else ds
+
+-- | A /performer-driven/ multi-day rehearsal instance: the realistic model where
+-- a song's availability is induced by the calendars of the performers it needs,
+-- rather than drawn independently per @(song, day)@ as in 'rehearsalInstance'.
+--
+-- Each performer is free on an i.i.d. subset of the days (the /calendar/, of
+-- density @calendarDensity@). Each song requires @perfsPerSong@ randomly chosen
+-- performers and can only be rehearsed on a day when /all/ of them are free, so
+-- its candidate days are the intersection of its performers' calendars. This
+-- couples songs that share a performer (correlated, competing windows) and makes
+-- a busy performer's free days a contention hot-spot — structure that the
+-- independent-Bernoulli 'rehearsalInstance' cannot express.
+--
+-- Days have the same geometry as 'rehearsalInstance' (a @dayLen@-slot window per
+-- day sized to the target @utilisation@, separated by a single boundary slot so
+-- no rehearsal straddles a day). A song whose performers share /no/ free day is
+-- pinned to the single day where the most of them are free, so every song keeps a
+-- non-empty domain: infeasibility must then come from the day-packing/contention,
+-- not from a trivially starved song (which the prune propagator would catch
+-- without any search).
+performerRehearsalInstance
+  :: Double  -- ^ utilisation: total demand / total day capacity, in @(0, 1]@
+  -> Int     -- ^ number of performers
+  -> Double  -- ^ per-(performer, day) free probability (calendar density), in @(0, 1]@
+  -> Int     -- ^ performers required per song (clamped to @[1, performer count]@)
+  -> Int     -- ^ number of days
+  -> Int     -- ^ number of songs
+  -> Int     -- ^ maximum rehearsal duration
+  -> Int     -- ^ PRNG seed
+  -> Instance
+performerRehearsalInstance utilisation numPerformers calendarDensity perfsPerSongArg numDays numSongs maxDur seed =
+  [ multiDayTask ( songDays k ) dayLen dayGap ( durOf k ) ( Text.pack ( "song" ++ show k ) )
+  | k <- [ 0 .. numSongs - 1 ]
+  ]
+  where
+    ( gDur, g1 )    = splitGen ( mkStdGen seed )
+    ( gCal, gPerf ) = splitGen g1
+
+    durs :: IntMap Int
+    durs  = IntMap.fromList ( zip [ 0 .. ] ( take numSongs ( randomRs ( 1, maxDur ) gDur ) ) )
+    durOf :: Int -> Int
+    durOf k = durs IntMap.! k
+
+    -- Size the day to the target utilisation, exactly as 'rehearsalInstance'.
+    total, dayLen, dayGap :: Int
+    total  = sum ( IntMap.elems durs )
+    dayLen = max maxDur ( ceiling ( fromIntegral total / ( fromIntegral numDays * utilisation ) ) )
+    dayGap = 1
+
+    -- Number of performers actually drawn per song.
+    perfsPerSong :: Int
+    perfsPerSong = max 1 ( min numPerformers perfsPerSongArg )
+
+    -- Each performer's free-day calendar, from i.i.d. @calendarDensity@ draws.
+    calDraws :: [ Double ]
+    calDraws = take ( numPerformers * numDays ) ( randomRs ( 0, 1 ) gCal )
+    calendars :: IntMap IntSet
+    calendars = IntMap.fromList
+      [ ( p, IntSet.fromList [ d | ( d, x ) <- zip [ 0 .. ] mask, x < calendarDensity ] )
+      | p <- [ 0 .. numPerformers - 1 ]
+      , let mask = take numDays ( drop ( p * numDays ) calDraws )
+      ]
+
+    -- The @perfsPerSong@ distinct performers each song requires, chosen by a
+    -- per-song random key over all performers (cf. the layout draw in
+    -- 'randomWindowedInstance').
+    perfKeys :: [ Int ]
+    perfKeys = randomRs ( 0, 1_000_000_000 ) gPerf
+    songPerformers :: Int -> [ Int ]
+    songPerformers k =
+      let keys = take numPerformers ( drop ( k * numPerformers ) perfKeys )
+      in take perfsPerSong ( map snd ( sortOn fst ( zip keys [ 0 .. numPerformers - 1 ] ) ) )
+
+    -- Candidate days = intersection of the song's performers' calendars, with the
+    -- best-overlap day as a non-empty fallback.
+    songDays :: Int -> [ Int ]
+    songDays k =
+      case songPerformers k of
+        []       -> [ 0 .. numDays - 1 ]
+        p : rest ->
+          let inter = foldl' ( \ acc p' -> IntSet.intersection acc ( calendars IntMap.! p' ) )
+                             ( calendars IntMap.! p ) rest
+          in if IntSet.null inter
+             then [ bestOverlapDay ( p : rest ) ]
+             else IntSet.toAscList inter
+
+    -- The day on which the most of the given performers are simultaneously free
+    -- (ties broken towards the earliest day).
+    bestOverlapDay :: [ Int ] -> Int
+    bestOverlapDay ps =
+      let freeCount d = length [ () | p <- ps, IntSet.member d ( calendars IntMap.! p ) ]
+          dayKey :: Int -> ( Int, Int )  -- (overlap, earliest) under tuple 'maximum'
+          dayKey d = ( freeCount d, negate d )
+      in negate ( snd ( maximum [ dayKey d | d <- [ 0 .. numDays - 1 ] ] ) )
 
 -- | A task available on each of the given @days@. Day @d@ is the @dayLen@-slot
 -- window @[d * (dayLen + dayGap), d * (dayLen + dayGap) + dayLen - 1]@, so

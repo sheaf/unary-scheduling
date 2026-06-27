@@ -37,6 +37,7 @@ import Schedule.Bench.Instances
   , Instance
   , runLCG
   , randomWindowedInstance, rehearsalInstance
+  , performerRehearsalInstance
   , overloadedInstance
   , tightCliqueInstance
   , intervalPigeonholeInstance
@@ -142,6 +143,21 @@ benchmarks =
           , (  70, 1.10, 0.50, 36 )   -- ~0.8 s,  962 decisions
           , (  90, 1.15, 0.50, 29 )   -- ~1.7 s, 1532 decisions
           , ( 110, 1.15, 0.60, 29 )   -- stress test
+          ]
+      ]
+  -- Mined hard instances of the performer-driven rehearsal model.
+  , bgroup "performer-driven rehearsal (hard)"
+      [ triple
+          ( "d=" ++ show days ++ " s=" ++ show songs ++ " perf=" ++ show perf
+            ++ " k=" ++ show k ++ " s=" ++ show seed )
+          ( performerRehearsalInstance util perf dens k days songs 8 seed )
+      | ( util, perf, dens, k, days, songs, seed ) <-
+          [ ( 1.00,  8, 0.75, 3,  5, 20,  7 )   -- feasible,   ~1 s,  1729 conf
+          , ( 0.95,  8, 0.60, 3,  5, 20, 18 )   -- infeasible, ~1.7s, 2994 conf
+          , ( 1.00, 10, 0.75, 3,  6, 28,  5 )   -- feasible,   ~2.6s, 2507 conf
+          , ( 1.00, 10, 0.75, 3,  6, 28,  6 )   -- infeasible, ~4.1s, 4606 conf
+          , ( 1.00, 10, 0.75, 3,  7, 35, 20 )   -- feasible,   ~5.1s, 2973 conf
+          , ( 0.95, 10, 0.75, 3,  7, 35, 15 )   -- infeasible, ~6.1s, 4072 conf
           ]
       ]
   ]

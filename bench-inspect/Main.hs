@@ -151,6 +151,8 @@ main = withCP65001 do
     ( "report" : rest ) -> mapM_ reportRun ( if null rest then [ "copies2" ] else rest )
     -- Explore the phase-transition of models in Wang et al. (ICAPS 2017).
     ( "phase" : _ ) -> phaseTransitionSweep
+    -- Explore hard instances of the performer-driven rehearsal model.
+    ( "performer" : _ ) -> performerRehearsalSweep
     -- Compare the outcomes when running different subsets of propagators.
     ( "subsets" : _ ) -> propagatorSubsetExperiment
     -- Measure the impact of various options e.g. whether to allow bound atom decisions.
@@ -185,6 +187,13 @@ profInstance "pt50"    = Instances.phaseTransitionAt ( 3, 19 ) 50  1.20 0.50 14
 profInstance "pt70"    = Instances.phaseTransitionAt ( 3, 19 ) 70  1.10 0.50 36
 profInstance "pt90"    = Instances.phaseTransitionAt ( 3, 19 ) 90  1.15 0.50 29
 profInstance "pt110"   = Instances.phaseTransitionAt ( 3, 19 ) 110 1.15 0.60 29
+-- Performer-driven rehearsal (correlated availability), mined hard instances.
+profInstance "perf520f"  = Instances.performerRehearsalInstance 1.00  8 0.75 3  5 20 8  7  -- feasible
+profInstance "perf520u"  = Instances.performerRehearsalInstance 0.95  8 0.60 3  5 20 8 18  -- infeasible
+profInstance "perf628f"  = Instances.performerRehearsalInstance 1.00 10 0.75 3  6 28 8  5  -- feasible
+profInstance "perf628u"  = Instances.performerRehearsalInstance 1.00 10 0.75 3  6 28 8  6  -- infeasible
+profInstance "perf735f"  = Instances.performerRehearsalInstance 1.00 10 0.75 3  7 35 8 20  -- feasible
+profInstance "perf735u"  = Instances.performerRehearsalInstance 0.95 10 0.75 3  7 35 8 15  -- infeasible
 profInstance other     = error ( "lcg-inspect prof: unknown instance " ++ show other )
 
 -- | Solve one anchor instance once, on the uninstrumented default path, forcing
@@ -400,6 +409,88 @@ phaseTransitionSweep = do
       | n      <- [ 70, 90, 110 ]
       , ratioW <- [ 0.5, 0.6, 0.7 ]
       , ratioT <- [ 1.05, 1.10, 1.15, 1.20 ]
+      ]
+
+-- | One point of the performer-driven rehearsal order-parameter grid.
+data PerfCell = PerfCell
+  { pcDays  :: !Int     -- ^ number of days
+  , pcSongs :: !Int     -- ^ number of songs
+  , pcPerf  :: !Int     -- ^ number of performers
+  , pcK     :: !Int     -- ^ performers required per song
+  , pcDens  :: !Double  -- ^ calendar density (per-(performer,day) free prob)
+  , pcUtil  :: !Double  -- ^ utilisation (demand / day capacity)
+  }
+  deriving stock Eq
+
+-- | Mine hard instances of the performer-driven rehearsal model.
+performerRehearsalSweep :: IO ()
+performerRehearsalSweep = do
+  printf "Performer-driven rehearsal HARD-INSTANCE finder (maxDur=%d).\n" maxDur
+  printf "Sweeping size × performers/song × calendar-density × utilisation × %d seeds, %.0fs timeout each.\n\n"
+    nSeeds ( fromIntegral timeoutMicros / 1e6 :: Double )
+  rows <- fmap concat $ forM grid \ cell ->
+    forM [ 1 .. nSeeds ] \ seed -> do
+      let inst = instanceOf cell seed
+      _  <- evaluate ( force inst )
+      mb <- timeout timeoutMicros ( measureOff defaultSearchOptions inst )
+      pure $ case mb of
+        Nothing         -> ( cell, seed, Nothing )
+        Just ( t, res ) ->
+          ( cell, seed
+          , Just ( case solution res of { Left _ -> 'U'; Right _ -> 'S' }
+                 , numConflicts ( stats res ), numDecisions ( stats res ), t ) )
+  -- Per cell: feasible fraction and the p50/p90/max conflicts.
+  printf "Grid summary (feas = fraction feasible; conf = p50/p90/max; TO = timeouts):\n"
+  printf "  %-13s %-4s %-5s %-6s %-6s %-18s %s\n"
+    ( "d/s/perf" :: String ) ( "k" :: String ) ( "dens" :: String )
+    ( "util" :: String ) ( "feas" :: String )
+    ( "conf p50/p90/max" :: String ) ( "TO" :: String )
+  forM_ grid \ cell -> do
+    let here  = [ r | ( c, _, r ) <- rows, c == cell ]
+        done  = [ x | Just x <- here ]
+        nTO   = length [ () | Nothing <- here ]
+        feas  = length [ () | ( 'S', _, _, _ ) <- done ]
+        confs = sortOn id [ c | ( _, c, _, _ ) <- done ]
+        pick p = if null confs then 0 else confs !! min ( length confs - 1 ) ( floor ( p * fromIntegral ( length confs ) :: Double ) )
+    printf "  %-13s %-4d %-5.2f %-6.2f %-6.2f %6d /%5d /%5d  %d\n"
+      ( show ( pcDays cell ) ++ "/" ++ show ( pcSongs cell ) ++ "/" ++ show ( pcPerf cell ) )
+      ( pcK cell ) ( pcDens cell ) ( pcUtil cell )
+      ( if null done then 0 else fromIntegral feas / fromIntegral ( length done ) :: Double )
+      ( pick 0.5 ) ( pick 0.9 ) ( if null confs then 0 else last confs ) nTO
+  -- Leaderboard: hardest specific instances (timeouts first, then by conflicts).
+  printf "\nHardest instances (performerRehearsalInstance util perf dens k days songs %d seed):\n" maxDur
+  printf "  %-34s %-4s %-7s %-7s %s\n"
+    ( "util perf dens k days songs seed" :: String ) ( "verd" :: String )
+    ( "conf" :: String ) ( "dec" :: String ) ( "time" :: String )
+  let timeouts = [ ( c, s ) | ( c, s, Nothing ) <- rows ]
+      solved   = sortOn ( \ ( _, _, _, c, _, _ ) -> negate c )
+                   [ ( c, s, v, cf, d, tm ) | ( c, s, Just ( v, cf, d, tm ) ) <- rows ]
+  forM_ timeouts \ ( c, s ) ->
+    printf "  %s TIMEOUT\n" ( reproLabel c s )
+  forM_ ( take 25 solved ) \ ( c, s, v, cf, d, tm ) ->
+    printf "  %-34s %-4s %-7d %-7d %s\n" ( reproLabel c s ) ( [ v ] :: String ) cf d ( fmtNs tm )
+  putStrLn ""
+  where
+    maxDur :: Int
+    maxDur = 8
+    nSeeds :: Int
+    nSeeds = 25
+    timeoutMicros :: Int
+    timeoutMicros = 10_000_000
+    instanceOf :: PerfCell -> Int -> Instance
+    instanceOf ( PerfCell { pcDays, pcSongs, pcPerf, pcK, pcDens, pcUtil } ) seed =
+      Instances.performerRehearsalInstance pcUtil pcPerf pcDens pcK pcDays pcSongs maxDur seed
+    reproLabel :: PerfCell -> Int -> String
+    reproLabel ( PerfCell { pcDays, pcSongs, pcPerf, pcK, pcDens, pcUtil } ) seed =
+      printf "%.2f %d %.2f %d %d %d %d" pcUtil pcPerf pcDens pcK pcDays pcSongs seed
+    -- Realistic rehearsal sizes; sweep the tightness knobs near the boundary.
+    grid :: [ PerfCell ]
+    grid =
+      [ PerfCell d s perf k dens util
+      | ( d, s, perf ) <- [ ( 5, 20, 8 ), ( 6, 28, 10 ), ( 7, 35, 10 ) ]
+      , k    <- [ 2, 3, 4 ]
+      , dens <- [ 0.45, 0.6, 0.75 ]
+      , util <- [ 0.9, 0.95, 1.0 ]
       ]
 
 -- | Measure how much each (group of) expensive global propagator earns its
