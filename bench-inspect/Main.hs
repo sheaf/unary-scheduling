@@ -80,10 +80,10 @@ import qualified Schedule.Bench.Instances as Instances
 -- interval-commitment, restarts) actually diverge — a slacker instance solves at
 -- 0 conflicts and makes every configuration identical.
 theInstance :: Instance
-theInstance = Instances.rehearsalInstance 1.0 0.4 6 24 8 9
+theInstance = Instances.performerRehearsalInstance 1.00 10 0.75 3 6 28 8 5
 
 instanceLabel :: String
-instanceLabel = "rehearsalInstance util=1.0 avail=0.4 days=6 songs=24 maxDur=8 seed=9 (forces conflicts)"
+instanceLabel = "performerRehearsalInstance util=1.0 perf=10 dens=0.75 k=3 days=6 songs=28 maxDur=8 seed=5 (feasible; Chuffed ~1ms, FDS ~2.6s)"
 
 -- | Timing iterations (per-run statistics are deterministic and measured once;
 -- only the wall-clock minimum is repeated).

@@ -39,14 +39,15 @@ import System.Random
 import SAT.Base
   ( Var(..), Lit, mkLit
   , Polarity(..)
-  , LBool(..)
+  , Ł3(..)
   )
 import SAT.Solver
   ( Verdict(..)
   , newSolver, newVar
   , addClause, PostResult(..)
-  , solveWith, defaultOptions
+  , solveWith, defaultSolverOptions
   , getModel, assignmentValue
+  , solverAssignments
   )
 import Schedule.Ordering
   ( upperTriangular )
@@ -80,7 +81,7 @@ solveCNF ( CNF nVars cls ) = runST \ @s -> do
   ok <- foldM addStep True cls
   if not ok
   then pure Unsat
-  else solveWith defaultOptions solver
+  else solveWith defaultSolverOptions solver
 
 toLit :: ( Int, Polarity ) -> Lit
 toLit ( i, pol ) = mkLit ( Var ( fromIntegral i ) ) pol
@@ -279,21 +280,21 @@ solveTwice ( CNF nVars cls ) = runST \ @s -> do
   if not ok
   then pure Unsat
   else do
-    v1 <- solveWith defaultOptions solver
+    v1 <- solveWith defaultSolverOptions solver
     case v1 of
       Sat -> do
-        m <- getModel solver
+        m <- getModel ( solverAssignments solver )
         let blockingLit :: Int -> Maybe Lit
             blockingLit i =
               let v = Var ( fromIntegral i )
               in case assignmentValue v m of
-                LTrue  -> Just ( mkLit v Negative )
-                LFalse -> Just ( mkLit v Positive )
-                LUndef -> Nothing
+                ŁTrue  -> Just ( mkLit v Negative )
+                ŁFalse -> Just ( mkLit v Positive )
+                ŁUndef -> Nothing
             blocking = mapMaybe blockingLit [ 0 .. nVars - 1 ]
         r <- addClause solver blocking
         case r of
           InstantUnsat -> pure Unsat
           Tautology    -> pure Sat  -- only possible if the model is empty
-          Posted       -> solveWith defaultOptions solver
+          Posted       -> solveWith defaultSolverOptions solver
       _ -> pure v1

@@ -44,7 +44,7 @@ import qualified Memory.Growable as Growable
 
 -- unary-scheduling
 import SAT.Base
-  ( LBool(..), Lit, litIndex, negateLit )
+  ( Ł3(..), Lit, litIndex, negateLit )
 import SAT.Clause
   ( Reason(..) )
 import qualified SAT.Solver as SAT
@@ -132,7 +132,7 @@ writeAvgRating t d r = do
 -- | The current SAT decision level as a plain depth.
 currentDepth :: TheoryState mode s task t -> ST s Int
 currentDepth t = do
-  SAT.DecisionLevel d <- SAT.currentLevel ( theorySolverState t )
+  SAT.DecisionLevel d <- SAT.currentLevel ( theoryAssignments t )
   pure d
 
 -- | The log of the remaining search-space size: @Σ_tasks log |domain|@, the
@@ -266,12 +266,12 @@ propagateFixpoint t = loop
       case mbC of
         Just c  -> pure ( Just c )
         Nothing -> do
-          before <- SAT.solverTrailSize ss
+          before <- SAT.trailSize ( SAT.solverAssignments ss )
           mbTC   <- theoryPropagate t
           case mbTC of
             Just c  -> pure ( Just c )
             Nothing -> do
-              after <- SAT.solverTrailSize ss
+              after <- SAT.trailSize ( SAT.solverAssignments ss )
               if after > before then loop else pure Nothing
 
 -- | Strong branching with shaving at a restart root.
@@ -376,10 +376,11 @@ probeBranch
   .  ( Real t, Num t, Measurable t, Bounded t, Show t, Show task, MonitorMode mode )
   => TheoryState mode s task t -> Lit -> Double -> ST s ProbeResult
 probeBranch t l before = do
-  rootLvl <- SAT.currentLevel ss
+  let assigs = theoryAssignments t
+  rootLvl <- SAT.currentLevel assigs
   SAT.pushNewLevel ss
   pushLevel t
-  SAT.enqueueUndef ss l RDecision
+  SAT.enqueueUndef assigs l RDecision
   mbConf <- propagateFixpoint t
   case mbConf of
     Just c  -> do
@@ -401,8 +402,8 @@ probeBranch t l before = do
 -- | Whether a precedence branch literal is still unassigned (its choice undecided).
 isUndecided :: TheoryState mode s task t -> Lit -> ST s Bool
 isUndecided t lit = do
-  v <- SAT.litValue ( theorySolverState t ) lit
-  pure $ case v of { LUndef -> True; _ -> False }
+  v <- SAT.litValue ( theoryAssignments t ) lit
+  pure $ case v of { ŁUndef -> True; _ -> False }
 
 -- | The @width@ best-rated undecided precedence choices, lowest @rating[c]@
 -- first, ties broken by criticality (so an all-neutral root probes the most
@@ -427,9 +428,9 @@ bestCandidates t width = do
           o <- readOrdering mat i j
           case o of
             Unknown -> do
-              v <- SAT.litValue ( theorySolverState t ) ( precLit ps i j )
+              v <- SAT.litValue ( theoryAssignments t ) ( precLit ps i j )
               case v of
-                LUndef -> do
+                ŁUndef -> do
                   let posLit = precLit ps i j
                       negLit = precLit ps j i
                   rPos <- readRating t posLit
@@ -509,9 +510,9 @@ theoryDecide t
       case mbForced of
         Just lit -> do
           writeMutVar ( forcedDecision t ) Nothing
-          v <- SAT.litValue ( theorySolverState t ) lit
+          v <- SAT.litValue ( theoryAssignments t ) lit
           case v of
-            LUndef -> pure ( Just lit )
+            ŁUndef -> pure ( Just lit )
             _      -> ratingScan
         Nothing -> ratingScan
   where
@@ -568,11 +569,11 @@ scanPrecedences t = go 0 1
           o <- readOrdering mat i j
           case o of
             Unknown -> do
-              v <- SAT.litValue ( theorySolverState t ) ( precLit ps i j )
+              v <- SAT.litValue ( theoryAssignments t ) ( precLit ps i j )
               case v of
                 -- 'Unknown' in the matrix should mean the precedence atom is
                 -- unassigned; the check guards against branching an assigned one.
-                LUndef -> do
+                ŁUndef -> do
                   cand <- precCandidate t i j
                   go i ( j + 1 ) ( keepBest best cand )
                 _ -> go i ( j + 1 ) best
@@ -625,7 +626,7 @@ scanBoundDecisions t acc0 = do
 firstUndecided :: TheoryState mode s task t -> [ Lit ] -> ST s ( Maybe Lit )
 firstUndecided _ [] = pure Nothing
 firstUndecided t ( l : ls ) = do
-  v <- SAT.litValue ( theorySolverState t ) l
+  v <- SAT.litValue ( theoryAssignments t ) l
   case v of
-    LUndef -> pure ( Just l )
+    ŁUndef -> pure ( Just l )
     _      -> firstUndecided t ls

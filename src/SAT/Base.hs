@@ -1,7 +1,7 @@
 {-# LANGUAGE PatternSynonyms      #-}
 {-# LANGUAGE UndecidableInstances #-}
 
--- | Propositional variables, literals, and three-valued booleans.
+-- | Propositional variables, literals, and Łukasiewicz three-valued logic.
 module SAT.Base
   ( -- * Variables
     Var(..), varIndex
@@ -18,11 +18,10 @@ module SAT.Base
   , LitOfValue(SatisfiedLit, FalsifiedLit, ..)
   , SatisfiedLit, FalsifiedLit
   , negateLitOfValue
-    -- * Three-valued booleans
-  , LBool(LUndef, LTrue, LFalse)
-  , liftBool
-  , lnot
-  , litValueFromVar
+    -- * Łukasiewicz three-valued logic
+  , Ł3(ŁUndef, ŁTrue, ŁFalse)
+  , łnot
+  , litValueFromVarValue
   )
   where
 
@@ -67,11 +66,12 @@ import qualified Data.Vector.Unboxed.Mutable as Unboxed
 -------------------------------------------------------------------------------
 -- Variables.
 
--- | A propositional variable, identified by its 0-based index.
+-- | A propositional variable.
 newtype Var = Var Int32
   deriving stock   ( Eq, Ord, Show, Generic )
   deriving newtype ( NFData, Prim )
 
+-- | @0@-based index
 varIndex :: Var -> Int
 varIndex ( Var v ) = fromIntegral v
 {-# INLINE varIndex #-}
@@ -106,19 +106,21 @@ negatePolarity Negative = Positive
 
 -- | The lifted-boolean value a variable takes when a literal of this
 -- polarity is enqueued true.
-polarityValue :: Polarity -> LBool
-polarityValue Positive = LTrue
-polarityValue Negative = LFalse
+polarityValue :: Polarity -> Ł3
+polarityValue Positive = ŁTrue
+polarityValue Negative = ŁFalse
 
 -------------------------------------------------------------------------------
 -- Literals.
 
--- | A signed propositional variable. Build with 'mkLit'.
+-- | A signed propositional variable: a variable or the negation of a variable.
+--
+-- Build with 'mkLit'.
 newtype Lit = Lit Int32
   deriving stock   ( Eq, Ord, Show, Generic )
   deriving newtype ( NFData, Prim )
 
--- | The literal's nonnegative integer key, in the range  @[0, 2 * numVars)@.
+-- | The literal's nonnegative integer key, in the range @[0, 2 * numVars)@.
 litIndex :: Lit -> Int
 litIndex ( Lit i ) = fromIntegral i
 
@@ -167,42 +169,38 @@ negateLitOfValue :: LitOfValue v -> LitOfValue ( Not v )
 negateLitOfValue ( LitOfValue l ) = LitOfValue $ negateLit l
 
 -------------------------------------------------------------------------------
--- Three-valued booleans.
+-- Łukasiewicz logic.
 
--- | The lifted boolean domain @ { undef, true, false } @.
-newtype LBool = LBool Word8
+-- | A Łukasiewicz three-valued truth value.
+newtype Ł3 = Ł3 Word8
   deriving stock   ( Eq, Generic )
   deriving newtype NFData
 
-pattern LUndef, LTrue, LFalse :: LBool
-pattern LUndef = LBool 0
-pattern LTrue  = LBool 1
-pattern LFalse = LBool 2
-{-# COMPLETE LUndef, LTrue, LFalse #-}
+pattern ŁUndef, ŁTrue, ŁFalse :: Ł3
+pattern ŁUndef = Ł3 0
+pattern ŁTrue  = Ł3 1
+pattern ŁFalse = Ł3 2
+{-# COMPLETE ŁUndef, ŁTrue, ŁFalse #-}
 
-newtype instance Unboxed.MVector s LBool = MVLBool ( Unboxed.MVector s Word8 )
-newtype instance Unboxed.Vector    LBool = VLBool  ( Unboxed.Vector    Word8 )
-deriving newtype instance Generic.MVector Unboxed.MVector LBool
-deriving newtype instance Generic.Vector  Unboxed.Vector  LBool
-deriving newtype instance Vector.Unbox LBool
+newtype instance Unboxed.MVector s Ł3 = MVŁ3 ( Unboxed.MVector s Word8 )
+newtype instance Unboxed.Vector    Ł3 = VŁ3  ( Unboxed.Vector    Word8 )
+deriving newtype instance Generic.MVector Unboxed.MVector Ł3
+deriving newtype instance Generic.Vector  Unboxed.Vector  Ł3
+deriving newtype instance Vector.Unbox Ł3
 
-instance Show LBool where
-  show LUndef = "undef"
-  show LTrue  = "true"
-  show LFalse = "false"
+instance Show Ł3 where
+  show ŁUndef = "undef"
+  show ŁTrue  = "true"
+  show ŁFalse = "false"
 
-liftBool :: Bool -> LBool
-liftBool True  = LTrue
-liftBool False = LFalse
+łnot :: Ł3 -> Ł3
+łnot ŁUndef = ŁUndef
+łnot ŁTrue  = ŁFalse
+łnot ŁFalse = ŁTrue
 
-lnot :: LBool -> LBool
-lnot LUndef = LUndef
-lnot LTrue  = LFalse
-lnot LFalse = LTrue
-
--- | The value of a literal given the lifted value of its variable.
-litValueFromVar :: Lit -> LBool -> LBool
-litValueFromVar l vb =
+-- | The value of a literal given the value of its variable.
+litValueFromVarValue :: Lit -> Ł3 -> Ł3
+litValueFromVarValue l val =
   case litPolarity l of
-    Positive -> vb
-    Negative -> lnot vb
+    Positive -> val
+    Negative -> łnot val

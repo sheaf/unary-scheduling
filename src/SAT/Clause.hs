@@ -3,17 +3,13 @@
 {-# LANGUAGE UnboxedTuples        #-}
 
 -- | Clauses, clause references, clause storage, and reasons.
---
--- A 'ClauseStore' is an arena of clauses. Recording a clause returns a
--- 'ClauseRef' identifying it; 'clauseAt' produces a 'Clause' — a transient,
--- mutable view of that clause's literals — on demand.
 module SAT.Clause
-  ( -- * Clauses (transient views)
+  ( -- * Clauses
     Clause
   , clauseSize
   , clauseLit
   , clauseSwap
-  , isLearnt
+  , clauseIsLearnt
   , clauseToList
     -- * Clause storage
   , ClauseStore
@@ -28,6 +24,7 @@ module SAT.Clause
   , Reason(..)
   , LazyRef(..)
   , LazyReason(..)
+  , forceLazyReasonNow
   )
   where
 
@@ -62,13 +59,12 @@ import SAT.Base
 -------------------------------------------------------------------------------
 -- Clause references.
 
--- | A reference into a 'ClauseStore' (offset of a clause's header in the
--- store's arena).
+-- | A reference into a 'ClauseStore'.
 newtype ClauseRef = ClauseRef { unCRef :: Int32 }
   deriving stock   Show
   deriving newtype ( Eq, Ord, Prim )
 
--- | A 'ClauseRef' whose clause is currently /falsified/: every literal is
+-- | A reference to a clause that is currently falsified: every literal is
 -- false under the current assignment.
 newtype FalsifiedClauseRef = FalsifiedClauseRef { falsifiedClause :: ClauseRef }
   deriving newtype ( Show, Eq, Ord )
@@ -76,11 +72,10 @@ newtype FalsifiedClauseRef = FalsifiedClauseRef { falsifiedClause :: ClauseRef }
 -------------------------------------------------------------------------------
 -- Clause storage.
 
--- | An append-only arena of clauses: a recorded clause is never relocated,
--- so its 'ClauseRef' stays valid for the lifetime of the store.
+-- | Storage for 'Clause's.
 data ClauseStore s = ClauseStore
   { csArena :: !( Arena s )
-      -- ^ Bump allocator over the backing 'MutableByteArray'.
+      -- ^ Underlying storage arena.
   , csView  :: !( PMV.MVector s Int32 )
       -- ^ Element-indexed view of the entire arena as raw 'Int32' data.
       --
@@ -88,8 +83,6 @@ data ClauseStore s = ClauseStore
   }
 
 -- | Allocate an empty store with the given capacity in bytes.
---
--- Each clause consumes @sizeOf Int32 * (size + 1)@ bytes.
 newClauseStore
   :: PrimMonad m
   => Int -> m ( ClauseStore ( PrimState m ) )
@@ -100,23 +93,26 @@ newClauseStore capBytes = do
   let view = PMV.MVector 0 capElems ( arenaStorage arena )
   pure ( ClauseStore arena view )
 
--- | Append a fresh original (non-learnt) clause and return its reference.
+-- | Record a fresh (non-learnt) clause and return its reference.
 recordClause
   :: PrimMonad m
   => ClauseStore ( PrimState m ) -> [ Lit ] -> m ClauseRef
 recordClause store = recordRaw store False
 
--- | Append a fresh learnt clause and return its reference.
+-- | Record a fresh learnt clause and return its reference.
 recordLearntClause
   :: PrimMonad m
   => ClauseStore ( PrimState m ) -> [ Lit ] -> m ClauseRef
 recordLearntClause store = recordRaw store True
 
--- | Internal shared helper for  'recordClause' / 'recordLearntClause'.
+-- | Internal shared helper for 'recordClause'/'recordLearntClause'.
 recordRaw
   :: forall m
   .  PrimMonad m
-  => ClauseStore ( PrimState m ) -> Bool -> [ Lit ] -> m ClauseRef
+  => ClauseStore ( PrimState m )
+  -> Bool -- ^ is this a learnt clause?
+  -> [ Lit ]
+  -> m ClauseRef
 recordRaw store learnt lits = do
   let !n = length lits
   slice <- allocArray @Int32 ( csArena store ) ( n + 1 )
@@ -131,9 +127,7 @@ recordRaw store learnt lits = do
   writeBody 0 lits
   pure ( ClauseRef $ fromIntegral startElem )
 
--- | Retrieve the 'Clause' from a reference into the clause store.
---
--- Reads see the current state and writes  mutate the store in-place.
+-- | Retrieve a 'Clause' given a 'ClauseRef'.
 clauseAt
   :: PrimMonad m
   => ClauseStore ( PrimState m ) -> ClauseRef -> m ( Clause ( PrimState m ) )
@@ -155,29 +149,27 @@ decodeHeader :: Int32 -> ( Int, Bool )
 decodeHeader h = ( fromIntegral ( h `shiftR` 1 ), ( h .&. 1 ) /= 0 )
 
 -------------------------------------------------------------------------------
--- Clauses (transient views).
+-- Clauses.
 
--- | A view of a clause's literal body together with its learnt flag.
+-- | A clause: a disjunction of literals @l0 ∨ l1 ∨ l2 ∨ ...@.
 data Clause s = Clause
   { clauseBody   :: {-# UNPACK #-} !( PMV.MVector s Int32 )
-  , clauseLearnt :: !Bool
+  , clauseIsLearnt :: !Bool
   }
 
+-- | The number of literals in a clause.
 clauseSize :: Clause s -> Int
 clauseSize = PMV.length . clauseBody
 
-isLearnt :: Clause s -> Bool
-isLearnt = clauseLearnt
-
+-- | Retrieve the literal at the given index of a 'Clause'.
 clauseLit :: PrimMonad m => Clause ( PrimState m ) -> Int -> m Lit
 clauseLit c i = Lit . fromIntegral <$> PMV.unsafeRead ( clauseBody c ) i
 
+-- | Swap the literals at the given indices of a 'Clause'.
 clauseSwap :: PrimMonad m => Clause ( PrimState m ) -> Int -> Int -> m ()
 clauseSwap c = PMV.unsafeSwap ( clauseBody c )
 
--- | Snapshot a clause as a list of its current literals (storage order).
---
--- Linear in the clause size; for debugging and oracle comparison only.
+-- | Retrieve the literals underlying a clause, in storage order.
 clauseToList :: PrimMonad m => Clause ( PrimState m ) -> m [ Lit ]
 clauseToList c = go ( clauseSize c - 1 ) []
   where
@@ -187,53 +179,25 @@ clauseToList c = go ( clauseSize c - 1 ) []
       | otherwise = do
           l <- PMV.unsafeRead v i
           go ( i - 1 ) ( Lit ( fromIntegral l ) : acc )
+{-# WARNING clauseToList "For debugging use only" #-}
 
 -------------------------------------------------------------------------------
 -- Reasons.
 
--- | Why a literal was added to the trail.
+-- | The reason why a literal was assigned.
 data Reason
-  -- | Literal enforced unconditionally at the ground level (a unit input
-  -- clause, or a unit learnt clause whose backjump level is @0@).
+  -- | The literal is enforced unconditionally at the ground level.
   = RFact
-  -- | Literal chosen by the search heuristic (head of a decision level
-  -- above the ground level).
+  -- | The literal was assigned by a decision (e.g. during search).
   | RDecision
-  -- | Literal that was unit-propagated from a binary clause.
-  | RBinary !FalsifiedLit -- ^ the "other" literal
-  -- | Literal that was unit-propagated from the clause at the given
-  -- reference. At the moment of propagation, this clause had all other
-  -- literals false.
-  | RClause !ClauseRef
-  -- | Literal that was theory-propagated, with a deferred clausal reason.
+  -- | The literal was unit-propagated from a binary clause.
+  | RBinary !FalsifiedLit -- ^ the other literal of the binary clause
+  -- | The literal was unit-propagated by the given clause.
   --
-  -- The 'LazyRef' indexes into the solver's lazy-reason table. When 1-UIP
-  -- analysis encounters this reason, it forces the corresponding
-  -- 'LazyReason' closure to obtain the supporting clause.
+  -- At the moment of propagation, this clause had all other literals false.
+  | RClause !ClauseRef
+  -- | The Literal was theory-propagated, with the given lazy clausal reason.
   | RLazy !LazyRef
-
--- | A reference into the solver's lazy-reason table.
-newtype LazyRef = LazyRef { unLazyRef :: Int32 }
-  deriving stock   Show
-  deriving newtype ( Eq, Ord, Prim )
-
--- | A deferred clause-producing action, attached to a theory-propagated
--- literal as a 'RLazy' reason.
---
--- The closure must be self-contained at the moment it is created: any
--- scheduler state it depends on should be captured into the closure so that
--- forcing it later — after further mutation or backjumping — still yields
--- the correct supporting clause.
---
--- The returned list contains the literals of the supporting clause; the
--- propagated literal may be included since 1-UIP analysis filters out
--- the resolution variable.
-data LazyReason s =
-  -- | A (still unevaluated) lazy reason.
-    LazyReason
-      ( forall m. ( PrimMonad m, PrimState m ~ s ) => m [ Lit ] )
-  -- | The value of an already-forced lazy reason.
-  | AlreadyForcedReason [ Lit ]
 
 -- | Fit a 'Reason' into an 'Int'.
 deriving via ( As Reason Int ) instance Prim Reason
@@ -241,12 +205,10 @@ instance IsoPrim Reason Int where
   toPrim   = encodeReason
   fromPrim = decodeReason
 
--- | Internal packing for the 'Prim' 'Reason' instance.
---
--- Five constructors need three tag bits; the remaining 61 bits hold the
--- payload ('Lit' index, 'ClauseRef', or 'LazyRef').
+-- | Pack a 'Reason' into an 'Int'.
 encodeReason :: Reason -> Int
 encodeReason = \case
+  -- 5 constructors <=> 3 tag bits
   RFact -> 0
   RDecision -> 1
   RBinary ( FalsifiedLit lit ) -> 2 .|. ( fromIntegral ( litIndex lit ) `shiftL` 3 )
@@ -262,6 +224,34 @@ decodeReason w =
     2 -> RBinary $ FalsifiedLit $ Lit ix
     3 -> RClause $ ClauseRef ix
     4 -> RLazy   $ LazyRef ix
-    _ -> error "SAT.Clause.decodeReason: invalid reason tag"
+    t -> error $ "decodeReason: invalid reason tag " ++ show t
   where
     ix = fromIntegral w `shiftR` 3
+
+-- | A reference into the solver's lazy-reason table.
+newtype LazyRef = LazyRef { unLazyRef :: Int32 }
+  deriving stock   Show
+  deriving newtype ( Eq, Ord, Prim )
+
+-- | A deferred clause-producing action.
+--
+-- The closure must be self-contained at the moment it is created: any
+-- mutable state it depends on should be captured into the closure so that
+-- forcing it later still yields the correct supporting clause.
+data LazyReason s =
+  -- | A (still unevaluated) lazy reason.
+    LazyReason
+      ( forall m. ( PrimMonad m, PrimState m ~ s ) => m [ Lit ] )
+  -- | The value of an already-forced lazy reason.
+  | AlreadyForcedReason [ Lit ]
+
+-- | Force a 'LazyReason' without overwriting the thunk with the value.
+--
+-- Risks wasting work if the 'LazyReason' is forced again later.
+forceLazyReasonNow
+  :: forall {s} m
+  .  ( PrimMonad m, PrimState m ~ s )
+  => LazyReason s -> m [ Lit ]
+forceLazyReasonNow = \case
+  LazyReason forceIt -> forceIt
+  AlreadyForcedReason lits -> pure lits

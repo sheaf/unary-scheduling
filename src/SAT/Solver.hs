@@ -2,30 +2,26 @@
 {-# LANGUAGE ScopedTypeVariables  #-}
 {-# LANGUAGE UndecidableInstances #-}
 
--- | A Conflict-Driven Clause-Learning (CDCL) SAT core, in the style of
--- MiniSat (Eén \& Sörensson 2003).
+-- | A Conflict Driven Clause Learning (CDCL) SAT solver, inspired by MiniSat.
 --
 -- The module plays two roles:
 --
---   * a self-contained solver, 'solve' / 'solveWith', running the search
---     loop to a 'Verdict'; and
---   * a set of lower-level driver primitives that expose each step of the loop
+--   * a self-contained solver ('solve'/'solveWith')
+--   * a set of lower-level primitives that expose each step of the loop
 --     ('decide', 'propagate', 'analyse', 'cancelUntil', 'installLearnt') so
---     that a DPLL(T) theory can interleave its own propagation and decisions
---     over the shared trail.
+--     that a DPLL(T) theory can interleave its own propagation and decisions.
 --
 -- The loop is the standard CDCL skeleton:
 --
---  - decide a literal by VSIDS activity at its saved phase
---  - propagate by two-watched-literal BCP until a clause is falsified or
---    no unit propagation remains
---  - on a conflict, learn an asserting clause by 1-UIP analysis, backjump,
---    and resume.
---
--- A Luby sequence schedules restarts.
+--  - the search decides on the value of a literal,
+--  - the value is propagated by two-watched-literal BCP until a clause is
+--    falsified or no unit propagation remains
+--  - on conflict, we learn an asserting clause by 1-UIP analysis, backjump,
+--    and resume the search.
 module SAT.Solver
   ( -- * Solver
-    SolverState
+    SolverState, Assignments
+  , solverAssignments
   , newSolver
     -- * Building the problem
   , newVar
@@ -39,7 +35,7 @@ module SAT.Solver
   , solve
   , solveWith
   , SolverOptions(..)
-  , defaultOptions
+  , defaultSolverOptions
     -- * Inspection
   , Assignment
   , assignmentValue
@@ -59,8 +55,8 @@ module SAT.Solver
   , Conflict(..)
   , currentLevel
   , levelOfAssignedVar
-  , dumpSolverState
-  , solverTrailSize
+  , dumpAssignments
+  , trailSize
   , trailAt
   , litValue
   , decide
@@ -147,8 +143,8 @@ import SAT.Base
   ( Var(..), varIndex
   , Polarity(..), polarityValue
   , Lit(..), litIndex, mkLit, litVar, litPolarity, negateLit
-  , LBool(..)
-  , litValueFromVar
+  , Ł3(..)
+  , litValueFromVarValue
   , LitOfValue(..), FalsifiedLit
   )
 import SAT.Clause
@@ -193,22 +189,14 @@ pattern GroundLevel = DecisionLevel 0
 pattern UnassignedLevel :: DecisionLevel
 pattern UnassignedLevel = DecisionLevel -1
 
--- | Hash a decision level into one of 64 buckets as a single-bit mask. The OR
--- of these over a clause's literals over-approximates its set of decision
--- levels, letting 'minimiseLearnt' reject a self-subsumption candidate cheaply:
--- a reason literal whose level-bit is absent from the clause mask cannot be
--- covered. Hash collisions only make the test more conservative, never unsound.
-abstractLevel :: DecisionLevel -> Word64
-abstractLevel ( DecisionLevel l ) = 1 `unsafeShiftL` ( l .&. 63 )
+-- | Hash a decision level into one of 64 buckets as a single-bit mask.
+hashDecisionLevel :: DecisionLevel -> Word64
+hashDecisionLevel ( DecisionLevel l ) = 1 `unsafeShiftL` ( l .&. 63 )
 
 -------------------------------------------------------------------------------
 -- Trail positions.
 
--- | A position on the assignment trail: an index in the range
--- @[0, trailSize)@.
---
--- Also used to express the trail's length / the "one past the last assignment"
--- anchor of a decision level.
+-- | A position on the assignment trail: an index in the range @[0, trailSize)@.
 newtype TrailPos = TrailPos { unTrailPos :: Int32 }
   deriving stock   Show
   deriving newtype ( Eq, Ord, Num )
@@ -222,7 +210,7 @@ deriving newtype instance Vector.Unbox TrailPos
 -- | Watermarks needed to restore an 'AssignmentTrail' on backjump.
 data LevelStart = LevelStart
   { levelTrailPos  :: !TrailPos
-    -- ^ 'entries' length when the level opened
+    -- ^ 'entries' length when the level started
     --
     -- This is also where Boolean Constraint Propagation resumes, i.e.
     -- the 'trailHead' to restore on backjump.
@@ -239,7 +227,7 @@ data AssignmentTrail s = AssignmentTrail
   , levelStarts :: !( Growable Boxed.MVector s LevelStart )
     -- ^ Per-level watermarks, indexed by decision level minus one (level @k+1@
     -- opens at @levelStarts[k]@).
-    --
+
     -- TODO: give 'LevelStart' a proper 'Prim' or 'Unboxed' instance instead
     -- of using boxed vectors.
 
@@ -250,7 +238,7 @@ data AssignmentTrail s = AssignmentTrail
     -- 'Clause.RLazy', indexed by 'Clause.LazyRef'.
   }
 
--- | Allocate an empty assignment trail.
+-- | Create a new (empty) assignment trail.
 newAssignmentTrail :: PrimMonad m => m ( AssignmentTrail ( PrimState m ) )
 newAssignmentTrail = do
   entries     <- Growable.new 16
@@ -264,29 +252,26 @@ newAssignmentTrail = do
 
 -- | A single entry on a literal's watch list.
 data Watcher
-  = -- | A binary clause: the other literal of the clause is stored inline.
+  = -- | A binary clause, storing the "other literal" of the clause.
     WBinary !Lit
-  | -- | A long clause (size @>= 3@), together with a /blocker/: a literal
-    -- whose current truth lets BCP skip fetching the clause altogether.
-    WLong !ClauseRef !Lit
+  | -- | A long clause (size @>= 3@).
+    WLong
+      !ClauseRef
+      !Lit
+        -- ^ Blocker: literal whose current assignment allows BCP to skip
+        -- fetching the clause altogether.
 
--- | A 'Watcher' is encoded in two adjacent 'Int32's: a 'ClauseRef' followed by
--- a 'Lit'. Both a clause-arena offset and a literal index fit comfortably in
--- 32 bits, so the watch entry is 8 bytes rather than 16.
+-- | Encode a 'Watcher' into two 'Int32's.
 deriving via ( As Watcher ( P2 Int32 ) ) instance Prim Watcher
 instance IsoPrim Watcher ( P2 Int32 ) where
   toPrim = \case
     WBinary ( Lit lit )                -> P2 -1 lit
     WLong ( ClauseRef cr ) ( Lit lit ) -> P2 cr lit
-  fromPrim ( P2 cr lit ) = decodeWatcher ( ClauseRef cr ) ( Lit lit )
+  fromPrim ( P2 cref lit )
+    | cref < 0  = WBinary ( Lit lit )
+    | otherwise = WLong ( ClauseRef cref ) ( Lit lit )
 
--- | Internal round-trip helper for the 'Prim' 'Watcher' instance.
-decodeWatcher :: ClauseRef -> Lit -> Watcher
-decodeWatcher cref lit
-  | unCRef cref < 0 = WBinary lit
-  | otherwise       = WLong cref lit
-
--- | The source of a Binary Constrait Propagation (BCP) conflict.
+-- | The source of a Binary Constraint Propagation (BCP) conflict.
 data Conflict
   = ConflictClause !FalsifiedClauseRef
   | ConflictBinary !FalsifiedLit !FalsifiedLit
@@ -306,26 +291,25 @@ data SolverState s = SolverState
   , -- | Clause database.
     clauseDB  :: !( ClauseDB s )
 
-    -- | Activity-ordered priority queue over variables (also owns the
-    -- VSIDS activity scores, current bump increment, and decay factor).
+    -- | Activity-ordered variable priority queue.
   , varOrder  :: !( VarOrder s )
 
-    -- | Transient per-literal marker, indexed by 'litIndex' (so two bits per
-    -- variable, one per polarity). Used by 'preprocessClause' to detect
-    -- duplicate literals and tautologies, and by 'binarySubsume' for O(1)
-    -- learnt-clause membership tests.
+    -- | Transient per-literal marker.
+    --
+    -- Used by 'preprocessClause' to detect duplicate literals and tautologies,
+    -- and by 'binarySubsume' for O(1) learnt-clause membership tests.
     --
     -- Always @False@ outside of those calls.
   , seenLit   :: !( Growable Unboxed.MVector s Bit )
 
-    -- | Search statistics and instrumentation counters.
-  , stats     :: !( Statistics s )
-
     -- | Conflict-analysis and learnt-clause-minimisation state.
   , analysisState :: !( AnalysisState s )
+
+    -- | Search statistics and instrumentation counters.
+  , stats     :: !( Statistics s )
   }
 
--- | Tunable knobs.
+-- | Tunable parameters for the solver.
 data SolverOptions = SolverOptions
   { -- | VSIDS activity decay factor in @(0, 1]@.
     --
@@ -340,8 +324,8 @@ data SolverOptions = SolverOptions
     optConflictBudget :: !Int
   }
 
-defaultOptions :: SolverOptions
-defaultOptions = SolverOptions
+defaultSolverOptions :: SolverOptions
+defaultSolverOptions = SolverOptions
   { optVarDecay       = 0.95
   , optRestartUnit    = 100
   , optConflictBudget = 0
@@ -350,7 +334,7 @@ defaultOptions = SolverOptions
 -- | State for 1-UIP conflict analysis and learnt clause minimisation.
 data AnalysisState s = AnalysisState
   { -- | Number of seen literals at the current decision level still on the
-    -- implication path, decremented by each resolution step.
+    -- implication path (decremented by each resolution step).
     analysePathC      :: !( MutVar s Int )
   , -- | Transient per-variable marker tracking membership of the
     -- clause in progress, used by 1-UIP analysis and by learnt-clause
@@ -387,8 +371,10 @@ data AnalysisState s = AnalysisState
 data ClauseDB s = ClauseDB
   { -- | Storage for long clauses (size @>= 3@).
     clauseStore :: !( ClauseStore s )
-  , -- | References of all learnt clauses, tracked separately from the input
-    -- clauses so the two sets can be managed independently.
+  , -- | References of all learnt clauses.
+    --
+    -- Tracked separately from the input clauses so the two sets can be managed
+    -- independently.
     learnts   :: !( Growable Primitive.MVector s ClauseRef )
   , -- | Per-literal watch lists, indexed by 'litIndex' and sized to
     -- @2 * numVars@.
@@ -398,10 +384,9 @@ data ClauseDB s = ClauseDB
     watches   :: !( Growable Boxed.MVector s ( Growable Primitive.MVector s Watcher ) )
   }
 
--- | Search statistics that the search /logic/ depends on (restart scheduling).
+-- | Search statistics that the search logic depends on (restart scheduling).
 --
--- Pure instrumentation lives in the zero-cost 'Schedule.Monitor.Monitor',
--- not here.
+-- Pure instrumentation lives in 'Schedule.Monitor.Monitor', not here.
 data Statistics s = Statistics
   { -- | Total conflicts encountered.
     confCount :: !( MutVar s Int )
@@ -412,8 +397,8 @@ data Statistics s = Statistics
 -- | Variable assignments and related metadata.
 data Assignments s =
   Assignments
-   { -- | Lifted-boolean assignment, indexed by 'varIndex'.
-     assignments :: !( Growable Unboxed.MVector s LBool )
+   { -- | Variable assignments, indexed by 'varIndex'.
+     assignments :: !( Growable Unboxed.MVector s Ł3 )
      -- | Polarity at which each variable was last assigned (used for phase
      -- saving on the next decision).
      --
@@ -421,7 +406,7 @@ data Assignments s =
    , phase     :: !( Growable Unboxed.MVector s Polarity )
      -- | Per-variable reason and decision level.
    , varData   :: !( VarData s )
-   , -- | Whether each variable is a /decision/ variable, i.e. eligible to be
+   , -- | Whether each variable is a decision variable, i.e. eligible to be
      -- branched on by 'decide'. Indexed by 'varIndex'.
      decidable :: !( Growable Unboxed.MVector s Bit )
      -- | The assignment trail, with the per-level bookkeeping needed for backjumping.
@@ -431,9 +416,9 @@ data Assignments s =
 -- | Metadata about a variable assignment.
 data VarData s = VarData
   { -- | Decision level at which each variable was assigned.
-    level     :: !( Growable Unboxed.MVector s DecisionLevel )
+    level  :: !( Growable Unboxed.MVector s DecisionLevel )
   , -- | Reason for each variable's current assignment.
-    reason    :: !( Growable Primitive.MVector s Clause.Reason )
+    reason :: !( Growable Primitive.MVector s Clause.Reason )
   }
 
 -------------------------------------------------------------------------------
@@ -462,10 +447,7 @@ newSolverAssignments = do
 -- | Allocate an empty clause database.
 newClauseDB :: PrimMonad m => m ( ClauseDB ( PrimState m ) )
 newClauseDB = do
-  -- TODO: expose the clause-store capacity via 'SolverOptions'. The
-  -- default is a compromise (small enough to be cheap to preallocate,
-  -- large enough that typical problems do not run out before we implement
-  -- learnt-clause deletion + compaction).
+  -- TODO: expose the clause-store capacity via 'SolverOptions'.
   clauseStore <- newClauseStore defaultStoreCapacityLits
   learnts     <- Growable.new 16
   watches     <- Growable.new 32
@@ -501,31 +483,23 @@ newAnalysisState = do
   minFailedTouched  <- Growable.new 16
   pure $ AnalysisState { .. }
 
-numVariables :: PrimMonad m => SolverState ( PrimState m ) -> m Int
-numVariables s = Growable.length ( assignments $ solverAssignments s )
+numVariables :: PrimMonad m => Assignments ( PrimState m ) -> m Int
+numVariables assig = Growable.length ( assignments assig )
 
--- | Add one activity bump to a variable (and re-heapify it). Exposed so a
--- theory can bias the decision order towards variables it considers
--- structurally important.
+-- | Add the current bump increment to a variable's activity and re-percolate
+-- it up the heap if it is currently a member.
 bumpVarActivity :: PrimMonad m => SolverState ( PrimState m ) -> Var -> m ()
 bumpVarActivity s = VarOrder.bumpActivity ( varOrder s )
 
--- | Allocate a fresh /decision/ variable. All per-variable and per-literal
--- tables grow to accommodate it; the new variable is initially unassigned
--- with zero activity and no saved phase. It is registered at the bottom of
--- the activity heap and is eligible to be branched on by 'decide'.
+-- | Allocate a fresh decision variable.
 newVar :: PrimMonad m => SolverState ( PrimState m ) -> m Var
 newVar s = newVarWith s True
 
--- | Allocate a fresh /auxiliary/ (non-decision) variable.
---
--- Identical to 'newVar' except that the variable is kept out of the activity
--- heap and flagged non-decidable: 'decide' never branches on it and
--- 'cancelUntil' never returns it to the heap.
+-- | Allocate a fresh auxiliary (non-decision) variable.
 newAuxVar :: PrimMonad m => SolverState ( PrimState m ) -> m Var
 newAuxVar s = newVarWith s False
 
--- | Shared allocator for 'newVar' / 'newAuxVar'.
+-- | Shared allocator for 'newVar'/'newAuxVar'.
 newVarWith :: PrimMonad m => SolverState ( PrimState m ) -> Bool -> m Var
 newVarWith
   ( SolverState
@@ -544,7 +518,7 @@ newVarWith
   isDecisionVar = do
   v <- ( if isDecisionVar then VarOrder.insertVar else VarOrder.insertAuxVar )
          varOrder
-  Growable.push assignments                 LUndef
+  Growable.push assignments                 ŁUndef
   Growable.push ( level  varData )          UnassignedLevel
   Growable.push ( reason varData )          Clause.RDecision
   Growable.push phase                       Positive
@@ -567,25 +541,21 @@ newVarWith
 -------------------------------------------------------------------------------
 -- Lookups.
 
--- | The lifted-boolean value currently assigned to a variable.
+-- | The value currently assigned to the given variable.
 valueOf
   :: PrimMonad m
-  => SolverState ( PrimState m ) -> Var -> m LBool
-valueOf s v = Growable.read ( assignments $ solverAssignments s ) ( varIndex v )
+  => Assignments ( PrimState m ) -> Var -> m Ł3
+valueOf assig v = Growable.read ( assignments assig ) ( varIndex v )
 
--- | The lifted-boolean value of a literal under the current assignment.
+-- | The value currently assigned to the given literal.
 litValue
   :: PrimMonad m
-  => SolverState ( PrimState m ) -> Lit -> m LBool
-litValue s l = litValueFromVar l <$> valueOf s ( litVar l )
+  => Assignments ( PrimState m ) -> Lit -> m Ł3
+litValue s l = litValueFromVarValue l <$> valueOf s ( litVar l )
 
 -- | The decision level we are currently exploring.
-currentLevel :: PrimMonad m => SolverState ( PrimState m ) -> m DecisionLevel
-currentLevel ( SolverState { solverAssignments } ) =
-  assignmentsCurrentLevel solverAssignments
-
-assignmentsCurrentLevel :: PrimMonad m => Assignments ( PrimState m ) -> m DecisionLevel
-assignmentsCurrentLevel assigs =
+currentLevel :: PrimMonad m => Assignments ( PrimState m ) -> m DecisionLevel
+currentLevel assigs =
   DecisionLevel <$> Growable.length ( levelStarts ( trail assigs ) )
 
 -- | The decision level at which the given variable was assigned.
@@ -593,34 +563,28 @@ assignmentsCurrentLevel assigs =
 -- Precondition: the variable must currently be assigned.
 levelOfAssignedVar
   :: PrimMonad m
-  => SolverState ( PrimState m ) -> Var -> m DecisionLevel
-levelOfAssignedVar s v = do
-  lvl <- assignmentLevelOfAssignedVar ( solverAssignments s ) v
+  => Assignments ( PrimState m ) -> Var -> m DecisionLevel
+levelOfAssignedVar assig v = do
+  lvl <- Growable.read ( level $ varData assig ) ( varIndex v )
 #ifdef DEBUG
   case lvl of
     UnassignedLevel -> do
-      dump <- dumpSolverState s
+      dump <- dumpAssignments assig
       error $ "SAT.Solver.levelOfAssignedVar: unassigned variable "
            ++ show v ++ "\n" ++ dump
     _ -> pure ()
 #endif
   return lvl
 
-assignmentLevelOfAssignedVar
-  :: PrimMonad m
-  => Assignments ( PrimState m ) -> Var -> m DecisionLevel
-assignmentLevelOfAssignedVar assig v =
-  Growable.read ( level $ varData assig ) ( varIndex v )
-
 -- | Render a snapshot of the trail (lits, levels, reasons) and the
 -- current decision-level stack, for inclusion in panic messages.
-dumpSolverState
+dumpAssignments
   :: forall m
   .  PrimMonad m
-  => SolverState ( PrimState m ) -> m String
-dumpSolverState s@( SolverState { solverAssignments = assigs@( Assignments { trail } ) } ) = do
-  TrailPos sz       <- solverTrailSize s
-  DecisionLevel cur <- currentLevel s
+  => Assignments ( PrimState m ) -> m String
+dumpAssignments assigs@( Assignments { trail } ) = do
+  TrailPos sz       <- trailSize assigs
+  DecisionLevel cur <- currentLevel assigs
   nLim              <- Growable.length ( levelStarts trail )
   let
     readLim :: Int32 -> m Int32
@@ -697,14 +661,9 @@ describeConflict s = \case
           ++ "  lvl=" ++ ( case lvl of UnassignedLevel -> "UNASSIGNED"; DecisionLevel d -> show d )
           ++ "  reason=" ++ showReason rsn
 
-solverTrailSize :: PrimMonad m => SolverState ( PrimState m ) -> m TrailPos
-solverTrailSize s = TrailPos . fromIntegral
-                 <$> Growable.length ( entries ( trail $ solverAssignments s ) )
-
-trailSize :: PrimMonad m => AssignmentTrail ( PrimState m ) -> m TrailPos
-trailSize trail = TrailPos . fromIntegral
-               <$> Growable.length ( entries trail )
-
+trailSize :: PrimMonad m => Assignments ( PrimState m ) -> m TrailPos
+trailSize assigs = TrailPos . fromIntegral
+               <$> Growable.length ( entries $ trail assigs )
 
 numConflicts, numDecisions :: PrimMonad m => SolverState ( PrimState m ) -> m Int
 numConflicts = readMutVar . confCount . stats
@@ -746,7 +705,7 @@ performAssignment assig l rsn = do
   let
     l_idx = varIndex ( litVar l )
     val  = polarityValue ( litPolarity l )
-  lvl <- assignmentsCurrentLevel assig
+  lvl <- currentLevel assig
   Growable.write ( assignments assig ) l_idx val
   Growable.write ( level  $ varData assig ) l_idx lvl
   Growable.write ( reason $ varData assig ) l_idx rsn
@@ -757,14 +716,14 @@ performAssignment assig l rsn = do
 -- Precondition: the literal's variable is currently unassigned.
 enqueueUndef
   :: PrimMonad m
-  => SolverState ( PrimState m ) -> Lit -> Clause.Reason -> m ()
-enqueueUndef s@( SolverState { solverAssignments = assig }) l rsn = do
-  cur <- valueOf s ( litVar l )
+  => Assignments ( PrimState m ) -> Lit -> Clause.Reason -> m ()
+enqueueUndef assig l rsn = do
+  cur <- valueOf assig ( litVar l )
   case cur of
-    LUndef -> performAssignment assig l rsn
+    ŁUndef -> performAssignment assig l rsn
     _      -> do
-      lvl     <- currentLevel s
-      vlvl    <- levelOfAssignedVar s ( litVar l )
+      lvl     <- currentLevel assig
+      vlvl    <- levelOfAssignedVar assig ( litVar l )
       oldRsn  <- Growable.read ( reason $ varData assig ) ( varIndex ( litVar l ) )
       error $ unlines
         [ "SAT.Solver.enqueueUndef: variable already assigned"
@@ -794,12 +753,12 @@ enqueueUndef s@( SolverState { solverAssignments = assig }) l rsn = do
 -- level-0 facts.
 tryEnqueue
   :: PrimMonad m
-  => SolverState ( PrimState m ) -> Lit -> Clause.Reason -> m Bool
-tryEnqueue s l rsn = do
+  => Assignments ( PrimState m ) -> Lit -> Clause.Reason -> m Bool
+tryEnqueue assig l rsn = do
   let val = polarityValue ( litPolarity l )
-  cur <- valueOf s ( litVar l )
+  cur <- valueOf assig ( litVar l )
   case cur of
-    LUndef -> performAssignment ( solverAssignments s ) l rsn *> pure True
+    ŁUndef -> performAssignment assig l rsn *> pure True
     _      -> pure ( cur == val )
 
 -------------------------------------------------------------------------------
@@ -867,7 +826,7 @@ data PostResult
 addClause
   :: PrimMonad m
   => SolverState ( PrimState m ) -> [ Lit ] -> m PostResult
-addClause s ls0 = do
+addClause s@( SolverState { solverAssignments = assig }) ls0 = do
   ok <- readMutVar ( okFlag s )
   if not ok then pure InstantUnsat
   else do
@@ -876,7 +835,7 @@ addClause s ls0 = do
       Nothing -> pure Tautology
       Just [] -> markFalse s >> pure InstantUnsat
       Just [ l ] -> do
-        e <- tryEnqueue s l Clause.RFact
+        e <- tryEnqueue assig l Clause.RFact
         if e
         then do
           conf <- propagate s
@@ -900,14 +859,14 @@ addClause s ls0 = do
 addBinaryLemma
   :: PrimMonad m
   => SolverState ( PrimState m ) -> Lit -> Lit -> m ()
-addBinaryLemma s l m = do
+addBinaryLemma s@( SolverState { solverAssignments = assig }) l m = do
 #ifdef DEBUG
   -- Check precondition: the clause is not already falsified.
-  dbg_val_l <- litValue s l
-  dbg_val_m <- litValue s m
+  dbg_val_l <- litValue assig l
+  dbg_val_m <- litValue assig m
   if
-    | LFalse <- dbg_val_l
-    , LFalse <- dbg_val_m
+    | ŁFalse <- dbg_val_l
+    , ŁFalse <- dbg_val_m
     ->
      error $ unlines
        [ "addBinaryLemma: clause already falsified"
@@ -923,13 +882,13 @@ addBinaryLemma s l m = do
     attachBinary ( clauseDB s ) l m
 
     -- If the clause is already unit, propagate immediately.
-    val_l <- litValue s l
-    val_m <- litValue s m
+    val_l <- litValue assig l
+    val_m <- litValue assig m
     case (val_l, val_m) of
       -- 'RBinary' carries the clause's /other/ literal (false here), as in
       -- 'installLearnt' and as consumed by 'walkUIP'.
-      (LFalse, LUndef) -> enqueueUndef s m $ Clause.RBinary ( FalsifiedLit l )
-      (LUndef, LFalse) -> enqueueUndef s l $ Clause.RBinary ( FalsifiedLit m )
+      (ŁFalse, ŁUndef) -> enqueueUndef assig m $ Clause.RBinary ( FalsifiedLit l )
+      (ŁUndef, ŁFalse) -> enqueueUndef assig l $ Clause.RBinary ( FalsifiedLit m )
       _                -> pure ()
 
 markFalse :: PrimMonad m => SolverState ( PrimState m ) -> m ()
@@ -945,7 +904,7 @@ preprocessClause
   => SolverState ( PrimState m )
   -> [ Lit ]
   -> m ( Maybe [ Lit ] )
-preprocessClause s ls0 = do
+preprocessClause s@( SolverState { solverAssignments = assig }) ls0 = do
   result <- go [] ls0
   -- Clear any markers we may have set during the pass. Re-walking 'ls0' is
   -- safe: positions that were never marked are already 'Bit False', so the
@@ -967,17 +926,17 @@ preprocessClause s ls0 = do
         if seenSelf
         then go keep rest   -- duplicate literal
         else do
-          v <- valueOf s ( litVar l )
+          v <- valueOf assig ( litVar l )
           let keepIt = do
                 Growable.write ( seenLit s ) li ( Bit True )
                 go ( l : keep ) rest
-          case litValueFromVar l v of
-            LUndef -> keepIt
+          case litValueFromVarValue l v of
+            ŁUndef -> keepIt
             here -> do
-              atGround <- ( GroundLevel == ) <$> levelOfAssignedVar s ( litVar l )
+              atGround <- ( GroundLevel == ) <$> levelOfAssignedVar assig ( litVar l )
               case ( here, atGround ) of
-                ( LTrue,  True ) -> pure Nothing
-                ( LFalse, True ) -> go keep rest
+                ( ŁTrue,  True ) -> pure Nothing
+                ( ŁFalse, True ) -> go keep rest
                 _                -> keepIt
 
 -------------------------------------------------------------------------------
@@ -989,12 +948,12 @@ propagate
   :: forall m
   .  PrimMonad m
   => SolverState ( PrimState m ) -> m ( Maybe Conflict )
-propagate s@( SolverState { solverAssignments = Assignments { trail } } ) = loop
+propagate s@( SolverState { solverAssignments = assig@( Assignments { trail } ) } ) = loop
   where
     loop :: m ( Maybe Conflict )
     loop = do
       q  <- readMutVar ( trailHead trail )
-      sz <- trailSize trail
+      sz <- trailSize assig
       if q >= sz
       then pure Nothing
       else do
@@ -1031,7 +990,7 @@ propagateLit
   => SolverState ( PrimState m )
   -> Lit -- ^ the literal we have just assigned to be true
   -> m ( Maybe Conflict )
-propagateLit s p = do
+propagateLit s@( SolverState { solverAssignments = assig }) p = do
   ws <- Growable.read ( watches ( clauseDB s ) ) ( litIndex p )
   total <- Growable.length ws
   loop ws total 0 0
@@ -1052,24 +1011,24 @@ propagateLit s p = do
           case w of
             WBinary other -> do
               -- Binary watcher: clause memory is never touched.
-              v <- litValue s other
+              v <- litValue assig other
               Growable.write ws wi w
               case v of
-                LTrue  -> loop ws total ( ri + 1 ) ( wi + 1 )
-                LUndef -> do
+                ŁTrue  -> loop ws total ( ri + 1 ) ( wi + 1 )
+                ŁUndef -> do
                   -- 'RBinary' carries the clause's other (false) literal, here
                   -- the just-falsified watched literal 'falseLit'.
-                  enqueueUndef s other ( Clause.RBinary falseLit )
+                  enqueueUndef assig other ( Clause.RBinary falseLit )
                   loop ws total ( ri + 1 ) ( wi + 1 )
-                LFalse -> do
+                ŁFalse -> do
                   -- Restore unprocessed remainder so the watch invariant
                   -- holds when the search later backjumps and re-runs BCP.
                   compactRest ws total ( ri + 1 ) ( wi + 1 )
                   pure $ Just $ ConflictBinary falseLit ( FalsifiedLit other )
             WLong cref blocker -> do
               -- Try the blocker shortcut before fetching the clause.
-              bv <- litValue s blocker
-              if bv == LTrue
+              bv <- litValue assig blocker
+              if bv == ŁTrue
               then do
                 Growable.write ws wi w
                 loop ws total ( ri + 1 ) ( wi + 1 )
@@ -1106,42 +1065,43 @@ handleWatched
   -> FalsifiedLit     -- ^ the watched literal that just became false
   -> Clause ( PrimState m )
   -> m WatchOutcome
-handleWatched s cref ( FalsifiedLit falseLit ) c = do
-  -- Normalise so 'falseLit' sits at position 1 and the other watched
-  -- literal at position 0.
-  c0 <- clauseLit c 0
-  when ( c0 == falseLit ) ( clauseSwap c 0 1 )
-  other  <- clauseLit c 0
-  otherV <- litValue s other
-  case otherV of
-    LTrue -> pure ( WatchKept other )
-    _ -> do
-      mb <- findNonFalseFrom s c 2
-      case mb of
-        Just ( i, newWatched ) -> do
-          clauseSwap c 1 i
-          -- The clause now watches 'other' at position 0 and 'newWatched'
-          -- at position 1. Register it on the new watch list with 'other'
-          -- as the blocker.
-          pushWatcher ( clauseDB s ) newWatched ( WLong cref other )
-          pure WatchReplaced
-        Nothing ->
-          case otherV of
-            LFalse -> pure ( WatchConflict other )
-            LUndef -> do
-              enqueueUndef s other ( Clause.RClause cref )
-              pure ( WatchKept other )
+handleWatched s@( SolverState { solverAssignments = assig })
+  cref ( FalsifiedLit falseLit ) c = do
+    -- Normalise so 'falseLit' sits at position 1 and the other watched
+    -- literal at position 0.
+    c0 <- clauseLit c 0
+    when ( c0 == falseLit ) ( clauseSwap c 0 1 )
+    other  <- clauseLit c 0
+    otherV <- litValue assig other
+    case otherV of
+      ŁTrue -> pure ( WatchKept other )
+      _ -> do
+        mb <- findNonFalseFrom assig c 2
+        case mb of
+          Just ( i, newWatched ) -> do
+            clauseSwap c 1 i
+            -- The clause now watches 'other' at position 0 and 'newWatched'
+            -- at position 1. Register it on the new watch list with 'other'
+            -- as the blocker.
+            pushWatcher ( clauseDB s ) newWatched ( WLong cref other )
+            pure WatchReplaced
+          Nothing ->
+            case otherV of
+              ŁFalse -> pure ( WatchConflict other )
+              ŁUndef -> do
+                enqueueUndef assig other ( Clause.RClause cref )
+                pure ( WatchKept other )
 
 -- | Scan a clause from position @start@ onwards for the first literal that
 -- is not currently false, returning its position and value.
 findNonFalseFrom
   :: forall m
   .  PrimMonad m
-  => SolverState ( PrimState m )
+  => Assignments ( PrimState m )
   -> Clause ( PrimState m )
   -> Int
   -> m ( Maybe ( Int, Lit ) )
-findNonFalseFrom s c start = go start
+findNonFalseFrom assig c start = go start
   where
     n :: Int
     n = clauseSize c
@@ -1150,8 +1110,8 @@ findNonFalseFrom s c start = go start
       | j >= n = pure Nothing
       | otherwise = do
           l <- clauseLit c j
-          v <- litValue s l
-          if v == LFalse
+          v <- litValue assig l
+          if v == ŁFalse
           then go ( j + 1 )
           else pure ( Just ( j, l ) )
 
@@ -1173,8 +1133,8 @@ analyse
   => SolverState ( PrimState m )
   -> Conflict
   -> m ( [ Lit ], DecisionLevel )
-analyse s conflict0 = do
-  curLevel <- currentLevel s
+analyse s@( SolverState { solverAssignments = assig } ) conflict0 = do
+  curLevel <- currentLevel assig
   let
     AnalysisState
       { analysePathC
@@ -1210,15 +1170,15 @@ analyse s conflict0 = do
       else do
 #ifdef DEBUG
         -- Check that 'l' is indeed false on the current trail.
-        lv <- litValue s l
-        when ( lv /= LFalse ) $ do
-          dump <- dumpSolverState s
+        lv <- litValue assig l
+        when ( lv /= ŁFalse ) $ do
+          dump <- dumpAssignments assig
           error $ unlines
             [ "Non-false learnt clause literal " <> show lv
             , dump
             ]
 #endif
-        lvl <- levelOfAssignedVar s ( litVar l )
+        lvl <- levelOfAssignedVar assig ( litVar l )
         if lvl <= GroundLevel
         then pure ()
         else do
@@ -1251,6 +1211,7 @@ analyse s conflict0 = do
       visitLit -1 l1
       visitLit -1 l2
 
+#ifdef DEBUG
   -- BCP only fires this analysis when the conflict was produced at the
   -- current level, so the conflict source must mention at least one
   -- literal at 'curLevel'. Failing this points at a BCP / level-bookkeeping
@@ -1258,7 +1219,7 @@ analyse s conflict0 = do
   postVisitPC <- readMutVar analysePathC
   when ( postVisitPC == 0 ) $ do
     conflictDesc <- describeConflict s conflict0
-    stateDump    <- dumpSolverState s
+    stateDump    <- dumpAssignments assig
     error $ unlines
       [ "SAT.Solver.analyse: conflict at level > 0 has no current-level literals."
       , "  currentLevel=" ++ show ( unDecisionLevel curLevel )
@@ -1266,8 +1227,9 @@ analyse s conflict0 = do
       , conflictDesc
       , stateDump
       ]
+#endif
 
-  initTrail <- solverTrailSize s
+  initTrail <- trailSize assig
   uipLit <- walkUIP s visit visitLit ( initTrail - 1 )
 
   -- Drop self-subsumed body literals while 'seen' still marks the body.
@@ -1302,12 +1264,10 @@ analyse s conflict0 = do
         Just secnd -> asserting : secnd : restLits
   pure ( learnt, bjLevel )
 
--- | Recursive learnt-clause minimisation (self-subsumption; Sörensson \& Biere
--- 2009). A body literal of the learnt clause is /redundant/ when its negation is
--- already implied by the rest of the clause — i.e. every other literal of its
--- reason is at the ground level, in the clause, or itself recursively redundant.
--- Dropping all such literals leaves a logically-equivalent, typically much
--- shorter clause (often roughly halved).
+-- | Recursive learnt-clause minimisation (Sörensson & Biere, 2009).
+--
+-- A body literal of a learnt clause is redundant when its negation is already
+-- implied by the rest of the clause.
 --
 -- Precondition: 'seen' is set exactly for the body-literal variables (the state
 -- 'walkUIP' leaves behind). A variable proven redundant is additionally marked
@@ -1334,7 +1294,7 @@ minimiseLearnt assig clauseDB
   Growable.truncate minFailedTouched  0
   n <- Growable.length analyseOtherLits
   -- The set of decision levels present in the body, hashed into a 64-bit mask
-  -- ('abstractLevel'). A literal can only be self-subsumed if every other
+  -- ('hashDecisionLevel'). A literal can only be self-subsumed if every other
   -- literal of its reason resolves into a level already in the clause; a reason
   -- literal whose level is absent from this mask is therefore not coverable, and
   -- the redundancy check fails fast without forcing the (possibly large)
@@ -1372,7 +1332,7 @@ minimiseLearnt assig clauseDB
           | j >= n    = pure acc
           | otherwise = do
               lvl <- Growable.read analyseOtherLevels j
-              go ( j + 1 ) ( acc .|. abstractLevel lvl )
+              go ( j + 1 ) ( acc .|. hashDecisionLevel lvl )
 
     -- A variable's assignment is self-subsumed iff its reason exists and every
     -- /other/ literal of that reason is covered. A decision (no reason) is not.
@@ -1401,7 +1361,7 @@ minimiseLearnt assig clauseDB
     covered :: Word64 -> FalsifiedLit -> m Bool
     covered abstraction ( FalsifiedLit q ) = do
       let vq = varIndex ( litVar q )
-      lvl <- assignmentLevelOfAssignedVar assig ( litVar q )
+      lvl <- levelOfAssignedVar assig ( litVar q )
       if lvl <= GroundLevel
       then pure True
       else do
@@ -1413,7 +1373,7 @@ minimiseLearnt assig clauseDB
           if isFailed
           then pure False
           else
-            if abstractLevel lvl .&. abstraction == 0
+            if hashDecisionLevel lvl .&. abstraction == 0
             then markFailed vq
             else do
               ok <- reasonRedundant abstraction vq
@@ -1711,9 +1671,9 @@ cancelUntil
 cancelUntil
   s@( SolverState { solverAssignments = assig })
   tgtLevel@( DecisionLevel tgt ) = do
-  cur <- currentLevel s
+  cur <- currentLevel assig
   when ( cur > tgtLevel ) do
-    TrailPos sz <- solverTrailSize s
+    TrailPos sz <- trailSize assig
     start@( LevelStart { levelTrailPos = TrailPos limI } ) <-
       Growable.read ( levelStarts ( trail assig ) ) tgt
     let
@@ -1730,7 +1690,7 @@ cancelUntil
             -- TODO: CaDiCaL vs MiniSat: do we want to save ALL phases or only
             -- decision phases?
             Growable.write ( phase       assig )      v_idx ( litPolarity lit )
-            Growable.write ( assignments assig )      v_idx LUndef
+            Growable.write ( assignments assig )      v_idx ŁUndef
             Growable.write ( level  $ varData assig ) v_idx UnassignedLevel
             Growable.write ( reason $ varData assig ) v_idx Clause.RDecision
             -- A decision variable is unassigned again, so it must be in the
@@ -1784,17 +1744,17 @@ decide
   :: forall m
   .  PrimMonad m
   => SolverState ( PrimState m ) -> m ( Maybe Lit )
-decide s = do
+decide s@( SolverState { solverAssignments = assig } ) = do
   mbV <- VarOrder.extractMaxBy ( varOrder s ) isUnassigned
   case mbV of
     Nothing -> pure Nothing
     Just v  -> do
       modifyMutVar' ( decCount ( stats s ) ) ( + 1 )
-      pol <- Growable.read ( phase $ solverAssignments s ) ( varIndex v )
+      pol <- Growable.read ( phase assig ) ( varIndex v )
       pure ( Just ( mkLit v pol ) )
   where
     isUnassigned :: Var -> m Bool
-    isUnassigned v = ( LUndef == ) <$> valueOf s v
+    isUnassigned v = ( ŁUndef == ) <$> valueOf assig v
 
 -- | Branch on a /specific/ variable, returning the literal with its saved phase
 -- (defaulting to positive). 'Nothing' if the variable is already assigned.
@@ -1808,12 +1768,12 @@ decide s = do
 decideVar
   :: forall m
   .  PrimMonad m
-  => SolverState ( PrimState m ) -> Var -> m ( Maybe Lit )
-decideVar s v = do
-  val <- valueOf s v
+  => Assignments ( PrimState m ) -> Var -> m ( Maybe Lit )
+decideVar assig v = do
+  val <- valueOf assig v
   case val of
-    LUndef -> do
-      pol <- Growable.read ( phase $ solverAssignments s ) ( varIndex v )
+    ŁUndef -> do
+      pol <- Growable.read ( phase assig ) ( varIndex v )
       pure ( Just ( mkLit v pol ) )
     _ -> pure Nothing
 
@@ -1838,13 +1798,13 @@ data StepResult
 solve
   :: PrimMonad m
   => SolverState ( PrimState m ) -> m Verdict
-solve = solveWith defaultOptions
+solve = solveWith defaultSolverOptions
 
 solveWith
   :: forall m
   .  PrimMonad m
   => SolverOptions -> SolverState ( PrimState m ) -> m Verdict
-solveWith opts s = do
+solveWith opts s@( SolverState { solverAssignments = assig } ) = do
   ok <- readMutVar ( okFlag s )
   if not ok then pure Unsat
   else do
@@ -1872,7 +1832,7 @@ solveWith opts s = do
           mbConf <- propagate s
           case mbConf of
             Just c -> do
-              lvl <- currentLevel s
+              lvl <- currentLevel assig
               if lvl == GroundLevel
               then markFalse s *> pure ( Solved Unsat )
               else do
@@ -1891,7 +1851,7 @@ solveWith opts s = do
                 Nothing -> pure ( Solved Sat )
                 Just lit -> do
                   pushNewLevel s
-                  enqueueUndef s lit Clause.RDecision
+                  enqueueUndef assig lit Clause.RDecision
                   step confs
 
         checkBudget :: m ( Maybe Verdict )
@@ -1937,17 +1897,17 @@ countDecision s = modifyMutVar' ( decCount ( stats s ) ) ( + 1 )
 installLearnt
   :: PrimMonad m
   => SolverState ( PrimState m ) -> [ Lit ] -> m ()
-installLearnt s = \case
+installLearnt s@( SolverState { solverAssignments = assig } ) = \case
   [] -> markFalse s
-  [ l ] -> enqueueUndef s l Clause.RFact
+  [ l ] -> enqueueUndef assig l Clause.RFact
   [ l, m ] -> do
     attachBinary ( clauseDB s ) l m
-    enqueueUndef s l ( Clause.RBinary $ FalsifiedLit m )
+    enqueueUndef assig l ( Clause.RBinary $ FalsifiedLit m )
   ls@( l : _ ) -> do
     ( cref, c ) <- recordClause ( clauseDB s ) True ls
     Growable.push ( learnts ( clauseDB s ) ) cref
     attachLong ( clauseDB s ) cref c
-    enqueueUndef s l ( Clause.RClause cref )
+    enqueueUndef assig l ( Clause.RClause cref )
 
 -- | Resolve a non-ground conflict.
 --
@@ -2058,17 +2018,17 @@ recordFalsifiedClause s ls =
 -- | A snapshot of the solver's variable assignment.
 --
 -- Only variables with a definite value are present; unassigned variables
--- are absent and surface as 'LUndef' via 'assignmentValue'.
+-- are absent and surface as 'ŁUndef' via 'assignmentValue'.
 newtype Assignment = Assignment ( IntMap Bool )
   deriving stock Show
 
 -- | The lifted-boolean value of a variable under the assignment.
-assignmentValue :: Var -> Assignment -> LBool
+assignmentValue :: Var -> Assignment -> Ł3
 assignmentValue ( Var v ) ( Assignment m ) =
   case IntMap.lookup ( fromIntegral v ) m of
-    Just True  -> LTrue
-    Just False -> LFalse
-    Nothing    -> LUndef
+    Just True  -> ŁTrue
+    Just False -> ŁFalse
+    Nothing    -> ŁUndef
 
 -- | Take a snapshot of the solver's current assignment.
 --
@@ -2082,18 +2042,18 @@ assignmentValue ( Var v ) ( Assignment m ) =
 getModel
   :: forall m
   .  PrimMonad m
-  => SolverState ( PrimState m ) -> m Assignment
-getModel s = do
-  n <- numVariables s
+  => Assignments ( PrimState m ) -> m Assignment
+getModel assig = do
+  n <- numVariables assig
   let
     collect :: Int -> IntMap Bool -> m ( IntMap Bool )
     collect !i !acc
       | i < 0     = pure acc
       | otherwise = do
-          val <- valueOf s ( Var $ fromIntegral i )
+          val <- valueOf assig ( Var $ fromIntegral i )
           let !acc' = case val of
-                LTrue  -> IntMap.insert i True  acc
-                LFalse -> IntMap.insert i False acc
-                LUndef -> acc
+                ŁTrue  -> IntMap.insert i True  acc
+                ŁFalse -> IntMap.insert i False acc
+                ŁUndef -> acc
           collect ( i - 1 ) acc'
   Assignment <$> collect ( n - 1 ) IntMap.empty

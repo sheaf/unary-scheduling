@@ -37,14 +37,15 @@ import qualified Z3.Monad as Z3
 import SAT.Base
   ( Var(..), Lit, mkLit
   , Polarity(..)
-  , LBool(..)
+  , Ł3(..)
   )
 import SAT.Solver
   ( SolverState, newSolver, newVar
   , addClause, PostResult(..)
   , solveWith, getModel
   , Assignment, assignmentValue
-  , SolverOptions(..), defaultOptions
+  , solverAssignments
+  , SolverOptions(..), defaultSolverOptions
   , Verdict(..)
   )
 
@@ -97,12 +98,12 @@ nativeSolve ( CNF nVars cls ) = runST \ @s -> do
     v <- solveWith options s
     case v of
       Sat -> do
-        m <- getModel s
+        m <- getModel ( solverAssignments s )
         pure ( Sat, Just m )
       _ -> pure ( v, Nothing )
   where
     options :: SolverOptions
-    options = defaultOptions { optConflictBudget = 50000 }
+    options = defaultSolverOptions { optConflictBudget = 50000 }
 
 rawToLit :: RawLit -> Lit
 rawToLit ( RawLit i pol ) = mkLit ( Var ( fromIntegral i ) ) pol
@@ -147,9 +148,9 @@ modelSatisfies a ( CNF _ cls ) = all clauseHolds cls
   where
     clauseHolds = any litHolds
     litHolds ( RawLit i pol ) = case assignmentValue ( Var ( fromIntegral i ) ) a of
-      LTrue  -> case pol of { Positive -> True;  Negative -> False }
-      LFalse -> case pol of { Positive -> False; Negative -> True  }
-      LUndef -> True   -- free variable: the model is consistent under either value
+      ŁTrue  -> case pol of { Positive -> True;  Negative -> False }
+      ŁFalse -> case pol of { Positive -> False; Negative -> True  }
+      ŁUndef -> True   -- free variable: the model is consistent under either value
 
 --------------------------------------------------------------------------------
 -- Properties.

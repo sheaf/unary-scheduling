@@ -33,6 +33,7 @@ module Schedule.LCG.Theory
   ( -- * Theory state
     TheoryState(..), TheoryOptions(..)
   , newTheory
+  , theoryAssignments
     -- * SAT-decision-level synchronisation
   , pushLevel
   , popToLevel
@@ -118,13 +119,13 @@ import qualified Data.Vector.Primitive.Mutable as Primitive
 
 -- unary-scheduling
 import SAT.Base
-  ( Var(..), Lit, LBool(..)
+  ( Var(..), Lit, Ł3(..)
   , Polarity(Positive, Negative)
   , negateLit, litVar, varIndex
   , LitOfValue(..), SatisfiedLit, FalsifiedLit, negateLitOfValue
   )
 import SAT.Clause
-  ( Reason(..), LazyReason(..) )
+  ( Reason(..), LazyReason(..), forceLazyReasonNow )
 import qualified SAT.Solver as SAT
 import Data.Lattice
   ( Lattice( (\/) ), BoundedLattice(top, bottom) )
@@ -277,6 +278,9 @@ data TheoryState mode s task t = TheoryState
     monitor         :: !( Monitor mode s )
   }
 
+theoryAssignments :: TheoryState mode s task t -> SAT.Assignments s
+theoryAssignments = SAT.solverAssignments . theorySolverState
+
 -- | Configuration options for the theory-side of the DPLL(T) loop.
 data TheoryOptions
   = TheoryOptions
@@ -388,8 +392,8 @@ seedInitialBounds t nT =
       -- availability has slots but none long enough for its duration, hence no
       -- feasible start. Seeding both then contradicts, so seed defensively and
       -- surface the contradiction as a root infeasibility.
-      ok1 <- SAT.tryEnqueue ( theorySolverState t ) estL RFact
-      ok2 <- SAT.tryEnqueue ( theorySolverState t ) lctL RFact
+      ok1 <- SAT.tryEnqueue ( theoryAssignments t ) estL RFact
+      ok2 <- SAT.tryEnqueue ( theoryAssignments t ) lctL RFact
       when ( not ( ok1 && ok2 ) ) ( SAT.markFalse ( theorySolverState t ) )
 
 -------------------------------------------------------------------------------
@@ -428,7 +432,7 @@ popToLevel t ( SAT.DecisionLevel lvl ) = do
   Growable.truncate ( levelMarks t ) lvl
   undoTo ( schedTrail t ) ( tasks t ) m
   -- Rewind the theory head: any trail positions above the new top are gone.
-  newSize <- SAT.solverTrailSize ( theorySolverState t )
+  newSize <- SAT.trailSize ( theoryAssignments t )
   writeMutVar ( theoryHead t ) newSize
 
 -- | Number of precedence literals currently on the SAT trail.
@@ -436,7 +440,7 @@ popToLevel t ( SAT.DecisionLevel lvl ) = do
 -- Used only for debugging/instrumentation.
 numPrecedenceDecisions :: TheoryState mode s task t -> ST s Int
 numPrecedenceDecisions t = do
-  SAT.TrailPos sz <- SAT.solverTrailSize ( theorySolverState t )
+  SAT.TrailPos sz <- SAT.trailSize ( theoryAssignments t )
   let
     loop !i !acc
       | i >= sz   = pure acc
@@ -508,7 +512,7 @@ channelPending t = do
       then pure Nothing  -- theorySolverState already marked UNSAT; outer loop will bail.
       else do
         h@( SAT.TrailPos hi ) <- readMutVar ( theoryHead t )
-        SAT.TrailPos sz       <- SAT.solverTrailSize ( theorySolverState t )
+        SAT.TrailPos sz       <- SAT.trailSize ( theoryAssignments t )
         if hi >= sz
         then pure Nothing
         else do
@@ -545,9 +549,9 @@ checkMatrixTrailInvariant t ctx = iterPairs 0 1
     ps     = atoms t
     nTasks = precedenceAtomsNumTasks ps
     mat    = orderings ( tasks t )
-    bad :: Int -> Int -> Order -> LBool -> String -> ST s ()
+    bad :: Int -> Int -> Order -> Ł3 -> String -> ST s ()
     bad i j o val expected = do
-      dump <- SAT.dumpSolverState ( theorySolverState t )
+      dump <- SAT.dumpAssignments ( theoryAssignments t )
       error $ "Schedule.LCG.Theory.checkMatrixTrailInvariant [" <> ctx <> "]: "
            <> "mat[" <> show i <> "," <> show j <> "] = " <> show o
            <> " but lit " <> show ( precLit ps i j ) <> " is " <> show val
@@ -555,11 +559,11 @@ checkMatrixTrailInvariant t ctx = iterPairs 0 1
     checkPair :: Int -> Int -> ST s ()
     checkPair i j = do
       o   <- readOrdering mat i j
-      val <- SAT.litValue ( theorySolverState t ) ( precLit ps i j )
+      val <- SAT.litValue ( theoryAssignments t ) ( precLit ps i j )
       case o of
         Unknown     -> pure ()
-        LessThan    -> case val of LTrue  -> pure (); _ -> bad i j o val "LTrue"
-        GreaterThan -> case val of LFalse -> pure (); _ -> bad i j o val "LFalse"
+        LessThan    -> case val of ŁTrue  -> pure (); _ -> bad i j o val "ŁTrue"
+        GreaterThan -> case val of ŁFalse -> pure (); _ -> bad i j o val "ŁFalse"
         Equal       -> bad i j o val "<matrix cycle>"
     iterPairs :: Int -> Int -> ST s ()
     iterPairs i j
@@ -807,8 +811,8 @@ debugAuditPropagationFixpoint t = do
   case eRes of
     Right () | IntSet.null movedTasks -> pure ()
     _ -> do
-      SAT.DecisionLevel lvl <- SAT.currentLevel ( theorySolverState t )
-      dump                  <- SAT.dumpSolverState ( theorySolverState t )
+      SAT.DecisionLevel lvl <- SAT.currentLevel ( theoryAssignments t )
+      dump                  <- SAT.dumpAssignments ( theoryAssignments t )
       let finding = case eRes of
             Left inf -> "an entailed conflict was not surfaced: " <> show inf
             Right () -> "a bound tightening was not applied for tasks "
@@ -922,9 +926,9 @@ internBoundAtomWith t allocVar i thr = do
 #ifdef DEBUG
     -- A freshly-interned atom owns a brand-new SAT variable, so it must
     -- start off unassigned.
-    freshVal <- SAT.valueOf ( theorySolverState t ) ( litVar lit )
+    freshVal <- SAT.valueOf ( theoryAssignments t ) ( litVar lit )
     case freshVal of
-      LUndef -> pure ()
+      ŁUndef -> pure ()
       _      -> error $ "internBoundAtomWith: freshly-interned atom already assigned: "
                      <> show lit <> " = " <> show freshVal
 #endif
@@ -1347,7 +1351,7 @@ boundMoveReason t i dur ( Interval lowerStart upperStart ) compOf carverLitsOf a
     -- the skipped span; otherwise the antecedents do not entail the bound and the
     -- learnt clause would be unsound. See Note [Bound-move reason completeness].
     when ( holdsDur _residual ) $ do
-      dump <- SAT.dumpSolverState ( theorySolverState t )
+      dump <- SAT.dumpAssignments ( theoryAssignments t )
       error $ unlines
         [ "Schedule.LCG.Theory.boundMoveReason: incomplete reason (does not entail new bound)."
         , "Cited antecedents leave a feasible slot in the skipped span for task " <> show i <> "."
@@ -1475,12 +1479,12 @@ enqueuePropagated
   .  MonitorMode mode
   => TheoryState mode s task t -> Lit -> LazyReason s -> ST s ()
 enqueuePropagated t lit reason = do
-  lvl <- SAT.currentLevel ( theorySolverState t )
+  lvl <- SAT.currentLevel ( theoryAssignments t )
   if lvl == SAT.GroundLevel
   then
     -- A ground-level theory propagation is an unconditional fact; 1-UIP never
     -- resolves against ground-level literals, so it needs no reason clause.
-    SAT.enqueueUndef ( theorySolverState t ) lit RFact
+    SAT.enqueueUndef ( theoryAssignments t ) lit RFact
   else do
 #ifdef DEBUG
     debugCheckReasonAntecedents t lit reason
@@ -1488,7 +1492,7 @@ enqueuePropagated t lit reason = do
     tickLazyRecord ( monitor t )
     lref <- SAT.recordLazyReason ( theorySolverState t )
               ( instrumentedLazyReason ( monitor t ) reason )
-    SAT.enqueueUndef ( theorySolverState t ) lit ( RLazy lref )
+    SAT.enqueueUndef ( theoryAssignments t ) lit ( RLazy lref )
   modifyMutVar' ( theoryPropCount t ) ( + 1 )
 
 -- | Instrument a lazy reason to tick when it gets forced.
@@ -1509,19 +1513,19 @@ instrumentedLazyReason mon = \case
 -- | Verify, at enqueue time, that a theory-propagation reason is a valid unit
 -- reason for @propLit@: every other literal of the (forced) clause is currently
 -- /false/, i.e. each antecedent is true and was asserted strictly earlier on the
--- trail. A 'LUndef' antecedent is a /future antecedent/ (cited before it is on
--- the trail) and would corrupt 1-UIP; a 'LTrue' clause literal means a false
+-- trail. A 'ŁUndef' antecedent is a /future antecedent/ (cited before it is on
+-- the trail) and would corrupt 1-UIP; a 'ŁTrue' clause literal means a false
 -- antecedent was cited as if true. Either is a reason-construction bug.
 debugCheckReasonAntecedents
   :: forall mode s task t
   .  TheoryState mode s task t -> Lit -> LazyReason s -> ST s ()
 debugCheckReasonAntecedents t propLit reason = do
-  body <- forceLazyReason reason
+  body <- forceLazyReasonNow reason
   -- A non-ground clause of just @[propLit]@ has no antecedents: it asserts the
   -- propagation as an unconditional fact (which would belong at the ground level
   -- as 'RFact'). A dropped-antecedent bug.
   when ( all ( \ l -> litVar l == litVar propLit ) body ) $ do
-    dump <- SAT.dumpSolverState ( theorySolverState t )
+    dump <- SAT.dumpAssignments ( theoryAssignments t )
     error $ unlines
       [ "Schedule.LCG.Theory.enqueuePropagated: reason for "<> show propLit <> " has no antecedents."
       , "clause = " <> show body
@@ -1531,15 +1535,15 @@ debugCheckReasonAntecedents t propLit reason = do
       check ( l : ls )
         | litVar l == litVar propLit = check ls
         | otherwise = do
-            v <- SAT.litValue ( theorySolverState t ) l
-            if v == LFalse
+            v <- SAT.litValue ( theoryAssignments t ) l
+            if v == ŁFalse
             then check ls
             else do
               mbMeaning <- litMeaning ( atoms t ) ( boundAtoms t ) l
-              dump      <- SAT.dumpSolverState ( theorySolverState t )
+              dump      <- SAT.dumpAssignments ( theoryAssignments t )
               error $ "Schedule.LCG.Theory.enqueuePropagated: reason for "
                    <> show propLit <> " cites antecedent " <> show l <> " which is "
-                   <> show v <> " (expected the clause literal to be LFalse, i.e. the "
+                   <> show v <> " (expected the clause literal to be ŁFalse, i.e. the "
                    <> "antecedent true and earlier on the trail)\n"
                    <> "  antecedent meaning: " <> debugMeaning mbMeaning <> "\n"
                    <> "full clause: " <> show body <> "\n" <> dump
@@ -1570,15 +1574,13 @@ assert
   -> LazyReason s
   -> ST s ( Maybe SAT.Conflict )
 assert t label lit reason = do
-  val <- SAT.litValue ( theorySolverState t ) lit
+  val <- SAT.litValue ( theoryAssignments t ) lit
   case val of
-    LTrue  -> pure Nothing
-    LUndef -> enqueuePropagated t lit reason *> pure Nothing
-    LFalse -> do
+    ŁTrue  -> pure Nothing
+    ŁUndef -> enqueuePropagated t lit reason *> pure Nothing
+    ŁFalse -> do
       -- Eagerly force the reason: we need it now. Don't generate a 'LazyRef'.
-      body <- case reason of
-        LazyReason forceIt -> forceIt
-        AlreadyForcedReason lits -> pure lits
+      body <- forceLazyReasonNow reason
       conflictClause t label ( map FalsifiedLit body )
 
 -------------------------------------------------------------------------------
@@ -1602,7 +1604,7 @@ assertValidOverload t culprit = do
         [ sum [ d | ( e, l, d ) <- rows, e >= a, l <= b ] > b - a
         | ( a, _, _ ) <- rows, ( _, b, _ ) <- rows, b > a ]
   unless does_overload do
-    dump <- SAT.dumpSolverState ( theorySolverState t )
+    dump <- SAT.dumpAssignments ( theoryAssignments t )
     error $ unlines
       [ "Schedule.LCG.Theory.buildInfeasibleConflict: invalid overload."
       , dump
@@ -1672,7 +1674,7 @@ emptyDomainConflict t cap i lo hi = do
   -- only @prune@\/@timetable@ removals this always holds (the others are ground).
   let fits iv = measure iv >= dur
   when ( any fits ( toList ( intervals residual ) ) ) $ do
-    dump <- SAT.dumpSolverState ( theorySolverState t )
+    dump <- SAT.dumpAssignments ( theoryAssignments t )
     error $ "Schedule.LCG.Theory.emptyDomainConflict: residual still admits task "
          <> show i <> " (carver reconstruction incomplete)\n" <> dump
 #else
@@ -1734,9 +1736,9 @@ reconstructCycle t predTask succTask = do
       | IntSet.member y visited     = tryEdges visited x ( y + 1 )
       | otherwise                   = do
           let edge = precLit ( atoms t ) x y
-          v <- SAT.litValue ( theorySolverState t ) edge
+          v <- SAT.litValue ( theoryAssignments t ) edge
           case v of
-            LTrue -> do
+            ŁTrue -> do
               mb <- findPath ( IntSet.insert y visited ) y
               case mb of
                 Just rest -> pure ( Just ( edge : rest ) )
@@ -1809,12 +1811,12 @@ checkCitabilityInvariant t ctx = go 0
             check i "lst" l
             go ( i + 1 )
     check i which lit = do
-      v <- SAT.litValue ( theorySolverState t ) lit
-      when ( v /= LTrue ) $ do
-        dump <- SAT.dumpSolverState ( theorySolverState t )
+      v <- SAT.litValue ( theoryAssignments t ) lit
+      when ( v /= ŁTrue ) $ do
+        dump <- SAT.dumpAssignments ( theoryAssignments t )
         error $ "Schedule.LCG.Theory.checkCitabilityInvariant [" <> ctx <> "]: task "
              <> show i <> "'s " <> which <> " bound atom " <> show lit <> " is " <> show v
-             <> ", not LTrue (citability invariant violated)\n" <> dump
+             <> ", not ŁTrue (citability invariant violated)\n" <> dump
 
 -- | Verify a conflict mentions at least one literal at the current decision level.
 --
@@ -1823,7 +1825,7 @@ debugAssertCurrentLevelLit
   :: forall s. Text -> SAT.SolverState s -> [ Lit ] -> ST s ()
 debugAssertCurrentLevelLit _     _ []   = pure ()
 debugAssertCurrentLevelLit label s body = do
-  cur   <- SAT.currentLevel s
+  cur   <- SAT.currentLevel assigs
   descs <- traverse ( describe cur ) body
   when ( not ( any fst descs ) ) $
     error $ unlines $
@@ -1831,13 +1833,15 @@ debugAssertCurrentLevelLit label s body = do
          " has no literal at the current level (" <> show cur <> ")"
        ) : map snd descs
   where
+    assigs :: SAT.Assignments s
+    assigs = SAT.solverAssignments s
     describe :: SAT.DecisionLevel -> Lit -> ST s ( Bool, String )
     describe cur l = do
-      v <- SAT.litValue s l
+      v <- SAT.litValue assigs l
       case v of
-        LUndef -> pure ( False, "    " <> show l <> "  assign=LUndef  lvl=UNASSIGNED" )
+        ŁUndef -> pure ( False, "    " <> show l <> "  assign=ŁUndef  lvl=UNASSIGNED" )
         _      -> do
-          lvl <- SAT.levelOfAssignedVar s ( litVar l )
+          lvl <- SAT.levelOfAssignedVar assigs ( litVar l )
           pure ( lvl == cur
                , "    " <> show l <> "  assign=" <> show v <> "  lvl=" <> show lvl )
 #endif
@@ -1960,7 +1964,7 @@ assertValidPacking t confined = do
       nBins   = length rangeBins
       capMax  = if null rangeBins then 0 else maximum rangeBins
   unless ( martelloTothBound sizes capMax > nBins ) do
-    dump <- SAT.dumpSolverState ( theorySolverState t )
+    dump <- SAT.dumpAssignments ( theoryAssignments t )
     error $ unlines
       [ "Schedule.LCG.Theory.resourcePackingCheck: invalid packing conflict "
         <> "(L2 ≤ " <> show nBins <> " bins for " <> show ( length sizes ) <> " items)."

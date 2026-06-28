@@ -95,14 +95,14 @@ data SearchOptions = SearchOptions
 
 defaultSearchOptions :: SearchOptions
 defaultSearchOptions = SearchOptions
-  { optSolver          = SAT.defaultOptions
-  , optRestartUnit     = 100
+  { optSolver            = SAT.defaultSolverOptions
+  , optRestartUnit       = 100
   , optStrongBranchWidth = 8
   , optTheoryOpts =
       TheoryOptions
-        { maxPropRounds = 1000
+        { maxPropRounds     = 1000
         , useBoundDecisions = True
-        , useTheoryDecide = True
+        , useTheoryDecide   = True
         }
   }
 
@@ -242,6 +242,8 @@ driveLoop restartUnit strongWidth theoryState = driveRestarts 1
   where
     solverState :: SAT.SolverState s
     solverState = theorySolverState theoryState
+    assigs :: SAT.Assignments s
+    assigs = SAT.solverAssignments solverState
     restartEnabled :: Bool
     restartEnabled = restartUnit > 0
 
@@ -272,7 +274,7 @@ driveLoop restartUnit strongWidth theoryState = driveRestarts 1
           -- Restart all the way to ground, keeping learnt clauses and the matured
           -- ratings. Guard the theory rollback: the triggering conflict may have
           -- already backjumped to ground (so there is no level to pop).
-          cur <- SAT.currentLevel ( theorySolverState theoryState )
+          cur <- SAT.currentLevel assigs
           when ( cur > SAT.GroundLevel ) do
             SAT.cancelUntil solverState SAT.GroundLevel
             popToLevel theoryState SAT.GroundLevel
@@ -295,7 +297,7 @@ driveLoop restartUnit strongWidth theoryState = driveRestarts 1
               Just c  -> onConflict confs c
               Nothing -> do
                 -- 2. Theory propagation.
-                szBefore <- SAT.solverTrailSize solverState
+                szBefore <- SAT.trailSize assigs
                 mbTConf <- theoryPropagate theoryState
                 case mbTConf of
                   Just c  -> onConflict confs c
@@ -306,7 +308,7 @@ driveLoop restartUnit strongWidth theoryState = driveRestarts 1
                     if not okAfter
                     then pure ( Solved SAT.Unsat )
                     else do
-                      szAfter <- SAT.solverTrailSize solverState
+                      szAfter <- SAT.trailSize assigs
                       if szAfter > szBefore
                       -- Theory pushed new literals — re-run BCP before deciding.
                       then step confs
@@ -340,13 +342,13 @@ driveLoop restartUnit strongWidth theoryState = driveRestarts 1
               when fdsEnabled ( noteDecision theoryState lit szNow )
               SAT.pushNewLevel solverState
               pushLevel theoryState
-              SAT.enqueueUndef solverState lit RDecision
+              SAT.enqueueUndef assigs lit RDecision
               step confs
 
         -- Common conflict-handling path (used for both BCP and theory conflicts).
         onConflict :: Int -> SAT.Conflict -> ST s WindowResult
         onConflict !confs c = do
-          lvl <- SAT.currentLevel solverState
+          lvl <- SAT.currentLevel assigs
           if lvl == SAT.GroundLevel
           then do
             SAT.markFalse solverState
