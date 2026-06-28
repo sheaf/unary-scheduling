@@ -201,12 +201,6 @@ newtype TrailPos = TrailPos { unTrailPos :: Int32 }
   deriving stock   Show
   deriving newtype ( Eq, Ord, Num )
 
-newtype instance Unboxed.MVector s TrailPos = MVTrailPos ( Unboxed.MVector s Int32 )
-newtype instance Unboxed.Vector    TrailPos = VTrailPos  ( Unboxed.Vector    Int32 )
-deriving newtype instance Generic.MVector Unboxed.MVector TrailPos
-deriving newtype instance Generic.Vector  Unboxed.Vector  TrailPos
-deriving newtype instance Vector.Unbox TrailPos
-
 -- | Watermarks needed to restore an 'AssignmentTrail' on backjump.
 data LevelStart = LevelStart
   { levelTrailPos  :: !TrailPos
@@ -214,23 +208,25 @@ data LevelStart = LevelStart
     --
     -- This is also where Boolean Constraint Propagation resumes, i.e.
     -- the 'trailHead' to restore on backjump.
-  , levelLazyCount :: !Int
+  , levelLazyCount :: !Int32
     -- ^ 'lazyReasons' length when the level opened
   }
   deriving stock Show
 
+-- | Fit a 'LevelStart' into two 'Int32's.
+deriving via ( As LevelStart ( P2 Int32 ) ) instance Prim LevelStart
+instance IsoPrim LevelStart ( P2 Int32 ) where
+  toPrim ( LevelStart ( TrailPos i ) j ) = P2 i j
+  fromPrim ( P2 i j ) = LevelStart ( TrailPos i ) j
+
 -- | Assigned literals in chronological order, with the per-level bookkeeping
 -- needed to backtrack.
 data AssignmentTrail s = AssignmentTrail
-  { entries     :: !( Growable Unboxed.MVector s Lit )
+  { entries     :: !( Growable Primitive.MVector s Lit )
     -- ^ Assigned literals, in chronological assignment order.
-  , levelStarts :: !( Growable Boxed.MVector s LevelStart )
+  , levelStarts :: !( Growable Primitive.MVector s LevelStart )
     -- ^ Per-level watermarks, indexed by decision level minus one (level @k+1@
     -- opens at @levelStarts[k]@).
-
-    -- TODO: give 'LevelStart' a proper 'Prim' or 'Unboxed' instance instead
-    -- of using boxed vectors.
-
   , trailHead   :: !( MutVar s TrailPos )
     -- ^ Next trail position for Boolean Constraint Propagation.
   , lazyReasons :: !( Growable Boxed.MVector s ( Clause.LazyReason s ) )
@@ -1709,7 +1705,7 @@ captureLevelStart :: PrimMonad m => AssignmentTrail ( PrimState m ) -> m LevelSt
 captureLevelStart trl = do
   pos   <- TrailPos . fromIntegral <$> Growable.length ( entries trl )
   nLazy <- Growable.length ( lazyReasons trl )
-  pure ( LevelStart { levelTrailPos = pos, levelLazyCount = nLazy } )
+  pure ( LevelStart { levelTrailPos = pos, levelLazyCount = fromIntegral nLazy } )
 
 -- | Roll every backjump-coupled array back to the watermarks captured for the
 -- target level, drop the cancelled levels from 'levelStarts', and resume BCP
@@ -1728,7 +1724,7 @@ truncateToLevel
     , levelLazyCount = nLazy
     } = do
   Growable.truncate ( entries trl )     ( fromIntegral p )
-  Growable.truncate ( lazyReasons trl ) nLazy
+  Growable.truncate ( lazyReasons trl ) ( fromIntegral nLazy )
   Growable.truncate ( levelStarts trl ) tgt
   writeMutVar ( trailHead trl ) pos
 
