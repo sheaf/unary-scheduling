@@ -254,8 +254,8 @@ data Watcher
     WLong
       !ClauseRef
       !Lit
-        -- ^ Blocker: literal whose current assignment allows BCP to skip
-        -- fetching the clause altogether.
+        -- ^ Blocking literal: a literal whose current assignment allows BCP
+        -- to skip fetching the clause altogether.
 
 -- | Encode a 'Watcher' into two 'Int32's.
 deriving via ( As Watcher ( P2 Int32 ) ) instance Prim Watcher
@@ -372,11 +372,10 @@ data ClauseDB s = ClauseDB
     -- Tracked separately from the input clauses so the two sets can be managed
     -- independently.
     learnts   :: !( Growable Primitive.MVector s ClauseRef )
-  , -- | Per-literal watch lists, indexed by 'litIndex' and sized to
-    -- @2 * numVars@.
+  , -- | Per-literal watch lists.
     --
-    -- @watches[p]@ holds every watcher whose clause has @negateLit p@ as a
-    -- watched literal, so that enqueueing @p@ wakes those clauses.
+    -- @watches[ℓ]@ holds every watcher whose clause has @¬ℓ@ as a watched literal,
+    -- so that enqueueing @ℓ@ wakes those clauses.
     watches   :: !( Growable Boxed.MVector s ( Growable Primitive.MVector s Watcher ) )
   }
 
@@ -938,8 +937,77 @@ preprocessClause s@( SolverState { solverAssignments = assig }) ls0 = do
 -------------------------------------------------------------------------------
 -- Boolean Constraint Propagation.
 
--- | Run BCP from the current trail tail until either no further propagation
--- is possible or a falsified clause is encountered.
+{- Note [Unit propagation using watchers]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+To perform unit propagation of the assignment @ℓ = true@, we need to find all
+clauses that become unit clauses after this assignment. That is, we must find
+all clauses that have all literals false except for two unassigned literals, one
+of them being ¬ℓ.
+
+To achieve this without scanning every clause, we proceed as follows:
+
+  - For every clause, pick two of its literals to watch.
+  - Permute the literals of every stored clause so that its literals at position
+    0 and 1 are its watched literals.
+  - Separately store a map from literal to the clauses that watch this literal.
+    Alongside each watched clause we cache a "blocking literal": some other
+    literal of the clause, used as a hint to skip work when it is already true
+    (a true literal makes the whole clause satisfied, so there is nothing to do).
+    For a binary clause, this blocking literal is the rest of the clause.
+    We store it inline and never need a reference to the clause at all.
+
+The watched literals are useful because we always uphold the following invariant:
+
+  (WINV)
+    If one of the watched literals is false, the other watched literal is true,
+    and the true literal was not assigned before the false literal.
+
+This rather subtle invariant guarantees that we can perform unit propagation by
+looking at watched literals only. To propagate @ℓ = true@, we traverse the
+watchers of @¬ℓ@ and try to uphold the (WINV) invariant. We do this as follows:
+
+  - Binary watcher: the clause is @{ ¬ℓ, o }@.
+      - o=true : nothing to do
+      - o=undef: unit propagate 'o = true'
+      - o=false: conflict
+
+  - Long clause watcher.
+    - Test the blocking literal first: if it is already true the clause is
+      satisfied and we skip fetching the clause from the database.
+    - Otherwise, fetch the clause and look at the other watched literal 'o'
+      - o=true: the clause is now satisfied. Keep the watcher, updating the blocker to 'o'.
+      - Otherwise, try to find another literal in the clause that is not false:
+        - If we find one, move it to become watched, restoring the invariant.
+        - Otherwise, this means the clause is unit on 'o':
+          - o=undef: unit propagate 'o = true'.
+          - o=false: conflict
+
+Crucially, watchers do not need to move on backtrack, i.e. (WINV) is preserved
+when assignments are undone. This is because backtracking only undoes assignments,
+so it never turns a watched literal false. This means that the only way to break
+the (WINV) invariant would be to unassign only the true literal in a {true, false}
+pair, but this cannot happen because the true literal was assigned first.
+
+References:
+
+  Moskewicz, Madigan, Zhao, Zhang, Malik
+    "Chaff: Engineering an Efficient SAT Solver" (2001)
+
+    Introduced the "two watched literals" scheme.
+
+  Eén, Sörensson
+    "An Extensible SAT-solver" (2003)
+
+    Introduced blocking literals.
+
+  Biere, Heule, van Maaren, Walsh
+    "Handbook of Satisfiability" (2021)
+
+    General reference.
+-}
+
+-- | Run Boolean Constraint Propagation from the current trail tail until either
+-- no further propagation is possible or a falsified clause is encountered.
 propagate
   :: forall m
   .  PrimMonad m
@@ -960,7 +1028,7 @@ propagate s@( SolverState { solverAssignments = assig@( Assignments { trail } ) 
           Just c  -> pure ( Just c )
           Nothing -> loop
 
--- | Outcome of revisiting a long-clause watcher.
+-- | Outcome of revisiting a long clause watcher.
 data WatchOutcome
   = -- | The clause's watch was re-routed to a non-false literal; the
     -- watcher is no longer on the current watch list.
@@ -974,8 +1042,9 @@ data WatchOutcome
     -- after a backjump see an up-to-date entry.
     WatchConflict !Lit
 
--- | Process every watcher on @watches[litIndex p]@ — these are clauses for
--- which @negateLit p@ is a watched literal, which has just become false.
+-- | Perform unit propagation of the assignment @ℓ = true@.
+--
+-- See Note [Unit propagation using watchers].
 --
 -- Iterates with a read/write index pair so that watchers we keep are
 -- compacted in place; watchers we move to a different watch list (via the
@@ -984,15 +1053,15 @@ propagateLit
   :: forall m
   .  PrimMonad m
   => SolverState ( PrimState m )
-  -> Lit -- ^ the literal we have just assigned to be true
+  -> Lit -- ^ @ℓ@
   -> m ( Maybe Conflict )
-propagateLit s@( SolverState { solverAssignments = assig }) p = do
-  ws <- Growable.read ( watches ( clauseDB s ) ) ( litIndex p )
-  total <- Growable.length ws
-  loop ws total 0 0
+propagateLit s@( SolverState { solverAssignments = assig }) ℓ = do
+  watchers <- Growable.read ( watches ( clauseDB s ) ) ( litIndex ℓ )
+  nbWatchers <- Growable.length watchers
+  loop watchers nbWatchers 0 0
   where
-    falseLit :: FalsifiedLit
-    falseLit = FalsifiedLit $ negateLit p
+    notℓ :: FalsifiedLit
+    notℓ = FalsifiedLit $ negateLit ℓ
 
     loop
       :: Growable Primitive.MVector ( PrimState m ) Watcher
@@ -1014,13 +1083,13 @@ propagateLit s@( SolverState { solverAssignments = assig }) p = do
                 ŁUndef -> do
                   -- 'RBinary' carries the clause's other (false) literal, here
                   -- the just-falsified watched literal 'falseLit'.
-                  enqueueUndef assig other ( Clause.RBinary falseLit )
+                  enqueueUndef assig other ( Clause.RBinary notℓ )
                   loop ws total ( ri + 1 ) ( wi + 1 )
                 ŁFalse -> do
                   -- Restore unprocessed remainder so the watch invariant
                   -- holds when the search later backjumps and re-runs BCP.
                   compactRest ws total ( ri + 1 ) ( wi + 1 )
-                  pure $ Just $ ConflictBinary falseLit ( FalsifiedLit other )
+                  pure $ Just $ ConflictBinary notℓ ( FalsifiedLit other )
             WLong cref blocker -> do
               -- Try the blocker shortcut before fetching the clause.
               bv <- litValue assig blocker
@@ -1030,7 +1099,7 @@ propagateLit s@( SolverState { solverAssignments = assig }) p = do
                 loop ws total ( ri + 1 ) ( wi + 1 )
               else do
                 c <- clauseAt ( clauseDB s ) cref
-                r <- handleWatched s cref falseLit c
+                r <- handleWatched s cref notℓ c
                 case r of
                   WatchReplaced -> loop ws total ( ri + 1 ) wi
                   WatchKept newBlocker -> do
