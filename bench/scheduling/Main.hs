@@ -12,9 +12,7 @@ import Test.Tasty
 import Test.Tasty.Bench
   ( defaultMain )
 
--- unary-scheduling
-import qualified SAT.Bench      as SAT
-  ( benchmarks )
+-- unary-scheduling bench suite
 import qualified Schedule.Bench as Sched
   ( benchmarks )
 
@@ -22,7 +20,4 @@ import qualified Schedule.Bench as Sched
 
 main :: IO ()
 main = withCP65001 $
-  defaultMain
-    [ testGroup "SAT"        SAT.benchmarks
-    , testGroup "Scheduling" Sched.benchmarks
-    ]
+  defaultMain [ testGroup "Scheduling" Sched.benchmarks ]

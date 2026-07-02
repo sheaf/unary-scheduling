@@ -6,18 +6,13 @@ import System.IO.CodePage
 
 -- tasty
 import Test.Tasty
-  ( defaultMain, testGroup )
+  ( defaultMain )
 
 -- unary-scheduling
 import qualified SAT.Test as SAT
-  ( tests )
-import qualified Schedule.Z3.Test as Z3
   ( tests )
 
 --------------------------------------------------------------------------------
 
 main :: IO ()
-main = withCP65001 $ defaultMain $ testGroup "z3-differential"
-  [ SAT.tests
-  , Z3.tests
-  ]
+main = withCP65001 $ defaultMain SAT.tests

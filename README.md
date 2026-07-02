@@ -39,26 +39,31 @@ to set up the spreadsheet for consumption by the executable.
 
 ### Testing
 
-The `unary-scheduling-test` testsuite contains simple property tests relating to
+The `sanity-tests` testsuite contains simple property tests relating to
 propagators and the underlying data representation of time intervals.
 
-The `unary-scheduling-z3-test` testsuite validates the implementation against Z3.
-It validates both:
+The `test-sat-solver` testsuite validates the SAT solver core that underlies
+CDCL against Z3.
 
-  1. The SAT-solver core that underlies CDCL.
-  2. The unary scheduling solver.
+The `test-scheduling` testsuite validates the unary scheduling solver against
+Z3.
+
 
 ### Benchmarking
 
-The `bench-unary-scheduling` benchmark compares the performance of the
-implementation against Z3 and MiniZinc Chuffed. Aga
+The `bench-sat-solver` benchmark suite compares the performance of the SAT
+solver implementation against Z3.
 
-The `lcg-inspect` executable is the instrumentation framework for the implementation.
-It's used:
+The `bench-scheduling` benchmark compares the performance of the unary
+scheduling solver against Z3 and MiniZinc Chuffed.
 
-  1. To inspect generated Core, STG, etc.
-  2. For profiling reports.
-  3. For instrumentated reports (e.g. numbers of learnt clauses, number of
+The `inspect-unary-scheduling` executable is the instrumentation framework for the implementation.
+It's used to:
+
+  1. Inspect generated Core, STG, etc. Tip: use `-f inspect-dumps`.
+  2. Generate profiling reports.
+  3. Provide instrumentated reports (e.g. numbers of learnt clauses, number of
      search decisions, etc).
-  4. For parameter sweeps, e.g. to determine the performance impact of solver
-     options or to compare performance across a series of benchmarks.
+  4. Run parameter sweeps. This can be used both to determine the performance
+     impact of various solver options and to compare performance across a series
+     of benchmarks (e.g. mining hard scheduling benchmarks).

@@ -9,7 +9,7 @@
 --  * /Z3/      — Z3 SMT solver
 --  * /Chuffed/ — the MiniZinc lazy-clause-generation solver
 --
--- See @bench/SAT/Bench.hs@ for the SAT-core-only counterpart.
+-- See @bench/sat/SAT/Bench.hs@ for the SAT-core-only counterpart.
 module Schedule.Bench
   ( benchmarks )
   where
@@ -41,7 +41,7 @@ import Test.Tasty.Bench
   ( Benchmark, Benchmarkable(..), RelStDev(..), TimeMode(..)
   , bgroup, bench, env, whnf )
 
--- unary-scheduling bench suite
+-- scheduling-bench-instances
 import Schedule.Bench.Instances
   ( BenchTime(..)  -- in scope for the @Coercible BenchTime Int@ used by 'benchZ3'
   , Instance

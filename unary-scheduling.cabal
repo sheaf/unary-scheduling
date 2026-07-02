@@ -185,7 +185,7 @@ library z3-oracle
   import: common
 
   hs-source-dirs:
-    z3-oracle
+    oracles/z3
 
   exposed-modules:
     Schedule.Z3
@@ -200,7 +200,7 @@ library minizinc-oracle
   import: common
 
   hs-source-dirs:
-    minizinc-oracle
+    oracles/minizinc
 
   exposed-modules:
     Schedule.MiniZinc
@@ -217,8 +217,8 @@ executable schedule-spreadsheet
   import: common
 
   hs-source-dirs:
-      examples/spreadsheet/src
-    , examples/spreadsheet/app
+      spreadsheet/src
+    , spreadsheet/app
 
   other-modules:
       Schedule.Spreadsheet
@@ -249,7 +249,7 @@ executable schedule-spreadsheet
   ghc-options:
     -threaded
 
-test-suite unary-scheduling-test
+test-suite sanity-tests
 
   import: common
 
@@ -257,7 +257,7 @@ test-suite unary-scheduling-test
     exitcode-stdio-1.0
 
   hs-source-dirs:
-    test
+    test/sanity
 
   main-is:
     Main.hs
@@ -272,7 +272,7 @@ test-suite unary-scheduling-test
     , tasty-hunit
         >= 0.10  && < 0.11
 
-test-suite unary-scheduling-z3-test
+test-suite test-sat-solver
 
   import: common
 
@@ -280,14 +280,40 @@ test-suite unary-scheduling-z3-test
     exitcode-stdio-1.0
 
   hs-source-dirs:
-    z3-test
+    test/sat
 
   main-is:
     Main.hs
 
   other-modules:
       SAT.Test
-    , Schedule.Z3.Test
+
+  build-depends:
+      unary-scheduling
+    , tasty
+        >= 1.4   && < 1.6
+    , tasty-hedgehog
+        >= 1.4   && < 1.5
+    , hedgehog
+        >= 1.2   && < 1.7
+    , z3
+         >= 411  && < 413
+
+test-suite test-scheduling
+
+  import: common
+
+  type:
+    exitcode-stdio-1.0
+
+  hs-source-dirs:
+    test/scheduling
+
+  main-is:
+    Main.hs
+
+  other-modules:
+      Schedule.Z3.Test
 
   build-depends:
       unary-scheduling
@@ -298,10 +324,8 @@ test-suite unary-scheduling-z3-test
         >= 1.4   && < 1.5
     , hedgehog
         >= 1.2   && < 1.7
-    , z3
-         >= 411  && < 413
 
-benchmark bench-unary-scheduling
+benchmark bench-sat-solver
 
   import: common
 
@@ -309,7 +333,7 @@ benchmark bench-unary-scheduling
     exitcode-stdio-1.0
 
   hs-source-dirs:
-    bench
+    bench/sat
 
   main-is:
     Main.hs
@@ -317,13 +341,9 @@ benchmark bench-unary-scheduling
   other-modules:
       SAT.Bench
     , SAT.Bench.Instances
-    , Schedule.Bench
-    , Schedule.Bench.Instances
 
   build-depends:
       unary-scheduling
-    , z3-oracle
-    , minizinc-oracle
     , random
          >= 1.2   && < 1.4
     , tasty
@@ -334,41 +354,75 @@ benchmark bench-unary-scheduling
   ghc-options:
     -threaded
 
-flag inspect-dumps
-  description:
-    Add GHC Core/STG dump flags to the lcg-inspect executable.
-  default:
-    False
-  manual:
-    True
-
-executable lcg-inspect
+library scheduling-bench-instances
 
   import: common
 
   hs-source-dirs:
-      bench-inspect
-    , bench
+    bench/instances
+
+  exposed-modules:
+    Schedule.Bench.Instances
+
+  build-depends:
+      unary-scheduling
+    , random
+         >= 1.2   && < 1.4
+
+benchmark bench-scheduling
+
+  import: common
+
+  type:
+    exitcode-stdio-1.0
+
+  hs-source-dirs:
+    bench/scheduling
 
   main-is:
     Main.hs
 
   other-modules:
-      SAT.Bench.Instances
-    , Schedule.Bench.Instances
+      Schedule.Bench
 
   build-depends:
       unary-scheduling
+    , scheduling-bench-instances
+    , z3-oracle
     , minizinc-oracle
-    , random
-         >= 1.2   && < 1.4
+    , tasty
+        >= 1.4    && < 1.6
+    , tasty-bench
+         >= 0.5   && < 0.6
+
+  ghc-options:
+    -threaded
+
+flag inspect-dumps
+  description:
+    Add GHC dump flags to the 'inspect-unary-scheduling' executable
+  default:
+    False
+  manual:
+    True
+
+executable inspect-unary-scheduling
+
+  import: common
+
+  hs-source-dirs:
+    inspect
+
+  main-is:
+    Main.hs
+
+  build-depends:
+      unary-scheduling
+    , scheduling-bench-instances
+    , minizinc-oracle
 
   if flag(inspect-dumps)
     ghc-options:
       -ddump-simpl
       -ddump-stg-final
       -ddump-to-file
-      -dsuppress-all
-      -dsuppress-uniques
-      -dsuppress-coercions
-      -dsuppress-type-applications

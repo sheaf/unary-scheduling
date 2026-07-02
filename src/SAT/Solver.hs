@@ -620,6 +620,7 @@ showReason ( Clause.RBinary l ) = "RBinary " ++ show l
 showReason ( Clause.RClause r ) = "RClause " ++ show r
 showReason ( Clause.RLazy l )   = "RLazy " ++ show l
 
+#ifdef DEBUG
 -- | Render a conflict source (for panic messages).
 describeConflict
   :: forall m
@@ -655,6 +656,7 @@ describeConflict s = \case
           ++ "  assign=" ++ show val
           ++ "  lvl=" ++ ( case lvl of UnassignedLevel -> "UNASSIGNED"; DecisionLevel d -> show d )
           ++ "  reason=" ++ showReason rsn
+#endif
 
 trailSize :: PrimMonad m => Assignments ( PrimState m ) -> m TrailPos
 trailSize assigs = TrailPos . fromIntegral

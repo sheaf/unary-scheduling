@@ -67,7 +67,7 @@ import Schedule.MiniZinc
   ( MiniZincOptions(..), MiniZincOutcome(..), MiniZincStatus(..)
   , MiniZincError, defaultMiniZincOptions, minizincFeasible )
 
--- bench:unary-scheduling
+-- scheduling-bench-instances
 import Schedule.Bench.Instances
   ( BenchTime(..), Instance )
 import qualified Schedule.Bench.Instances as Instances
