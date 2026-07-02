@@ -1,24 +1,31 @@
 # unary-scheduling
 
-Unary scheduling: resource assignemnt for a unary resource.
-
-Constraint solving for scheduling tasks on a **unary resource** — a resource that
-can only do one thing at a time, so no two tasks may overlap.
+Given a collection of tasks, each with pre-determined lengths and availabilities,
+unary scheduling is the problem of finding a valid schedule for all the tasks
+so that no two tasks are performed at the same time.
 
 ## Motivating example: rehearsal scheduling
 
-Suppose you are running rehearsals over the course of a week. Given
-a set of students (the staff) and a set of songs (the tasks), we want to
-find a rehearsal schedule given:
+We are given a set of musicians and a set of pieces. Each musician has a fixed
+availability (e.g. John is available on Monday from 2pm to 6pm). Each piece
+to rehearse has a fixed roster (e.g. Annie, Mark and John need to rehearse
+"Giant Steps" together) and a set amount of rehearsal time (e.g. 40 minutes).
 
-  - the availabilities of each student across the week,
-  - for each song, the group of students that need to play that song together.
+The problem is to find a rehearsal schedule: a feasible start time for the
+rehearsal of each piece, allowing each piece to be rehearsed sequentially.
 
+## Project architecture
 
-There is a single rehearsal slot at any given moment, so rehearsals cannot
-overlap: this is the unary resource.
+This library tackles unary scheduling through constraint programming:
 
-## Project structure
+  - Basic constraint propagation is performed using Vilím's Θ-tree unary resource
+    propagators.
+  - We search for valid schedules using conflict-driven clause learning (CDCL).
+
+Each propagator explains its inferences as clausal reasons, which allows
+interleaving propagation and search decisions.
+
+### schedule-spreadsheet
 
 The `schedule-spreadsheet` application reads scheduling data from an
 Excel spreadsheet and writes an updated spreadsheet back.
@@ -27,97 +34,31 @@ Excel spreadsheet and writes an updated spreadsheet back.
 cabal run schedule-spreadsheet -- INPUTFILE [OPTIONS]
 ```
 
-`INPUTFILE` is the spreadsheet to read; the `.xlsx` extension is supplied
-automatically (so `myschedule` reads `myschedule.xlsx`).
+Pass `--help` for an overview of available options and an explanation of how
+to set up the spreadsheet for consumption by the executable.
 
-| Option | Default | Meaning |
-| --- | --- | --- |
-| `INPUTFILE` (positional) | — | Input `.xlsx` spreadsheet to read. |
-| `-o`, `--output FILE` | `output.xlsx` | Where to write the updated spreadsheet. |
-| `-l`, `--log FILE` | `log.txt` | Where to log how each constraint was derived. |
-| `--no-prop` | (propagation on) | Disable constraint propagation entirely. |
-| `--no-search` | (search on) | Disable the search for a concrete schedule. |
-| `-m`, `--makespan` | off | Enable makespan constraints (**experimental**). |
+### Testing
 
-When search is enabled, a few extra files are written next to the output:
-`search_statistics.txt`, `cost.txt`, and `dotfile.txt` (a Graphviz dump of the
-precedence graph of the best solution).
+The `unary-scheduling-test` testsuite contains simple property tests relating to
+propagators and the underlying data representation of time intervals.
 
-Example:
+The `unary-scheduling-z3-test` testsuite validates the implementation against Z3.
+It validates both:
 
-```sh
-cabal run schedule-spreadsheet -- rehearsals -o rehearsals-solved -l rehearsals-log.txt
-```
+  1. The SAT-solver core that underlies CDCL.
+  2. The unary scheduling solver.
 
-### Spreadsheet format
+### Benchmarking
 
-The tool discovers where everything lives from a small block of pointer formulas
-in the top-left corner, then reads three regions: a row per task, a row per staff
-member, and a block of availability columns shared by both.
+The `bench-unary-scheduling` benchmark compares the performance of the
+implementation against Z3 and MiniZinc Chuffed. Aga
 
-#### Control block (cells B1:C3)
+The `lcg-inspect` executable is the instrumentation framework for the implementation.
+It's used:
 
-Each cell contains a formula `=<cell>` pointing at the first/last boundary of a
-region. Only the **row** of the pointed-at cell matters for tasks/staff, and only
-the **column** matters for availability.
-
-| Cell | Points at | Meaning |
-| --- | --- | --- |
-| `B1` / `C1` | any cell in first / last **task** row | range of task rows |
-| `B2` / `C2` | any cell in first / last **staff** row | range of staff rows |
-| `B3` / `C3` | any cell in first / last **availability** column | range of time-slot columns |
-
-#### Task rows
-
-For each task row:
-
-- **Column A** — the staff assigned to the task, as a formula
-  `=TEXTJOIN(delimiter, ignore_empty, cell_1, …, cell_n)` where each `cell_k`
-  refers to a cell in the row of an assigned staff member (e.g. their name cell).
-- **Column B** — the task duration, as a number of availability columns.
-- **Column C** — the task name.
-- **Availability columns** — see below.
-
-#### Staff rows
-
-For each staff row:
-
-- **Column C** — the staff member's name.
-- **Availability columns** — see below.
-
-(Column B of a staff row is also where makespan constraints go when `--makespan`
-is enabled; see the program's `--help` for the format.)
-
-#### Availability values
-
-In every availability column, for both task and staff rows:
-
-- a cell value of `0` means **unavailable**;
-- a blank cell (or any other value) means **available**.
-
-#### Output
-
-The output spreadsheet is a copy of the input with:
-
-- task rows: availability cells set to `0` for any slot where the task can no
-  longer be scheduled (after propagation, and after search if enabled);
-- staff column A: a summary such as `Song A (2) + Song C (1) = 3`.
-
-The log file explains, in plain text, why each slot was removed (which
-propagation rule fired and on account of which other tasks).
-
-## Implementation overview
-
-The library implements standard unary-resource constraint-propagation algorithms
-over task time windows:
-
-- **prune** (drop windows too short for the task) and **timetable** (block out
-  slots a task must occupy) — local propagators;
-- **overload checking**, **detectable precedences**, **not-first / not-last**,
-  and **edge finding** — global propagators based on Θ-tree / Θ-Λ-tree structures;
-- a **precedence matrix** that records and transitively propagates ordering
-  decisions.
-
-Propagation runs to a fixpoint. An optional **search** then fixes the
-still-unknown pairwise orderings one at a time (with backtracking), keeping
-the best solutions found according to a cost function.
+  1. To inspect generated Core, STG, etc.
+  2. For profiling reports.
+  3. For instrumentated reports (e.g. numbers of learnt clauses, number of
+     search decisions, etc).
+  4. For parameter sweeps, e.g. to determine the performance impact of solver
+     options or to compare performance across a series of benchmarks.
