@@ -966,7 +966,7 @@ This rather subtle invariant guarantees that we can perform unit propagation by
 looking at watched literals only. To propagate @ℓ = true@, we traverse the
 watchers of @¬ℓ@ and try to uphold the (WINV) invariant. We do this as follows:
 
-  - Binary watcher: the clause is @{ ¬ℓ, o }@.
+  - Binary watcher: the clause is @¬ℓ ∨ o@.
       - o=true : nothing to do
       - o=undef: unit propagate 'o = true'
       - o=false: conflict
@@ -1183,15 +1183,98 @@ findNonFalseFrom assig c start = go start
 -------------------------------------------------------------------------------
 -- Conflict analysis (1-UIP).
 
--- | Resolve the conflict clause backwards through the implication graph
--- until exactly one literal of the current decision level remains. That
--- literal is the first unique implication point; its negation is the
--- asserting literal of the learnt clause.
+{- Note [Conflict learning]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When Boolean Constraint Propagation discovers a conflict, we analyse the
+conflict to learn a new clause that
+  (a) is entailed by the existing clauses
+  (b) is falsified by the current variable assignments
+Learnt clauses help us avoid chronological backtracking, as they inform the
+search about which variables participate in the conflict. This makes search
+less likely to constantly re-explore the same dead-end, by backjumping over
+intermediate irrelevant decisions.
+
+The implication graph
+---------------------
+We can organise the assignments made so far into a directed acyclic graph called
+the implication graph. Its nodes are the assigned literals, together with an
+additional ⊥ node. Its edges are given as follows:
+
+  - A decision literal (assigned by 'decide') has no incoming edges.
+  - A literal @p@ that was assigned via unit-propagation of a reason clause
+      p ∨ ¬a₁ ∨ … ∨ ¬aₙ
+    has an incoming edge from each antecedent @aᵢ@.
+  - There is one edge into ⊥ from each antecedent of the falsified conflict
+    clause.
+
+Each edge points from an earlier assignment to a later one, so the graph is
+acyclic. The graph is stratified by decision level, with a decision literal
+at the root of each stratum above ground level.
+
+Cuts
+----
+A /cut/ is a collection of edges that separates ⊥ from all of the decision
+literals. Each choice of cut corresponds to a learnt clause, obtained as a
+disjunction of the negations of the antecedent nodes of these edges.
+
+The choice of cut is important: it needs to be small (to ensure the learnt
+clause is small). Another important property is that the clause is /asserting/:
+it contains a single literal at the current decision level (the so-called
+asserting literal).
+
+Unique implication points
+-------------------------
+A /unique implication point/ (UIP) is a node that dominates ⊥ on the stratum at
+the current decision level. That is, it lies on every path from the decision
+literal at the current decision level to ⊥.
+
+There is always at least one UIP (the decision itself). The UIPs form a chain
+(standard graph-theoretic fact about dominators); the one closest to ⊥ is called
+the first unique implication point (1-UIP).
+
+Cutting immediately behind a UIP results in a learnt clause that consists of a
+single literal at the current decision level (the negated UIP), together with
+literals from strictly lower levels, while non-UIP cuts contain at least two
+current-level literals.
+
+After learning a UIP-clause, we backjump to the second-highest decision level in
+the learnt clause (or the ground level if the clause contains only the asserting
+literal), upon which the learnt clause immediately becomes a unit clause (since
+it is asserting).
+
+Resolution
+----------
+We compute the learnt clause by resolution. Given the current working clause
+(initially the falsified conflict clause), we repeatedly:
+
+  - Find the most recently assigned current-level literal in the working clause.
+  - Resolve it against its reason clause: delete the literal from the working
+    clause and splice in the rest of the reason clause (the negated antecedents).
+
+We can visualise this as the cut sweeping backwards through the implication graph
+in reverse assignment order: the number of current-level literals in the working
+clause is the current-level frontier of the cut. We stop as soon as that number
+falls to one. The sole remaining current-level literal is then the asserting
+literal, and the variable it negates is the 1-UIP defined above.
+
+Stopping here is what makes the 1-UIP clause maximally "local" to the conflict:
+it resolves back the fewest steps before the current level collapses to a single
+literal. Stopping at any UIP further back (up to the decision itself) would
+unwind more of the current level's propagation, drawing in assignments that
+are further from the immediate cause of the conflict.
+
+This doesn't mean the 1-UIP clause is perfect: the body of the 1-UIP clause
+is not necessarily minimal. We can further reduce its size by resolving away
+redundant body literals (see 'minimiseLearnt' and 'binarySubsume').
+-}
+
+-- | Compute the 1-UIP of a conflict clause.
+--
+-- See Note [Conflict learning].
 --
 -- The returned learnt clause has the asserting literal first and the
 -- highest-level remaining literal second, so that the clause is immediately
--- unit and watchable as soon as we backjump to the second component of the
--- return value.
+-- unit and watchable as soon as we backjump.
 analyse
   :: forall m
   .  PrimMonad m
