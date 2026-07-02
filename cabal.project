@@ -4,6 +4,10 @@ constraints:
     acts -finitary,
   bitvec -libgmp
 
+allow-newer:
+  *:base, *:ghc-bignum, *:ghc-prim, *:ghc-internal, *:template-haskell,
+  generic-lens:text
+
 -- GHC 9.10 support for generic-lens 1.0
 -- (generic-lens 2.0 doesn't have all the features we need)
 source-repository-package
@@ -17,6 +21,7 @@ source-repository-package
   location: https://github.com/arminhoh/haskell-z3
   tag: 2887c5f6fec309e87ce202effee815e570f18acf
 
-allow-newer:
-  *:base, *:ghc-bignum, *:ghc-prim, *:ghc-internal, *:template-haskell,
-  generic-lens:text
+source-repository-package
+  type: git
+  location: https://codeberg.org/sheaf/memory-arena
+  tag: 6ab6295b3341c288dddb5fa8902d055eacd0da9b
